@@ -14,6 +14,14 @@ pub const OPUS_RATE: u32 = 48_000;
 // one second of capture is plenty: the transmit loop drains it every few ms
 const MAX_CAPTURE_SECONDS: usize = 1;
 
+/// drops the oldest captured samples beyond `MAX_CAPTURE_SECONDS` at `rate`
+pub fn cap_capture(queue: &mut VecDeque<f32>, rate: u32) {
+    let excess = queue
+        .len()
+        .saturating_sub(rate as usize * MAX_CAPTURE_SECONDS);
+    queue.drain(..excess);
+}
+
 /// starts the default input device; captured audio is averaged to mono and appended to `samples`
 pub fn open_input(samples: Samples) -> Result<(cpal::Stream, u32), Box<dyn Error>> {
     let device = cpal::default_host()
@@ -27,7 +35,6 @@ pub fn open_input(samples: Samples) -> Result<(cpal::Stream, u32), Box<dyn Error
         rate,
         channels
     );
-    let cap = rate as usize * MAX_CAPTURE_SECONDS;
     let stream = device.build_input_stream::<f32, _, _>(
         config,
         move |data, _| {
@@ -36,8 +43,7 @@ pub fn open_input(samples: Samples) -> Result<(cpal::Stream, u32), Box<dyn Error
                 data.chunks(channels)
                     .map(|c| c.iter().sum::<f32>() / channels as f32),
             );
-            let excess = queue.len().saturating_sub(cap);
-            queue.drain(..excess);
+            cap_capture(&mut queue, rate);
         },
         |err| eprintln!("input stream error: {err}"),
         None,
@@ -113,6 +119,14 @@ impl Resampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_queue_keeps_the_newest_second() {
+        let mut queue: VecDeque<f32> = (0..3 * 100).map(|i| i as f32).collect();
+        cap_capture(&mut queue, 100);
+        assert_eq!(queue.len(), 100);
+        assert_eq!(queue[0], 200.0);
+    }
 
     #[test]
     fn resampler_rate_and_continuity_across_chunks() {

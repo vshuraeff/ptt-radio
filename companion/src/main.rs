@@ -4,33 +4,34 @@
 //! threads: main (OS events for the PTT key, HELLO heartbeat, auto-ptt),
 //! transmit (capture or tone -> opus -> game), receive (game -> jitter queues),
 //! playout (20 ms ticks: decode, mix -> output device and/or wav).
-//! everything OS-specific is in ptt_key.rs; audio goes through cpal only.
+//! everything OS-specific is in ptt_key.rs; audio goes through cpal, or
+//! through the virtual device (src/virtual_audio.rs) for tests.
 
-mod audio;
-mod jitter;
-mod mix;
-mod packet;
 mod ptt_key;
-mod tx;
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::io::ErrorKind;
+use std::fmt;
+use std::fs::File;
+use std::io::{BufWriter, ErrorKind, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 
-use audio::{OPUS_RATE, Resampler, Samples};
-use mix::Mixer;
-use packet::{HELLO, Incoming, RosterEntry, VOICE};
 use ptt_key::PttKey;
-use tx::{FRAME_SAMPLES, Transmitter};
+use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
+use ptt_radio_companion::echo::{self, EchoPath};
+use ptt_radio_companion::mix::{self, Mixer};
+use ptt_radio_companion::packet::{self, HELLO, Incoming, RosterEntry, START, VOICE};
+use ptt_radio_companion::tx::{FRAME_SAMPLES, Transmitter};
+use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
+use ptt_radio_companion::{percentile, unix_us};
 
 const FRAME: Duration = Duration::from_millis(20);
 const HELLO_EVERY: Duration = Duration::from_secs(5);
@@ -54,21 +55,47 @@ struct Args {
     /// Opus bitrate in bit/s
     #[arg(long, default_value_t = 16_000, value_parser = clap::value_parser!(u32).range(500..=512_000))]
     bitrate: u32,
-    /// global push-to-talk key in global-hotkey syntax, e.g. F8, F13, shift+F8
+    /// global push-to-talk key in global-hotkey syntax, e.g. F8, F13, shift+F8; "none" registers no key
     #[arg(long, default_value = "F8")]
     ptt_key: String,
     /// test: transmit a sine of this frequency instead of the microphone
-    #[arg(long, value_name = "HZ")]
+    #[arg(long, value_name = "HZ", conflicts_with = "mic_wav")]
     tone: Option<f32>,
     /// test: once the roster arrives hold PTT this long, then drain and exit
     #[arg(long, value_name = "SECONDS")]
     auto_ptt: Option<f64>,
+    /// test: exit this long after the start
+    #[arg(long, value_name = "SECONDS")]
+    exit_after: Option<f64>,
     /// do not open the output device
-    #[arg(long)]
+    #[arg(long, conflicts_with = "speaker_wav")]
     no_playback: bool,
     /// write the decoded received mix (48 kHz mono, only while someone is audible) to this file
     #[arg(long, value_name = "FILE.wav")]
     record_received: Option<PathBuf>,
+    /// test: virtual audio instead of the devices; the microphone plays this file in real time, then silence
+    #[arg(long, value_name = "FILE.wav")]
+    mic_wav: Option<PathBuf>,
+    /// test: virtual audio instead of the devices; everything played, silence included, goes to this file
+    #[arg(long, value_name = "FILE.wav")]
+    speaker_wav: Option<PathBuf>,
+    /// test: virtual speaker output leaks into the virtual microphone at this gain (a player with speakers)
+    #[arg(long, value_name = "DB", allow_negative_numbers = true)]
+    couple_gain_db: Option<f32>,
+    /// test: delay of the speaker-to-microphone path
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0.0,
+        requires = "couple_gain_db"
+    )]
+    couple_delay_ms: f64,
+    /// test: impulse response of the speaker-to-microphone path (default: a plain delay)
+    #[arg(long, value_name = "FILE.wav", requires = "couple_gain_db")]
+    couple_ir: Option<PathBuf>,
+    /// test: append per-frame timestamps to this file for the end-to-end scenarios
+    #[arg(long, value_name = "FILE")]
+    trace: Option<PathBuf>,
 }
 
 struct Shared {
@@ -79,8 +106,21 @@ struct Shared {
     open_mic: AtomicBool,
     roster_seen: AtomicBool,
     mixer: Mutex<Mixer>,
+    echo: EchoPath,
     // own VOICE frames by seq, to time their echo
     sent: Mutex<HashMap<u16, (Instant, Vec<u8>)>>,
+    trace: Option<Mutex<BufWriter<File>>>,
+}
+
+impl Shared {
+    /// one trace line: "<unix us> <event> <fields>", read by tests/scenarios.rs
+    fn trace(&self, event: fmt::Arguments) {
+        if let Some(file) = &self.trace
+            && let Err(err) = writeln!(file.lock().unwrap(), "{} {event}", unix_us())
+        {
+            eprintln!("--trace: write failed: {err}");
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -101,6 +141,10 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         )
     })?;
     socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let trace = match &args.trace {
+        Some(path) => Some(Mutex::new(BufWriter::new(File::create(path)?))),
+        None => None,
+    };
     let shared = Arc::new(Shared {
         socket,
         game: SocketAddr::from(([127, 0, 0, 1], args.game_port)),
@@ -109,8 +153,11 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         open_mic: AtomicBool::new(false),
         roster_seen: AtomicBool::new(false),
         mixer: Mutex::new(Mixer::default()),
+        echo: EchoPath::default(),
         sent: Mutex::new(HashMap::new()),
+        trace,
     });
+    shared.trace(format_args!("canceller {}", echo::CANCELLER));
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = interrupted.clone();
     ctrlc::set_handler(move || flag.store(true, Relaxed))?;
@@ -122,11 +169,56 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         args.game_port
     );
 
-    let ptt_key = PttKey::register(&args.ptt_key)?;
+    let ptt_key = match args.ptt_key.as_str() {
+        "none" => None,
+        spec => Some(PttKey::register(spec)?),
+    };
+
+    // the virtual device replaces both cpal streams when either of its files is given
+    let virtual_device = if args.mic_wav.is_some() || args.speaker_wav.is_some() {
+        let mic = match &args.mic_wav {
+            Some(path) => virtual_audio::read_wav(path)
+                .map_err(|err| format!("--mic-wav {}: {err}", path.display()))?,
+            None => Vec::new(),
+        };
+        let ir = match &args.couple_ir {
+            Some(path) => virtual_audio::read_wav(path)
+                .map_err(|err| format!("--couple-ir {}: {err}", path.display()))?,
+            None => vec![1.0],
+        };
+        let coupling = args.couple_gain_db.map(|gain| {
+            Coupling::new(
+                gain,
+                Duration::from_secs_f64(args.couple_delay_ms / 1000.0),
+                &ir,
+            )
+        });
+        let (input, output) = (Samples::default(), Samples::default());
+        let device = VirtualDevice::start(
+            mic,
+            coupling,
+            args.speaker_wav.as_deref(),
+            input.clone(),
+            output.clone(),
+        )?;
+        println!("audio: virtual device, 48000 Hz, 1 ch");
+        shared.trace(format_args!(
+            "device {} {}",
+            device.start_us,
+            virtual_audio::PERIOD.as_micros()
+        ));
+        Some((device, input, output))
+    } else if args.couple_gain_db.is_some() {
+        return Err(
+            "--couple-gain-db needs the virtual device (--mic-wav or --speaker-wav)".into(),
+        );
+    } else {
+        None
+    };
 
     // cpal streams are not Send: they live here on the main thread until exit
-    let (source, _input) = match args.tone {
-        Some(hz) => (
+    let (source, _input) = match (args.tone, &virtual_device) {
+        (Some(hz), _) => (
             Source::Tone {
                 hz,
                 phase: 0.0,
@@ -134,23 +226,24 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
             },
             None,
         ),
-        None => {
+        (None, Some((_, input, _))) => (Source::mic(input.clone(), OPUS_RATE), None),
+        (None, None) => {
             let samples = Samples::default();
             let (stream, rate) = audio::open_input(samples.clone())?;
-            let source = Source::Mic {
-                samples,
-                resampler: Resampler::new(rate, OPUS_RATE),
-                pending: Vec::new(),
-            };
-            (source, Some(stream))
+            (Source::mic(samples, rate), Some(stream))
         }
     };
-    let (output, _output_stream) = if args.no_playback {
-        (None, None)
-    } else {
-        let samples = Samples::default();
-        let (stream, rate) = audio::open_output(samples.clone())?;
-        (Some((samples, rate)), Some(stream))
+    let (output, _output_stream) = match &virtual_device {
+        _ if args.no_playback => (None, None),
+        Some((device, _, output)) => (
+            Some((output.clone(), OPUS_RATE, Some(device.popped.clone()))),
+            None,
+        ),
+        None => {
+            let samples = Samples::default();
+            let (stream, rate) = audio::open_output(samples.clone())?;
+            (Some((samples, rate, None)), Some(stream))
+        }
     };
     let wav = match &args.record_received {
         Some(path) => Some(hound::WavWriter::create(
@@ -188,13 +281,22 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         0,
         format!("ptt-radio-companion {}", env!("CARGO_PKG_VERSION")).as_bytes(),
     );
+    let exit_at = args
+        .exit_after
+        .map(|s| started + Duration::from_secs_f64(s));
     while !interrupted.load(Relaxed) {
-        if let Some(held) = ptt_key.poll(Duration::from_millis(10))
-            && shared.ptt.swap(held, Relaxed) != held
-        {
-            println!("ptt {}", if held { "pressed" } else { "released" });
+        match &ptt_key {
+            Some(key) => {
+                if let Some(held) = key.poll(Duration::from_millis(10)) {
+                    set_ptt(&shared, held);
+                }
+            }
+            None => thread::sleep(Duration::from_millis(10)),
         }
         let now = Instant::now();
+        if exit_at.is_some_and(|at| now >= at) {
+            break;
+        }
         // heartbeat for the whole lifetime: the mod marks the companion offline after 15 s without HELLO
         if now >= next_hello {
             send(&shared, &hello);
@@ -215,7 +317,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
                     "auto-ptt: holding for {} s",
                     args.auto_ptt.unwrap_or_default()
                 );
-                shared.ptt.store(true, Relaxed);
+                set_ptt(&shared, true);
                 auto = Some(Auto::Hold(
                     now + Duration::from_secs_f64(args.auto_ptt.unwrap_or_default()),
                 ));
@@ -229,7 +331,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
                 break;
             }
             Some(Auto::Hold(until)) if now >= until => {
-                shared.ptt.store(false, Relaxed);
+                set_ptt(&shared, false);
                 auto = Some(Auto::Drain(now));
             }
             Some(Auto::Drain(since))
@@ -246,9 +348,26 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     let frames_sent = tx_thread.join().expect("transmit thread");
     let rx = rx_thread.join().expect("receive thread");
     let recorded = playout_thread.join().expect("playout thread")?;
+    if let Some((device, _, _)) = virtual_device {
+        device.stop()?;
+    }
     let mix = &shared.mixer.lock().unwrap().stats;
+    shared.trace(format_args!(
+        "stats {frames_sent} {} {} {} {}",
+        mix.decoded, mix.decode_errors, mix.dropped_late, mix.underruns
+    ));
+    if let Some(file) = &shared.trace {
+        file.lock().unwrap().flush()?;
+    }
     println!("{}", summary(frames_sent, &rx, mix, recorded));
     Ok(code)
+}
+
+fn set_ptt(shared: &Shared, held: bool) {
+    if shared.ptt.swap(held, Relaxed) != held {
+        println!("ptt {}", if held { "pressed" } else { "released" });
+        shared.trace(format_args!("ptt {}", held as u8));
+    }
 }
 
 enum Auto {
@@ -277,6 +396,14 @@ enum Source {
 }
 
 impl Source {
+    fn mic(samples: Samples, rate: u32) -> Self {
+        Source::Mic {
+            samples,
+            resampler: Resampler::new(rate, OPUS_RATE),
+            pending: Vec::new(),
+        }
+    }
+
     /// blocks until the next 20 ms frame at 48 kHz is ready; None once shutdown starts
     fn next_frame(&mut self, done: &AtomicBool) -> Option<Vec<f32>> {
         match self {
@@ -317,38 +444,48 @@ impl Source {
 /// returns the number of VOICE frames sent
 fn transmit(shared: &Shared, mut source: Source, bitrate: u32) -> u64 {
     let mut tx = Transmitter::new(bitrate).expect("opus encoder");
-    let mut frames = 0;
-    let mut send_all = |packets: Vec<Vec<u8>>| {
-        for p in packets {
-            match p[2] {
-                VOICE => {
-                    let seq = u16::from_be_bytes([p[3], p[4]]);
-                    shared
-                        .sent
-                        .lock()
-                        .unwrap()
-                        .insert(seq, (Instant::now(), p[5..].to_vec()));
-                    frames += 1;
-                }
-                kind => println!(
-                    "sent {}",
-                    if kind == packet::START {
-                        "START"
-                    } else {
-                        "STOP"
-                    }
-                ),
-            }
-            send(shared, &p);
-        }
-    };
-    while let Some(pcm) = source.next_frame(&shared.done) {
+    let mut sent = 0;
+    // captured frames so far: frame n holds samples [n * 960, (n + 1) * 960) of the capture
+    let mut frame = 0;
+    while let Some(mut pcm) = source.next_frame(&shared.done) {
+        let ready_us = unix_us();
+        shared.echo.near_end(&mut pcm);
         tx.set_ptt(shared.ptt.load(Relaxed));
         tx.set_open_mic(shared.open_mic.load(Relaxed));
-        send_all(tx.frame(&pcm));
+        sent += send_packets(shared, tx.frame(&pcm), frame, ready_us);
+        frame += 1;
     }
-    send_all(tx.close());
-    frames
+    sent + send_packets(shared, tx.close(), frame, unix_us())
+}
+
+/// sends what the transmitter made of captured frame `frame`; returns the VOICE count
+fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u64) -> u64 {
+    let voices = packets.iter().filter(|p| p[2] == VOICE).count() as u64;
+    // a START burst carries the pre-roll: its VOICE frames end with the current one
+    let mut voice_frame = frame + 1 - voices;
+    for p in packets {
+        match p[2] {
+            VOICE => {
+                let seq = u16::from_be_bytes([p[3], p[4]]);
+                shared
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .insert(seq, (Instant::now(), p[5..].to_vec()));
+                send(shared, &p);
+                shared.trace(format_args!(
+                    "tx {seq} {voice_frame} {} {ready_us}",
+                    (voice_frame < frame) as u8
+                ));
+                voice_frame += 1;
+            }
+            kind => {
+                println!("sent {}", if kind == START { "START" } else { "STOP" });
+                send(shared, &p);
+            }
+        }
+    }
+    voices
 }
 
 #[derive(Default)]
@@ -434,7 +571,8 @@ fn receive(shared: &Shared) -> RxStats {
                     stats.rtt_ms.push((now - at).as_secs_f64() * 1000.0);
                 }
                 drop(sent);
-                shared.mixer.lock().unwrap().voice(sender, frame, now);
+                shared.mixer.lock().unwrap().voice(sender, seq, frame, now);
+                shared.trace(format_args!("rx {sender} {seq}"));
             }
             Incoming::Stop { sender, .. } => {
                 stats.senders.entry(sender).or_default().stops += 1;
@@ -448,19 +586,19 @@ fn receive(shared: &Shared) -> RxStats {
 /// returns the number of 20 ms frames written to the wav
 fn playout(
     shared: &Shared,
-    output: Option<(Samples, u32)>,
+    output: Option<(Samples, u32, Option<Arc<AtomicU64>>)>,
     mut wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
 ) -> Result<u64, hound::Error> {
     let mut resampler = output
         .as_ref()
-        .map(|(_, rate)| Resampler::new(OPUS_RATE, *rate));
+        .map(|(_, rate, _)| Resampler::new(OPUS_RATE, *rate));
     let mut next = Instant::now();
     let mut recorded = 0;
     let mut out = Vec::new();
     while !shared.done.load(Relaxed) {
         match &output {
             // the output device's clock paces playout: keep about 40 ms queued ahead of it
-            Some((samples, rate)) => {
+            Some((samples, rate, _)) => {
                 let ahead = 2 * *rate as usize * FRAME.as_millis() as usize / 1000;
                 if samples.lock().unwrap().len() >= ahead {
                     thread::sleep(Duration::from_millis(2));
@@ -473,7 +611,13 @@ fn playout(
                 thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         }
-        let mix = shared.mixer.lock().unwrap().tick(Instant::now());
+        let (mix, pulled) = {
+            let mut mixer = shared.mixer.lock().unwrap();
+            let mix = mixer.tick(Instant::now());
+            (mix, std::mem::take(&mut mixer.pulled))
+        };
+        let frame = mix.as_deref().unwrap_or(&[0.0; FRAME_SAMPLES]);
+        shared.echo.far_end(frame);
         if let (Some(frame), Some(writer)) = (&mix, wav.as_mut()) {
             let written = frame.iter().try_for_each(|s| {
                 writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
@@ -487,10 +631,25 @@ fn playout(
                 }
             }
         }
-        if let (Some((samples, _)), Some(resampler)) = (&output, resampler.as_mut()) {
+        // the frame's first sample sounds after everything the device took before plus what is
+        // queued now; both are read under the queue lock, so the index does not depend on when
+        // the device thread wakes (it counts only with the virtual device, else it is the queue
+        // length)
+        let mut slot = 0;
+        if let (Some((samples, _, popped)), Some(resampler)) = (&output, resampler.as_mut()) {
             out.clear();
-            resampler.process(mix.as_deref().unwrap_or(&[0.0; FRAME_SAMPLES]), &mut out);
-            samples.lock().unwrap().extend(&out);
+            resampler.process(frame, &mut out);
+            let mut queue = samples.lock().unwrap();
+            slot = popped.as_ref().map_or(0, |p| p.load(Relaxed)) + queue.len() as u64;
+            queue.extend(&out);
+        }
+        for p in pulled {
+            match p.seq {
+                Some(seq) => {
+                    shared.trace(format_args!("pull {} {seq} {} {slot}", p.sender, p.queued))
+                }
+                None => shared.trace(format_args!("pull {} - 0 {slot}", p.sender)),
+            }
         }
     }
     if let Some(writer) = wav {
@@ -517,19 +676,14 @@ fn summary(frames_sent: u64, rx: &RxStats, mix: &mix::MixStats, recorded: u64) -
         .collect();
     let mut rtt = rx.rtt_ms.clone();
     rtt.sort_by(f64::total_cmp);
-    let pick = |p: usize| {
-        rtt.get((rtt.len() - 1) * p / 100)
-            .copied()
-            .unwrap_or(f64::NAN)
-    };
     let rtt = if rtt.is_empty() {
         "rtt n/a (no own frames echoed)".to_string()
     } else {
         format!(
             "rtt p50 {:.0} ms p95 {:.0} ms max {:.0} ms (n={})",
-            pick(50),
-            pick(95),
-            pick(100),
+            percentile(&rtt, 50),
+            percentile(&rtt, 95),
+            percentile(&rtt, 100),
             rtt.len()
         )
     };

@@ -16,24 +16,25 @@ pub const MAX_FRAMES: usize = 10;
 pub const IDLE_CLOSE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, PartialEq)]
-pub enum Pull {
+pub enum Pull<F> {
     /// still buffering: contributes nothing to the mix
     Wait,
-    Frame(Vec<u8>),
+    Frame(F),
     /// underrun mid-transmission: play one frame of silence
     Silence,
     Closed,
 }
 
-pub struct Stream {
-    queue: VecDeque<Vec<u8>>,
+/// `F` is one queued frame, as the caller wants it back
+pub struct Stream<F> {
+    queue: VecDeque<F>,
     playing: bool,
     stopping: bool,
     opened_at: Instant,
     last_frame_at: Instant,
 }
 
-impl Stream {
+impl<F> Stream<F> {
     pub fn new(now: Instant) -> Self {
         Stream {
             queue: VecDeque::new(),
@@ -51,7 +52,7 @@ impl Stream {
     }
 
     /// queues one encoded frame; returns how many old frames were dropped
-    pub fn push(&mut self, frame: Vec<u8>, now: Instant) -> usize {
+    pub fn push(&mut self, frame: F, now: Instant) -> usize {
         self.queue.push_back(frame);
         self.last_frame_at = now;
         if self.queue.len() <= MAX_FRAMES {
@@ -67,8 +68,13 @@ impl Stream {
         self.stopping = true;
     }
 
+    /// frames waiting to be played
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
     /// called once per 20 ms playout tick
-    pub fn pull(&mut self, now: Instant) -> Pull {
+    pub fn pull(&mut self, now: Instant) -> Pull<F> {
         if !self.playing {
             let ready = self.queue.len() >= TARGET_FRAMES
                 || now - self.opened_at >= START_WAIT
@@ -174,7 +180,7 @@ mod tests {
         assert_eq!(s.pull(t0 + 300 * MS), Pull::Silence);
         assert_eq!(s.pull(t0 + 301 * MS), Pull::Closed);
         // a START that never gets a frame also times out
-        let mut s = Stream::new(t0);
+        let mut s = Stream::<Vec<u8>>::new(t0);
         assert_eq!(s.pull(t0 + 200 * MS), Pull::Silence);
         assert_eq!(s.pull(t0 + 301 * MS), Pull::Closed);
     }

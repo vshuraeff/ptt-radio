@@ -12,7 +12,8 @@ use crate::tx::FRAME_SAMPLES;
 const MAX_DECODE: usize = 5760;
 
 struct Speaker {
-    stream: Stream,
+    // (seq, opus frame)
+    stream: Stream<(u16, Vec<u8>)>,
     decoder: Decoder,
 }
 
@@ -24,10 +25,21 @@ pub struct MixStats {
     pub underruns: u64,
 }
 
+/// one speaker's contribution to the last tick, for the trace
+pub struct Pulled {
+    pub sender: u16,
+    /// None: underrun, a frame of silence was played
+    pub seq: Option<u16>,
+    /// frames still queued after this pull
+    pub queued: usize,
+}
+
 #[derive(Default)]
 pub struct Mixer {
     speakers: BTreeMap<u16, Speaker>,
     pub stats: MixStats,
+    /// what the last `tick` played, per audible speaker
+    pub pulled: Vec<Pulled>,
 }
 
 impl Mixer {
@@ -38,13 +50,13 @@ impl Mixer {
         }
     }
 
-    pub fn voice(&mut self, sender: u16, frame: &[u8], now: Instant) {
+    pub fn voice(&mut self, sender: u16, seq: u16, frame: &[u8], now: Instant) {
         if !self.speakers.contains_key(&sender) {
             // START was missed (companion started mid-transmission)
             self.open(sender, now);
         }
         let speaker = self.speakers.get_mut(&sender).expect("opened above");
-        self.stats.dropped_late += speaker.stream.push(frame.to_vec(), now) as u64;
+        self.stats.dropped_late += speaker.stream.push((seq, frame.to_vec()), now) as u64;
     }
 
     pub fn stop(&mut self, sender: u16) {
@@ -63,17 +75,29 @@ impl Mixer {
         let mut audible = false;
         let mut decoded = [0.0f32; MAX_DECODE];
         let stats = &mut self.stats;
+        let pulled = &mut self.pulled;
+        pulled.clear();
         self.speakers
-            .retain(|_, speaker| match speaker.stream.pull(now) {
+            .retain(|&sender, speaker| match speaker.stream.pull(now) {
                 Pull::Wait => true,
                 Pull::Closed => false,
                 Pull::Silence => {
                     stats.underruns += 1;
                     audible = true;
+                    pulled.push(Pulled {
+                        sender,
+                        seq: None,
+                        queued: 0,
+                    });
                     true
                 }
-                Pull::Frame(frame) => {
+                Pull::Frame((seq, frame)) => {
                     audible = true;
+                    pulled.push(Pulled {
+                        sender,
+                        seq: Some(seq),
+                        queued: speaker.stream.queued(),
+                    });
                     match speaker
                         .decoder
                         .decode_float_to_slice(&frame, &mut decoded, false)
@@ -132,16 +156,22 @@ mod tests {
 
         let mut mixer = Mixer::default();
         mixer.start(1, t0);
-        mixer.voice(1, opus_frame, t0);
-        mixer.voice(1, opus_frame, t0);
+        mixer.voice(1, 1, opus_frame, t0);
+        mixer.voice(1, 2, opus_frame, t0);
         // code-3 packet with a frame count of 0 is invalid opus
         mixer.start(0, t0);
-        mixer.voice(0, &[0x03, 0x00], t0);
-        mixer.voice(0, &[0x03, 0x00], t0);
+        mixer.voice(0, 7, &[0x03, 0x00], t0);
+        mixer.voice(0, 8, &[0x03, 0x00], t0);
         let frame = mixer.tick(t0).expect("audible");
         assert_eq!(frame.len(), FRAME_SAMPLES);
         assert!(frame.iter().all(|s| s.abs() < 1.0));
         assert_eq!((mixer.stats.decoded, mixer.stats.decode_errors), (1, 1));
+        let pulled: Vec<_> = mixer
+            .pulled
+            .iter()
+            .map(|p| (p.sender, p.seq, p.queued))
+            .collect();
+        assert_eq!(pulled, [(0, Some(7), 1), (1, Some(1), 1)]);
 
         mixer.stop(1);
         mixer.stop(0);
