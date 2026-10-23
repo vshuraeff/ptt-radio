@@ -7,12 +7,13 @@
 Packets to the game (127.0.0.1:<--game-port>, the --enable-lua-udp value):
   R, 1, kind, seq u16 BE, body          kind: 1 HELLO, 2 START, 3 VOICE, 4 STOP
 Packets from the game (127.0.0.1:<--port>, the ptt-radio-companion-port setting):
-  R, 1, kind, sender u16 BE, rest       kind: 2/3/4 forwarded, 0x10 ROSTER, 0x11 TOGGLE
+  R, 1, kind, sender u16 BE, rest       kind: 2/3/4 forwarded, 0x10 ROSTER, 0x11 MIC_STATE (rest: 1 byte, 0 off / 1 on)
 
 Commands:
-  hello   ask the mod for the roster
+  hello   send one HELLO, print the roster and open-mic state the mod answers with
   talk    hold the radio for N seconds sending fake 20 ms frames, then release
-  listen  print what the mod forwards to this companion
+  listen  print what the mod forwards to this companion; --heartbeat keeps the
+          mod's companion presence alive by sending HELLO every 5 s
 """
 
 import argparse
@@ -20,8 +21,9 @@ import socket
 import struct
 import time
 
-HELLO, START, VOICE, STOP, ROSTER, TOGGLE = 0x01, 0x02, 0x03, 0x04, 0x10, 0x11
-NAMES = {START: "START", VOICE: "VOICE", STOP: "STOP", ROSTER: "ROSTER", TOGGLE: "TOGGLE"}
+HELLO, START, VOICE, STOP, ROSTER, MIC_STATE = 0x01, 0x02, 0x03, 0x04, 0x10, 0x11
+NAMES = {START: "START", VOICE: "VOICE", STOP: "STOP", ROSTER: "ROSTER", MIC_STATE: "MIC_STATE"}
+HEARTBEAT_SECONDS = 5
 
 
 def packet(kind: int, seq: int, body: bytes = b"") -> bytes:
@@ -64,14 +66,20 @@ def cmd_hello(args):
     sock = open_socket(args.port)
     sock.sendto(packet(HELLO, 0, b"radio.py"), ("127.0.0.1", args.game_port))
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
+    roster = mic = None
+    while time.monotonic() < deadline and (roster is None or mic is None):
         for _, (kind, _, body) in receive(sock):
             if kind == ROSTER:
-                print("roster:")
-                print_roster(body)
-                return
+                roster = body
+            elif kind == MIC_STATE:
+                mic = body[:1] == b"\x01"
         time.sleep(0.01)
-    print("no ROSTER within 3 s: game not running with --enable-lua-udp, wrong port, or mod not loaded")
+    if roster is None:
+        print("no ROSTER within 3 s: game not running with --enable-lua-udp, wrong port, or mod not loaded")
+        return
+    print("roster:")
+    print_roster(roster)
+    print("open mic: " + ("no MIC_STATE (mod older than 0.2)" if mic is None else "on" if mic else "off"))
 
 
 def cmd_talk(args):
@@ -127,14 +135,23 @@ def cmd_talk(args):
 def cmd_listen(args):
     sock = open_socket(args.port)
     deadline = time.monotonic() + args.duration
+    next_hello = time.monotonic() if args.heartbeat else deadline
     talk = {}  # sender -> [first packet time, voice frames, last voice frame time]
+    mic = None
     while time.monotonic() < deadline:
+        if time.monotonic() >= next_hello:
+            sock.sendto(packet(HELLO, 0, b"radio.py"), ("127.0.0.1", args.game_port))
+            next_hello += HEARTBEAT_SECONDS
         for t, (kind, sender, body) in receive(sock):
             if kind == ROSTER:
-                print(f"{time.strftime('%H:%M:%S')} ROSTER")
-                print_roster(body)
-            elif kind == TOGGLE:
-                print(f"{time.strftime('%H:%M:%S')} TOGGLE from player {sender} (in-game key)")
+                if not args.heartbeat:
+                    print(f"{time.strftime('%H:%M:%S')} ROSTER")
+                    print_roster(body)
+            elif kind == MIC_STATE:
+                state = body[:1] == b"\x01"
+                if state != mic:
+                    print(f"{time.strftime('%H:%M:%S')} open mic {'on' if state else 'off'} for player {sender}")
+                    mic = state
             elif kind == START:
                 talk[sender] = [t, 0, t]
                 print(f"{time.strftime('%H:%M:%S')} player {sender} pressed the radio")
@@ -166,6 +183,7 @@ def main():
     talk.set_defaults(func=cmd_talk)
     listen = sub.add_parser("listen")
     listen.add_argument("--duration", type=float, default=60)
+    listen.add_argument("--heartbeat", action="store_true", help="act as a live companion: HELLO every 5 s")
     listen.set_defaults(func=cmd_listen)
     args = parser.parse_args()
     args.func(args)

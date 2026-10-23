@@ -18,10 +18,13 @@ local START = 0x02
 local VOICE = 0x03
 local STOP = 0x04
 local ROSTER = 0x10
-local TOGGLE = 0x11
+local MIC_STATE = 0x11
 
 local STALE_TICKS = 30
+-- the companion sends HELLO every 5 s; three missed heartbeats mean it is gone
+local COMPANION_TIMEOUT_TICKS = 15 * 60
 local BADGE = "ptt_radio_badge"
+local SHORTCUT = "ptt-radio-open-mic"
 local SERVER_COLOR = { r = 0.8, g = 0.8, b = 0.8, a = 1 }
 local START_SOUND = "utility/gui_click"
 local STOP_SOUND = "utility/list_box_click"
@@ -107,6 +110,40 @@ local function send_roster_to_all()
   end
 end
 
+local function send_mic_state(player)
+  local state = storage.open_mic[player.index] and 1 or 0
+  helpers.send_udp(companion_port(player), header(MIC_STATE, player.index) .. string.char(state), player.index)
+end
+
+local function set_open_mic(player, open)
+  storage.open_mic[player.index] = open or nil
+  player.set_shortcut_toggled(SHORTCUT, open)
+  send_mic_state(player)
+end
+
+local function toggle_open_mic(player)
+  if not storage.companions[player.index] then
+    player.print({ "ptt-radio.no-companion" })
+    return
+  end
+  set_open_mic(player, not storage.open_mic[player.index])
+end
+
+local function companion_seen(player, tick)
+  local was_online = storage.companions[player.index] ~= nil
+  storage.companions[player.index] = tick
+  if not was_online then
+    player.print({ "ptt-radio.companion-online" })
+  end
+  send_roster(player)
+  send_mic_state(player)
+end
+
+local function forget_companion(player_index)
+  storage.companions[player_index] = nil
+  storage.open_mic[player_index] = nil
+end
+
 local function fan_out(sender_index, kind, payload)
   local out = header(kind, sender_index) .. string.sub(payload, 4)
   for _, listener in pairs(game.connected_players) do
@@ -132,6 +169,8 @@ end
 
 local function init_storage()
   storage.speakers = storage.speakers or {}
+  storage.companions = storage.companions or {}
+  storage.open_mic = storage.open_mic or {}
 end
 
 script.on_init(init_storage)
@@ -150,7 +189,7 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
   local sender_index = event.player_index
   if kind == HELLO then
     if sender_index ~= 0 then
-      send_roster(game.get_player(sender_index))
+      companion_seen(game.get_player(sender_index), event.tick)
     end
   elseif kind == START or kind == VOICE then
     set_speaking(sender_index, true)
@@ -172,13 +211,33 @@ script.on_nth_tick(15, function(event)
   end
 end)
 
+script.on_nth_tick(60, function(event)
+  for index, last_tick in pairs(storage.companions) do
+    if event.tick - last_tick > COMPANION_TIMEOUT_TICKS then
+      local player = game.get_player(index)
+      forget_companion(index)
+      if player then
+        player.set_shortcut_toggled(SHORTCUT, false)
+        player.print({ "ptt-radio.companion-offline" })
+      end
+    end
+  end
+end)
+
 script.on_event("ptt-radio-toggle-mic", function(event)
-  local player = game.get_player(event.player_index)
-  helpers.send_udp(companion_port(player), header(TOGGLE, player.index), player.index)
+  toggle_open_mic(game.get_player(event.player_index))
+end)
+
+script.on_event(defines.events.on_lua_shortcut, function(event)
+  if event.prototype_name == SHORTCUT then
+    toggle_open_mic(game.get_player(event.player_index))
+  end
 end)
 
 script.on_event(defines.events.on_player_joined_game, function(event)
-  render_badge(game.get_player(event.player_index))
+  local player = game.get_player(event.player_index)
+  player.set_shortcut_toggled(SHORTCUT, storage.open_mic[player.index] ~= nil)
+  render_badge(player)
   send_roster_to_all()
 end)
 
@@ -186,6 +245,8 @@ script.on_event(defines.events.on_player_left_game, function(event)
   if storage.speakers[event.player_index] then
     set_speaking(event.player_index, false)
   end
+  forget_companion(event.player_index)
+  game.get_player(event.player_index).set_shortcut_toggled(SHORTCUT, false)
   send_roster_to_all()
 end)
 
