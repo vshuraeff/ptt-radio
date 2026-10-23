@@ -12,8 +12,9 @@ Packets from the game (127.0.0.1:<--port>, the ptt-radio-companion-port setting)
 Commands:
   hello   send one HELLO, print the roster and open-mic state the mod answers with
   talk    hold the radio for N seconds sending fake 20 ms frames, then release
-  listen  print what the mod forwards to this companion; --heartbeat keeps the
-          mod's companion presence alive by sending HELLO every 5 s
+  listen  print what the mod forwards to this companion; --heartbeat acts as a
+          live companion: HELLO every 5 s, and while the in-game open-mic button
+          is on it transmits fake voice frames
 """
 
 import argparse
@@ -136,12 +137,21 @@ def cmd_listen(args):
     sock = open_socket(args.port)
     deadline = time.monotonic() + args.duration
     next_hello = time.monotonic() if args.heartbeat else deadline
+    target = ("127.0.0.1", args.game_port)
     talk = {}  # sender -> [first packet time, voice frames, last voice frame time]
     mic = None
+    seq = 0
+    next_frame = 0.0
     while time.monotonic() < deadline:
-        if time.monotonic() >= next_hello:
-            sock.sendto(packet(HELLO, 0, b"radio.py"), ("127.0.0.1", args.game_port))
+        now = time.monotonic()
+        if now >= next_hello:
+            sock.sendto(packet(HELLO, 0, b"radio.py"), target)
             next_hello += HEARTBEAT_SECONDS
+        # with --heartbeat an open mic transmits fake 20 ms frames, like a real companion would
+        if args.heartbeat and mic and now >= next_frame:
+            seq = (seq + 1) % 65536
+            sock.sendto(packet(VOICE, seq, bytes(40)), target)
+            next_frame += 0.02
         for t, (kind, sender, body) in receive(sock):
             if kind == ROSTER:
                 if not args.heartbeat:
@@ -151,6 +161,12 @@ def cmd_listen(args):
                 state = body[:1] == b"\x01"
                 if state != mic:
                     print(f"{time.strftime('%H:%M:%S')} open mic {'on' if state else 'off'} for player {sender}")
+                    if args.heartbeat and state:
+                        sock.sendto(packet(START, seq), target)
+                        next_frame = time.monotonic()
+                    elif args.heartbeat and mic:
+                        for _ in range(2):
+                            sock.sendto(packet(STOP, seq), target)
                     mic = state
             elif kind == START:
                 talk[sender] = [t, 0, t]
@@ -166,6 +182,9 @@ def cmd_listen(args):
                     f"{count} frames, STOP {(t - last) * 1000:.0f} ms after the last frame"
                 )
         time.sleep(0.005)
+    if args.heartbeat and mic:
+        for _ in range(2):
+            sock.sendto(packet(STOP, seq), target)
 
 
 def main():
