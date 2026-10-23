@@ -3,7 +3,7 @@
 //!
 //! threads: main (OS events for the PTT key, HELLO heartbeat, auto-ptt),
 //! transmit (capture or tone -> opus -> game), receive (game -> jitter queues),
-//! playout (20 ms ticks: decode, mix -> output device and/or wav).
+//! playout (10 ms ticks: mix -> output device and/or wav).
 //! everything OS-specific is in ptt_key.rs; audio goes through cpal, or
 //! through the virtual device (src/virtual_audio.rs) for tests.
 
@@ -23,17 +23,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use clap::builder::{PossibleValuesParser, TypedValueParser};
 
 use ptt_key::PttKey;
 use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
 use ptt_radio_companion::echo::{self, EchoPath};
-use ptt_radio_companion::mix::{self, Mixer};
+use ptt_radio_companion::jitter::SLICE;
+use ptt_radio_companion::mix::{self, Mixer, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, HELLO, Incoming, RosterEntry, START, VOICE};
-use ptt_radio_companion::tx::{FRAME_SAMPLES, Transmitter};
+use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
 
-const FRAME: Duration = Duration::from_millis(20);
+/// audio kept queued ahead of the output device
+const OUTPUT_AHEAD: Duration = Duration::from_millis(20);
 const HELLO_EVERY: Duration = Duration::from_secs(5);
 const ROSTER_WARN_AFTER: Duration = Duration::from_secs(3);
 const AUTO_PTT_GIVE_UP: Duration = Duration::from_secs(10);
@@ -55,6 +58,15 @@ struct Args {
     /// Opus bitrate in bit/s
     #[arg(long, default_value_t = 16_000, value_parser = clap::value_parser!(u32).range(500..=512_000))]
     bitrate: u32,
+    /// Opus frame (packet) duration in ms; receivers play any mix of durations
+    #[arg(long, default_value_t = 20, value_parser = PossibleValuesParser::new(["10", "20"]).map(|s| s.parse::<usize>().unwrap()))]
+    frame_ms: usize,
+    /// Opus encoder complexity, 0 (cheapest) ..= 10
+    #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(u8).range(0..=10))]
+    complexity: u8,
+    /// Opus in-band FEC (costs bits; only a lost packet uses it, and the game loses none)
+    #[arg(long)]
+    fec: bool,
     /// global push-to-talk key in global-hotkey syntax, e.g. F8, F13, shift+F8; "none" registers no key
     #[arg(long, default_value = "F8")]
     ptt_key: String,
@@ -258,9 +270,22 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         None => None,
     };
 
+    let codec = Codec {
+        frame_ms: args.frame_ms,
+        bitrate: args.bitrate,
+        complexity: args.complexity,
+        fec: args.fec,
+    };
+    shared.trace(format_args!(
+        "codec {} {} {} {}",
+        codec.frame_samples(),
+        codec.bitrate,
+        codec.complexity,
+        codec.fec as u8
+    ));
     let tx_thread = {
-        let (shared, bitrate) = (shared.clone(), args.bitrate);
-        thread::spawn(move || transmit(&shared, source, bitrate))
+        let shared = shared.clone();
+        thread::spawn(move || transmit(&shared, source, codec))
     };
     let rx_thread = {
         let shared = shared.clone();
@@ -404,14 +429,14 @@ impl Source {
         }
     }
 
-    /// blocks until the next 20 ms frame at 48 kHz is ready; None once shutdown starts
-    fn next_frame(&mut self, done: &AtomicBool) -> Option<Vec<f32>> {
+    /// blocks until the next frame of `n` samples at 48 kHz is ready; None once shutdown starts
+    fn next_frame(&mut self, n: usize, done: &AtomicBool) -> Option<Vec<f32>> {
         match self {
             Source::Tone { hz, phase, next } => {
-                *next += FRAME;
+                *next += Duration::from_secs_f64(n as f64 / OPUS_RATE as f64);
                 thread::sleep(next.saturating_duration_since(Instant::now()));
                 let step = std::f32::consts::TAU * *hz / OPUS_RATE as f32;
-                let frame = (0..FRAME_SAMPLES)
+                let frame = (0..n)
                     .map(|_| {
                         let s = 0.3 * phase.sin();
                         *phase = (*phase + step) % std::f32::consts::TAU;
@@ -425,15 +450,15 @@ impl Source {
                 resampler,
                 pending,
             } => loop {
-                if pending.len() >= FRAME_SAMPLES {
-                    return Some(pending.drain(..FRAME_SAMPLES).collect());
+                if pending.len() >= n {
+                    return Some(pending.drain(..n).collect());
                 }
                 if done.load(Relaxed) {
                     return None;
                 }
                 let captured: Vec<f32> = samples.lock().unwrap().drain(..).collect();
                 resampler.process(&captured, pending);
-                if pending.len() < FRAME_SAMPLES {
+                if pending.len() < n {
                     // the poll period adds up to its own length to every frame
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -443,12 +468,12 @@ impl Source {
 }
 
 /// returns the number of VOICE frames sent
-fn transmit(shared: &Shared, mut source: Source, bitrate: u32) -> u64 {
-    let mut tx = Transmitter::new(bitrate).expect("opus encoder");
+fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
+    let mut tx = Transmitter::new(codec).expect("opus encoder");
     let mut sent = 0;
-    // captured frames so far: frame n holds samples [n * 960, (n + 1) * 960) of the capture
+    // captured frames so far: frame n holds samples [n * size, (n + 1) * size) of the capture
     let mut frame = 0;
-    while let Some(mut pcm) = source.next_frame(&shared.done) {
+    while let Some(mut pcm) = source.next_frame(tx.frame_samples(), &shared.done) {
         let ready_us = unix_us();
         shared.echo.near_end(&mut pcm);
         tx.set_ptt(shared.ptt.load(Relaxed));
@@ -475,8 +500,9 @@ fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u6
                     .insert(seq, (Instant::now(), p[5..].to_vec()));
                 send(shared, &p);
                 shared.trace(format_args!(
-                    "tx {seq} {voice_frame} {} {ready_us}",
-                    (voice_frame < frame) as u8
+                    "tx {seq} {voice_frame} {} {ready_us} {}",
+                    (voice_frame < frame) as u8,
+                    p.len() - 5
                 ));
                 voice_frame += 1;
             }
@@ -584,7 +610,7 @@ fn receive(shared: &Shared) -> RxStats {
     stats
 }
 
-/// returns the number of 20 ms frames written to the wav
+/// returns the number of slices written to the wav
 fn playout(
     shared: &Shared,
     output: Option<(Samples, u32, Option<Arc<AtomicU64>>)>,
@@ -598,10 +624,10 @@ fn playout(
     let mut out = Vec::new();
     while !shared.done.load(Relaxed) {
         match &output {
-            // the output device's clock paces playout: top the queue up with the next frame
-            // once less than one frame is left
+            // the output device's clock paces playout: top the queue up with the next slice
+            // once less than OUTPUT_AHEAD is left
             Some((samples, rate, _)) => {
-                let ahead = *rate as usize * FRAME.as_millis() as usize / 1000;
+                let ahead = *rate as usize * OUTPUT_AHEAD.as_millis() as usize / 1000;
                 if samples.lock().unwrap().len() >= ahead {
                     thread::sleep(Duration::from_millis(2));
                     continue;
@@ -609,7 +635,7 @@ fn playout(
             }
             // no device: the system clock paces it
             None => {
-                next += FRAME;
+                next += SLICE;
                 thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         }
@@ -618,7 +644,7 @@ fn playout(
             let mix = mixer.tick(Instant::now());
             (mix, std::mem::take(&mut mixer.pulled))
         };
-        let frame = mix.as_deref().unwrap_or(&[0.0; FRAME_SAMPLES]);
+        let frame = mix.as_deref().unwrap_or(&[0.0; SLICE_SAMPLES]);
         shared.echo.far_end(frame);
         if let (Some(frame), Some(writer)) = (&mix, wav.as_mut()) {
             let written = frame.iter().try_for_each(|s| {
@@ -646,14 +672,15 @@ fn playout(
             queue.extend(&out);
         }
         for p in pulled {
-            if let Some(seq) = p.shed {
-                shared.trace(format_args!("shed {} {seq}", p.sender));
+            if let Some((seq, offset)) = p.shed {
+                shared.trace(format_args!("shed {} {seq} {offset}", p.sender));
             }
-            match p.seq {
-                Some(seq) => {
-                    shared.trace(format_args!("pull {} {seq} {} {slot}", p.sender, p.queued))
-                }
-                None => shared.trace(format_args!("pull {} - 0 {slot}", p.sender)),
+            match p.slice {
+                Some((seq, offset)) => shared.trace(format_args!(
+                    "pull {} {seq} {offset} {} {slot}",
+                    p.sender, p.queued
+                )),
+                None => shared.trace(format_args!("pull {} - 0 0 {slot}", p.sender)),
             }
         }
     }
@@ -704,7 +731,7 @@ fn summary(frames_sent: u64, rx: &RxStats, mix: &mix::MixStats, recorded: u64) -
         mix.decode_errors,
         mix.dropped_late,
         mix.underruns,
-        recorded as f64 * FRAME.as_secs_f64(),
+        recorded as f64 * SLICE.as_secs_f64(),
         rx.ignored
     )
 }

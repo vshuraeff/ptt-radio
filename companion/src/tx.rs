@@ -1,22 +1,54 @@
-//! transmit state machine: decides per captured 20 ms frame what goes to the game.
-//! on air while PTT is held or open mic is on; going on air sends START, then
-//! the pre-roll of already-captured frames, then live VOICE; going off air
+//! transmit state machine: decides per captured frame (10 or 20 ms) what goes to
+//! the game. on air while PTT is held or open mic is on; going on air sends START,
+//! then the pre-roll of already-captured frames, then live VOICE; going off air
 //! sends the frame in progress, then STOP twice.
 
 use std::collections::VecDeque;
 
 use opusic_c::{Application, Bitrate, Channels, Encoder, InbandFec, SampleRate};
 
+use crate::audio::OPUS_RATE;
 use crate::packet::{self, START, STOP, VOICE};
 
-pub const FRAME_SAMPLES: usize = 960;
-/// 120 ms of audio captured before the press, the frame in progress included
-pub const PREROLL_FRAMES: usize = 6;
+/// audio captured before the press, the frame in progress included
+const PREROLL_MS: usize = 120;
 // opus never produces more than 1275 bytes per frame
 const MAX_PACKET: usize = 1275;
 
+/// encoder settings (--frame-ms, --bitrate, --complexity, --fec). a receiver needs none
+/// of them: opus packets carry their own duration
+#[derive(Clone, Copy, Debug)]
+pub struct Codec {
+    pub frame_ms: usize,
+    pub bitrate: u32,
+    /// 0..=10; libopus 1.6.1 defaults to 9 for VOIP
+    pub complexity: u8,
+    /// in-band FEC, told to expect 10 % loss: without an expected loss the encoder spends
+    /// nothing on it, and only a lost packet is ever decoded from it
+    pub fec: bool,
+}
+
+impl Default for Codec {
+    fn default() -> Self {
+        Codec {
+            frame_ms: 20,
+            bitrate: 16_000,
+            complexity: 9,
+            fec: false,
+        }
+    }
+}
+
+impl Codec {
+    pub fn frame_samples(&self) -> usize {
+        OPUS_RATE as usize / 1000 * self.frame_ms
+    }
+}
+
 pub struct Transmitter {
     encoder: Encoder,
+    frame_samples: usize,
+    preroll_frames: usize,
     seq: u16,
     ptt: bool,
     open_mic: bool,
@@ -25,19 +57,32 @@ pub struct Transmitter {
 }
 
 impl Transmitter {
-    pub fn new(bitrate: u32) -> Result<Self, opusic_c::ErrorCode> {
+    pub fn new(codec: Codec) -> Result<Self, opusic_c::ErrorCode> {
         let mut encoder = Encoder::new(Channels::Mono, SampleRate::Hz48000, Application::Voip)?;
-        encoder.set_bitrate(Bitrate::Value(bitrate))?;
-        encoder.set_inband_fec(InbandFec::Off)?;
+        encoder.set_bitrate(Bitrate::Value(codec.bitrate))?;
+        encoder.set_complexity(codec.complexity)?;
+        if codec.fec {
+            encoder.set_inband_fec(InbandFec::Mode1)?;
+            encoder.set_packet_loss(10)?;
+        } else {
+            encoder.set_inband_fec(InbandFec::Off)?;
+        }
         encoder.set_dtx(false)?;
         Ok(Transmitter {
             encoder,
+            frame_samples: codec.frame_samples(),
+            preroll_frames: PREROLL_MS / codec.frame_ms,
             seq: 0,
             ptt: false,
             open_mic: false,
             on_air: false,
             preroll: VecDeque::new(),
         })
+    }
+
+    /// 48 kHz samples `frame` takes
+    pub fn frame_samples(&self) -> usize {
+        self.frame_samples
     }
 
     pub fn set_ptt(&mut self, held: bool) {
@@ -49,7 +94,7 @@ impl Transmitter {
         self.open_mic = open;
     }
 
-    /// takes one 48 kHz mono frame of FRAME_SAMPLES and returns the packets to send, in order
+    /// takes one 48 kHz mono frame of `frame_samples` and returns the packets to send, in order
     pub fn frame(&mut self, pcm: &[f32]) -> Vec<Vec<u8>> {
         let want = self.ptt || self.open_mic;
         let mut out = Vec::new();
@@ -63,7 +108,7 @@ impl Transmitter {
             return out;
         }
         self.preroll.push_back(pcm.to_vec());
-        if self.preroll.len() > PREROLL_FRAMES {
+        if self.preroll.len() > self.preroll_frames {
             self.preroll.pop_front();
         }
         if want {
@@ -94,7 +139,7 @@ impl Transmitter {
         let len = self
             .encoder
             .encode_float_to_slice(pcm, &mut buf)
-            .expect("opus encode of a 20 ms frame");
+            .expect("opus encode of a 10 or 20 ms frame");
         self.seq = self.seq.wrapping_add(1);
         packet::encode(VOICE, self.seq, &buf[..len])
     }
@@ -109,12 +154,32 @@ mod tests {
     }
 
     fn silence() -> Vec<f32> {
-        vec![0.0; FRAME_SAMPLES]
+        vec![0.0; Codec::default().frame_samples()]
+    }
+
+    #[test]
+    fn ten_ms_frames_keep_120_ms_of_preroll() {
+        let codec = Codec {
+            frame_ms: 10,
+            ..Codec::default()
+        };
+        let mut tx = Transmitter::new(codec).unwrap();
+        assert_eq!(tx.frame_samples(), 480);
+        for _ in 0..20 {
+            tx.frame(&[0.0; 480]);
+        }
+        tx.set_ptt(true);
+        let press = tx.frame(&[0.0; 480]);
+        assert_eq!(kinds(&press).len(), 1 + 12);
+        // a 10 ms opus packet says so itself: 480 samples at 48 kHz
+        let decoder =
+            opusic_c::Decoder::new(Channels::Mono, SampleRate::Hz48000).expect("opus decoder");
+        assert_eq!(decoder.get_nb_samples(&press[1][5..]).unwrap(), 480);
     }
 
     #[test]
     fn idle_sends_nothing() {
-        let mut tx = Transmitter::new(16_000).unwrap();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
         for _ in 0..10 {
             assert!(tx.frame(&silence()).is_empty());
         }
@@ -122,7 +187,7 @@ mod tests {
 
     #[test]
     fn ptt_press_sends_start_and_preroll_release_sends_frame_and_two_stops() {
-        let mut tx = Transmitter::new(16_000).unwrap();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
         for _ in 0..10 {
             tx.frame(&silence());
         }
@@ -144,7 +209,7 @@ mod tests {
 
     #[test]
     fn preroll_is_shorter_right_after_startup_and_after_release() {
-        let mut tx = Transmitter::new(16_000).unwrap();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
         tx.set_ptt(true);
         assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
         tx.set_ptt(false);
@@ -156,7 +221,7 @@ mod tests {
 
     #[test]
     fn mic_state_is_idempotent_and_overrides_ptt() {
-        let mut tx = Transmitter::new(16_000).unwrap();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
         tx.set_open_mic(true);
         assert_eq!(kinds(&tx.frame(&silence()))[0], START);
         tx.set_open_mic(true);
@@ -174,7 +239,7 @@ mod tests {
 
     #[test]
     fn close_stops_only_an_open_transmission() {
-        let mut tx = Transmitter::new(16_000).unwrap();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
         assert!(tx.close().is_empty());
         tx.set_ptt(true);
         tx.frame(&silence());

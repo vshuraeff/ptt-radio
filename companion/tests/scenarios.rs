@@ -29,7 +29,8 @@ use ptt_radio_companion::{percentile, virtual_audio};
 const FS: usize = 48_000;
 // envelope hop: 1 ms
 const HOP: usize = FS / 1000;
-const FRAME_US: u64 = 20_000;
+const SLICE_SAMPLES: usize = ptt_radio_companion::mix::SLICE_SAMPLES;
+const SLICE_MS: f64 = SLICE_SAMPLES as f64 * 1000.0 / FS as f64;
 // player A talks, B listens or talks back; the relay numbers players from 1, A is player 1
 const A: u16 = 1;
 // speaker-to-mic coupling of the "player with speakers": -6 dB, 2 ms of air, a small room
@@ -50,59 +51,163 @@ const ROOM: [(f64, f32); 8] = [
 // the scenarios measure real-time latency: running two at once would skew both
 static SERIAL: Mutex<()> = Mutex::new(());
 
-#[test]
-fn latency_a_talks_b_listens() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let run = Session {
-        name: "latency",
+/// A talks with `codec` (extra companion flags), B listens with the defaults
+fn latency_session(name: &str, codec: &[String]) -> Outcome {
+    Session {
+        name: name.to_string(),
         players: vec![
-            Talker::ptt(place(0.8, talk(3.0), 6.0), 3.8),
+            Talker::ptt(place(0.8, talk(3.0), 6.0), 3.8).with_args(codec),
             Talker::listener(),
         ],
         stall: None,
         seconds: 6.0,
     }
-    .run();
+    .run()
+}
+
+/// what the latency scenario reads from one run
+struct Latency {
+    acoustic: Lag,
+    stages: Vec<(String, String)>,
+    /// mean of the per-frame trace totals
+    total: f64,
+    /// jitter stage, mean ms
+    jitter: f64,
+    first_live: f64,
+    /// slices of A that B played, concealed, shed (live ones of them)
+    played: usize,
+    silence: usize,
+    shed: usize,
+    shed_live: usize,
+    /// B's queue after a pull, median, ms
+    depth_ms: f64,
+}
+
+fn latency(run: &Outcome) -> Latency {
+    let (a, b) = (&run.players[0], &run.players[1]);
+    let frames = frame_timings(a, A, &run.relay, b);
+    let live: Vec<&FrameTiming> = frames.iter().filter(|f| !f.preroll).collect();
+    let acoustic = acoustic_lag(a, b, None);
+    let shed = b.trace.shed_from(A);
+    Latency {
+        stages: stage_table(&live, acoustic.lag_ms),
+        acoustic,
+        total: mean(live.iter().map(|f| f.total_ms())),
+        jitter: mean(live.iter().map(|f| (f.pull_us - f.rx_us) / 1000.0)),
+        first_live: live.first().map_or(f64::NAN, |f| f.total_ms()),
+        played: b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count(),
+        silence: b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count(),
+        shed_live: shed
+            .iter()
+            .filter(|(seq, _)| !a.trace.tx[seq].preroll)
+            .count(),
+        shed: shed.len(),
+        depth_ms: median(live.iter().map(|f| f.queued as f64 * SLICE_MS)),
+    }
+}
+
+/// frame duration x bitrate x complexity (and FEC once): latency, traffic and how close A's
+/// voice at B is to what A said. B keeps the default codec, so every row also checks a
+/// receiver configured differently from its sender.
+///
+///   cargo test --release --test scenarios quality_sweep -- --ignored --nocapture
+#[test]
+#[ignore = "25 real-time runs, about 4 minutes"]
+fn quality_sweep() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut settings: Vec<(usize, u32, u8, bool)> = Vec::new();
+    for frame_ms in [10, 20] {
+        for kbit in [12, 16, 24, 32] {
+            for complexity in [5, 9, 10] {
+                settings.push((frame_ms, kbit, complexity, false));
+            }
+        }
+    }
+    settings.push((20, 16, 9, true));
+    let mut rows = Vec::new();
+    for (frame_ms, kbit, complexity, fec) in settings {
+        let name = format!(
+            "sweep-{frame_ms}ms-{kbit}k-c{complexity}{}",
+            if fec { "-fec" } else { "" }
+        );
+        let mut codec = vec![
+            "--frame-ms".to_string(),
+            frame_ms.to_string(),
+            "--bitrate".into(),
+            (kbit * 1000).to_string(),
+            "--complexity".into(),
+            complexity.to_string(),
+        ];
+        if fec {
+            codec.push("--fec".into());
+        }
+        let run = latency_session(&name, &codec);
+        let l = latency(&run);
+        let (a, b) = (&run.players[0], &run.players[1]);
+        let live: Vec<&TxFrame> = a.trace.tx.values().filter(|t| !t.preroll).collect();
+        let packets_per_s = 1000.0 / frame_ms as f64;
+        // the 5-byte ptt-radio header on top of opus
+        let bytes_per_s = mean(live.iter().map(|t| t.bytes as f64 + 5.0)) * packets_per_s;
+        let q = quality(a, b, A);
+        rows.push(format!(
+            "{frame_ms:>5} {kbit:>5} {complexity:>3} {:>4} {:>6.0} {:>6.1} {:>5.0} {:>6.0} {:>6.1} {:>5.2} {:>4}  {}",
+            if fec { "on" } else { "off" },
+            l.acoustic.lag_ms,
+            l.jitter,
+            packets_per_s,
+            bytes_per_s,
+            q.seg_snr_db,
+            q.lsd_db,
+            l.silence,
+            Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join("scenarios")
+                .join(&name)
+                .join("b-speaker.wav")
+                .display()
+        ));
+    }
+    println!(
+        "\nquality sweep: A talks with the row's codec, B listens with the defaults\n\
+         frame  kbit  cx  fec  m2e,ms jit,ms pkt/s    B/s segSNR   LSD conc  B's speaker wav"
+    );
+    for row in &rows {
+        println!("{row}");
+    }
+}
+
+#[test]
+fn latency_a_talks_b_listens() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let run = latency_session("latency", &[]);
     let (a, b) = (&run.players[0], &run.players[1]);
     let press = a.trace.first_ptt_us();
     assert!(
         press < a.trace.device_us + 800_000,
         "PTT pressed after the voice started"
     );
-
-    let frames = frame_timings(a, A, &run.relay, b);
-    let live: Vec<&FrameTiming> = frames.iter().filter(|f| !f.preroll).collect();
-    let acoustic = acoustic_lag(a, b, None);
-    let stages = stage_table(&live, acoustic.lag_ms);
-    let played = b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count();
-    let silence = b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count();
-    let shed = b.trace.shed_from(A);
-    let shed_live = shed.iter().filter(|seq| !a.trace.tx[seq].preroll).count();
-    let depth = median(live.iter().map(|f| f.queued as f64));
-    let first_live = live.first().map_or(f64::NAN, |f| f.total_ms());
+    let l = latency(&run);
     print_table(
         "latency: A talks (PTT), B listens",
         &[
-            stages.as_slice(),
+            l.stages.as_slice(),
             &[
-                row("mouth-to-ear (acoustic xcorr)", fmt_ms(acoustic.lag_ms)),
-                row("  xcorr peak", format!("{:.2}", acoustic.peak)),
-                row("first live frame, total", fmt_ms(first_live)),
+                row("mouth-to-ear (acoustic xcorr)", fmt_ms(l.acoustic.lag_ms)),
+                row("  xcorr peak", format!("{:.2}", l.acoustic.peak)),
+                row("first live frame, total", fmt_ms(l.first_live)),
+                row("B jitter queue after pull (median)", fmt_ms(l.depth_ms)),
                 row(
-                    "B jitter queue after pull (median)",
-                    format!("{depth:.0} frames"),
-                ),
-                row(
-                    "frames A sent / B played / shed (live of them)",
+                    "slices A sent / B played / shed (live of them)",
                     format!(
-                        "{} / {played} / {} ({shed_live})",
-                        a.trace.stats.sent,
-                        shed.len()
+                        "{} / {} / {} ({})",
+                        a.trace.sent_slices(),
+                        l.played,
+                        l.shed,
+                        l.shed_live
                     ),
                 ),
                 row(
-                    "dropped / silence inserted at B",
-                    format!("{} / {silence}", b.trace.stats.dropped),
+                    "slices dropped / concealed at B",
+                    format!("{} / {}", b.trace.stats.dropped, l.silence),
                 ),
                 row("relay delay p50 / p95", relay_delay(&run.relay)),
             ],
@@ -111,31 +216,34 @@ fn latency_a_talks_b_listens() {
     );
 
     // the acoustic measure and the frame trace must tell the same story
-    let total = mean(live.iter().map(|f| f.total_ms()));
+    let acoustic = &l.acoustic;
     assert!(
         acoustic.peak > 0.5,
         "voice not found at B: {}",
         acoustic.peak
     );
     // the delta is the codec (opus 6.5 ms lookahead), the 1 ms envelope hop and the talker's
-    // echo canceller delay: measured 4.8-7.0 ms without a canceller, so 10 ms leaves 3 ms for load
+    // echo canceller delay: measured 3.8-7.0 ms without a canceller, so 10 ms leaves 3 ms for load
     let expected = a.trace.canceller_delay_ms;
+    let total = l.total;
     assert!(
         (acoustic.lag_ms - total - expected).abs() < 10.0,
         "acoustic {} ms vs frames {total:.1} ms + canceller {expected} ms",
         acoustic.lag_ms
     );
-    // complete: every frame A sent was played or shed as backlog, nothing dropped. with no
+    // complete: every slice A sent was played or shed as backlog, nothing dropped. with no
     // margin kept until an underrun, a loaded machine can starve one pull (seen once in a debug
     // build beside parallel test runs, never in 5 release runs); the decoder conceals it and
     // the margin then holds, so one is allowed
-    assert_eq!((played + shed.len()) as u64, a.trace.stats.sent);
+    assert_eq!((l.played + l.shed) as u64, a.trace.sent_slices());
     assert_eq!(b.trace.stats.dropped, 0);
-    assert!(silence <= 1, "{silence} underruns at B");
-    // the pre-roll burst is shed: the queue left after a pull is the tick-batching low water
+    assert!(l.silence <= 1, "{} underruns at B", l.silence);
+    // the pre-roll burst (120 ms) is shed: what stays after a pull is the margin plus what the
+    // tick batching needs between deliveries, 10-30 ms by median over 10 ms pulls (2026-10-24)
     assert!(
-        depth <= 1.0,
-        "start backlog not drained: {depth} frames queued"
+        l.depth_ms <= 30.0,
+        "start backlog not drained: {} ms queued",
+        l.depth_ms
     );
     // 2026-10-24: 240-262 ms before the backlog was shed, 152-153 ms after (3 runs) without a
     // canceller. margin: one relay tick and a few ms of load
@@ -150,7 +258,7 @@ fn latency_a_talks_b_listens() {
 fn echo_return_b_has_speakers_and_open_mic() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let run = Session {
-        name: "echo",
+        name: "echo".into(),
         players: vec![
             Talker::ptt(place(0.8, talk(3.0), 6.0), 3.8),
             Talker::open_mic(Vec::new(), true),
@@ -195,7 +303,7 @@ fn echo_return_b_has_speakers_and_open_mic() {
 fn double_talk_a_and_b_at_once() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let run = Session {
-        name: "double-talk",
+        name: "double-talk".into(),
         players: vec![
             Talker::ptt(place(0.8, talk(3.5), 6.0), 4.3),
             Talker::open_mic(place(0.9, speech(2, 210.0, 3.4), 6.0), true),
@@ -250,7 +358,7 @@ fn stall_burst_recovers() {
         every: None,
     };
     let run = Session {
-        name: "stall",
+        name: "stall".into(),
         players: vec![
             Talker::ptt(place(0.8, talk(7.0), 10.0), 7.8),
             Talker::listener(),
@@ -275,7 +383,7 @@ fn stall_burst_recovers() {
         median(
             live.iter()
                 .filter(|f| f.mic_us >= from && f.mic_us < to)
-                .map(|f| f.queued as f64),
+                .map(|f| f.queued as f64 * SLICE_MS),
         )
     };
     let depth_before = depth(0.0, stall_start as f64 - 300_000.0);
@@ -284,10 +392,11 @@ fn stall_burst_recovers() {
     let settled = live
         .iter()
         .filter(|f| f.play_us > stall_end as f64 && (f.total_ms() - after).abs() > 10.0)
-        .map(|f| (f.play_us - stall_end as f64) / 1000.0 + 20.0)
+        .map(|f| (f.play_us - stall_end as f64 + f.frame_us) / 1000.0)
         .fold(0.0, f64::max);
     let acoustic_before = acoustic_lag(a, b, Some((0, stall_start)));
     let acoustic_after = acoustic_lag(a, b, Some((stall_end + 1_000_000, u64::MAX)));
+    let played = b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count() as u64;
     let silence = b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count();
     print_table(
         "stall: relay stops 500 ms mid-utterance, then bursts",
@@ -319,14 +428,13 @@ fn stall_burst_recovers() {
             ),
             row(
                 "B jitter queue before / after",
-                format!("{depth_before:.0} / {depth_after:.0} frames"),
+                format!("{} / {}", fmt_ms(depth_before), fmt_ms(depth_after)),
             ),
             row(
-                "frames sent / played / dropped / silence",
+                "slices sent / played / dropped / concealed",
                 format!(
-                    "{} / {} / {} / {silence}",
-                    a.trace.stats.sent,
-                    frames.len(),
+                    "{} / {played} / {} / {silence}",
+                    a.trace.sent_slices(),
                     b.trace.stats.dropped
                 ),
             ),
@@ -340,17 +448,14 @@ fn stall_burst_recovers() {
         "the burst was played instead of trimmed"
     );
     // nothing lost besides what the jitter buffer dropped or shed on purpose
-    assert_eq!(
-        frames.len() as u64 + b.trace.stats.dropped + shed,
-        a.trace.stats.sent
-    );
-    // the burst after the stall is shed back to the depth before it; the underrun keeps one
-    // frame of margin for a while, so allow that one frame. 2026-10-24: 0 / 0 frames queued,
+    assert_eq!(played + b.trace.stats.dropped + shed, a.trace.sent_slices());
+    // the burst after the stall is shed back to the depth before it; the underrun keeps 20 ms
+    // of margin for a while, so allow that. 2026-10-24 with 20 ms slices: 0 / 0 frames queued,
     // 145 ms before and 142-143 ms after (3 runs); without shedding the trim left 2..10 frames
     // and up to 100 ms extra for the rest of the utterance
     assert!(
-        depth_after <= depth_before + 1.0,
-        "stall backlog not drained: {depth_before:.0} -> {depth_after:.0} frames"
+        depth_after <= depth_before + 20.0,
+        "stall backlog not drained: {depth_before:.0} -> {depth_after:.0} ms"
     );
     assert!(
         after <= before + 20.0,
@@ -369,6 +474,8 @@ struct Talker {
     auto_ptt: Option<f64>,
     open_mic: bool,
     coupled: bool,
+    /// extra companion flags, e.g. the codec settings
+    args: Vec<String>,
 }
 
 impl Talker {
@@ -378,6 +485,7 @@ impl Talker {
             auto_ptt: Some(hold_seconds),
             open_mic: false,
             coupled: false,
+            args: Vec::new(),
         }
     }
 
@@ -387,6 +495,7 @@ impl Talker {
             auto_ptt: None,
             open_mic: false,
             coupled: false,
+            args: Vec::new(),
         }
     }
 
@@ -396,12 +505,18 @@ impl Talker {
             auto_ptt: None,
             open_mic: true,
             coupled,
+            args: Vec::new(),
         }
+    }
+
+    fn with_args(mut self, args: &[String]) -> Self {
+        self.args = args.to_vec();
+        self
     }
 }
 
 struct Session {
-    name: &'static str,
+    name: String,
     players: Vec<Talker>,
     stall: Option<Stall>,
     seconds: f64,
@@ -424,7 +539,7 @@ impl Session {
     fn run(self) -> Outcome {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("scenarios")
-            .join(self.name);
+            .join(&self.name);
         // the previous run's files, if any; create_dir_all below reports real trouble
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -478,6 +593,7 @@ impl Session {
             if let Some(hold) = talker.auto_ptt {
                 cmd.arg("--auto-ptt").arg(hold.to_string());
             }
+            cmd.args(&talker.args);
             if talker.coupled {
                 cmd.arg("--couple-gain-db")
                     .arg(COUPLE_GAIN_DB.to_string())
@@ -575,14 +691,19 @@ struct TxFrame {
     preroll: bool,
     ready_us: u64,
     sent_us: u64,
+    /// opus bytes
+    bytes: usize,
 }
 
 struct PullEvent {
     at_us: u64,
     sender: u16,
     seq: Option<u16>,
+    /// sample offset of the pulled slice in its packet
+    offset: usize,
+    /// slices still queued
     queued: usize,
-    /// index on the device timeline at which the pulled frame's first sample sounds
+    /// index on the device timeline at which the pulled slice's first sample sounds
     slot: u64,
 }
 
@@ -592,12 +713,14 @@ struct Trace {
     device_us: u64,
     canceller: String,
     canceller_delay_ms: f64,
+    /// this companion's own encoder: samples per frame, bitrate, complexity, fec
+    frame_samples: usize,
     ptt: Vec<(u64, bool)>,
     tx: HashMap<u16, TxFrame>,
     rx: HashMap<(u16, u16), u64>,
     pulls: Vec<PullEvent>,
-    /// (sender, seq) skipped by the receiver to cut a backlog
-    shed: HashSet<(u16, u16)>,
+    /// (sender, seq, offset) slices skipped by the receiver to cut a backlog
+    shed: HashSet<(u16, u16, usize)>,
     stats: Stats,
 }
 
@@ -615,6 +738,7 @@ impl Trace {
                     // optional: the canceller's algorithmic delay, invisible to the frame trace
                     trace.canceller_delay_ms = f.get(3).map_or(0.0, |d| d.parse().unwrap());
                 }
+                "codec" => trace.frame_samples = num(2) as usize,
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
                 "tx" => {
                     trace.tx.insert(
@@ -624,6 +748,7 @@ impl Trace {
                             preroll: f[4] == "1",
                             ready_us: num(5),
                             sent_us: num(0),
+                            bytes: num(6) as usize,
                         },
                     );
                 }
@@ -631,14 +756,17 @@ impl Trace {
                     trace.rx.insert((num(2) as u16, num(3) as u16), num(0));
                 }
                 "shed" => {
-                    trace.shed.insert((num(2) as u16, num(3) as u16));
+                    trace
+                        .shed
+                        .insert((num(2) as u16, num(3) as u16, num(4) as usize));
                 }
                 "pull" => trace.pulls.push(PullEvent {
                     at_us: num(0),
                     sender: num(2) as u16,
                     seq: f[3].parse().ok(),
-                    queued: num(4) as usize,
-                    slot: num(5),
+                    offset: num(4) as usize,
+                    queued: num(5) as usize,
+                    slot: num(6),
                 }),
                 "stats" => {
                     trace.stats = Stats {
@@ -660,26 +788,35 @@ impl Trace {
             .0
     }
 
-    /// seqs of `sender` this listener shed
-    fn shed_from(&self, sender: u16) -> Vec<u16> {
-        let mut seqs: Vec<u16> = self
+    /// (seq, offset) of the slices of `sender` this listener shed
+    fn shed_from(&self, sender: u16) -> Vec<(u16, usize)> {
+        let mut slices: Vec<(u16, usize)> = self
             .shed
             .iter()
-            .filter(|(s, _)| *s == sender)
-            .map(|&(_, seq)| seq)
+            .filter(|(s, _, _)| *s == sender)
+            .map(|&(_, seq, offset)| (seq, offset))
             .collect();
-        seqs.sort_unstable();
-        seqs
+        slices.sort_unstable();
+        slices
     }
 
     fn pulls_from(&self, sender: u16) -> impl Iterator<Item = &PullEvent> {
         self.pulls.iter().filter(move |p| p.sender == sender)
     }
 
-    /// when the first sample of a pulled frame sounds: sample k of the device timeline sounds at
-    /// `device_us + k / FS`, and the companion traced the frame's k under the queue lock
+    /// when the first sample of a pulled slice sounds: sample k of the device timeline sounds at
+    /// `device_us + k / FS`, and the companion traced the slice's k under the queue lock
     fn play_us(&self, pull: &PullEvent) -> f64 {
         self.device_us as f64 + pull.slot as f64 * 1e6 / FS as f64
+    }
+
+    fn frame_us(&self) -> f64 {
+        self.frame_samples as f64 * 1e6 / FS as f64
+    }
+
+    /// slices in everything this companion sent
+    fn sent_slices(&self) -> u64 {
+        self.stats.sent * (self.frame_samples / SLICE_SAMPLES) as u64
     }
 }
 
@@ -687,6 +824,8 @@ impl Trace {
 
 struct FrameTiming {
     preroll: bool,
+    /// the talker's frame duration
+    frame_us: f64,
     /// first sample of the frame spoken (talker's device timeline)
     mic_us: f64,
     ready_us: f64,
@@ -705,7 +844,7 @@ impl FrameTiming {
     }
 }
 
-/// frames of `talker` (player `sender`) that `listener` played, in order
+/// frames of `talker` (player `sender`) whose first slice `listener` played, in order
 fn frame_timings(
     talker: &PlayerRun,
     sender: u16,
@@ -721,13 +860,16 @@ fn frame_timings(
     listener
         .trace
         .pulls_from(sender)
+        .filter(|pull| pull.offset == 0)
         .filter_map(|pull| {
             let seq = pull.seq?;
             let tx = &talker.trace.tx[&seq];
             let d = relayed[&seq];
+            let frame_us = talker.trace.frame_us();
             Some(FrameTiming {
                 preroll: tx.preroll,
-                mic_us: (talker.trace.device_us + tx.frame * FRAME_US) as f64,
+                frame_us,
+                mic_us: talker.trace.device_us as f64 + tx.frame as f64 * frame_us,
                 ready_us: tx.ready_us as f64,
                 sent_us: tx.sent_us as f64,
                 relay_in_us: d.received_us as f64,
@@ -753,10 +895,8 @@ fn stage_table(live: &[&FrameTiming], acoustic_ms: f64) -> Vec<(String, String)>
     let total = mean(live.iter().map(|f| f.total_ms()));
     vec![
         row("stage (live frames)", "mean ms      ms".into()),
-        stage("capture buffering", &|t| {
-            t.ready_us - t.mic_us - FRAME_US as f64
-        }),
-        stage("framing (20 ms frame)", &|_| FRAME_US as f64),
+        stage("capture buffering", &|t| t.ready_us - t.mic_us - t.frame_us),
+        stage("framing (one frame)", &|t| t.frame_us),
         stage("encode + send", &|t| t.sent_us - t.ready_us),
         stage("udp loopback (both legs)", &|t| {
             (t.relay_in_us - t.sent_us) + (t.rx_us - t.relay_out_us)
@@ -851,6 +991,99 @@ fn acoustic_lag(from: &PlayerRun, to: &PlayerRun, window: Option<(u64, u64)>) ->
         }
     }
     best
+}
+
+struct Quality {
+    /// mean per-slice SNR of the received voice against the source, clamped to -10..35 dB
+    seg_snr_db: f64,
+    /// mean log-spectral distance up to 8 kHz (opus wideband), dB; 0 is identical
+    lsd_db: f64,
+}
+
+/// how close `talker`'s voice at `listener` is to what the talker said, slice by slice: the
+/// traces say which capture samples each played slice holds and where it sounds, so shed
+/// slices and concealment do not misalign the rest. the codec delay (constant) is found by
+/// cross-correlation, the received side is scaled by the least-squares gain, and only slices
+/// whose source is within 40 dB of the loudest sample count
+fn quality(talker: &PlayerRun, listener: &PlayerRun, sender: u16) -> Quality {
+    const N: usize = SLICE_SAMPLES;
+    let (source, received) = (&talker.voice, &listener.speaker);
+    let size = talker.trace.frame_samples;
+    let peak = source.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    // (first source sample, first received sample) of each active played slice
+    let active: Vec<(usize, usize)> = listener
+        .trace
+        .pulls_from(sender)
+        .filter_map(|p| {
+            let tx = talker.trace.tx.get(&p.seq?)?;
+            let s = tx.frame as usize * size + p.offset;
+            let w = source.get(s..s + N)?;
+            let loud = (w.iter().map(|x| x * x).sum::<f32>() / N as f32).sqrt() > peak * 0.01;
+            loud.then_some((s, p.slot as usize))
+        })
+        .collect();
+    // received sample r + i carries source sample s + i - delay
+    let src = |s: usize, i: usize, delay: usize| -> f64 {
+        (s + i).checked_sub(delay).map_or(0.0, |k| source[k] as f64)
+    };
+    let rcv = |r: usize, i: usize| -> f64 { received.get(r + i).map_or(0.0, |x| *x as f64) };
+    let dot = |delay: usize| -> f64 {
+        active
+            .iter()
+            .flat_map(|&(s, r)| (0..N).map(move |i| src(s, i, delay) * rcv(r, i)))
+            .sum()
+    };
+    // opus lookahead is 312 samples at 48 kHz; search around it
+    let delay = (200..=500)
+        .max_by(|a, b| dot(*a).total_cmp(&dot(*b)))
+        .unwrap();
+    let rr: f64 = active
+        .iter()
+        .flat_map(|&(_, r)| (0..N).map(move |i| rcv(r, i).powi(2)))
+        .sum();
+    let gain = dot(delay) / rr.max(1e-12);
+    // 100 Hz bins up to 8 kHz (opus wideband), hann window
+    let bins = 80;
+    let hann: Vec<f64> = (0..N)
+        .map(|n| 0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / N as f64).cos())
+        .collect();
+    let power = |x: &dyn Fn(usize) -> f64| -> Vec<f64> {
+        (1..=bins)
+            .map(|b| {
+                let w = std::f64::consts::TAU * b as f64 / N as f64;
+                let (mut re, mut im) = (0.0, 0.0);
+                for (n, h) in hann.iter().enumerate() {
+                    let v = x(n) * h;
+                    re += v * (w * n as f64).cos();
+                    im -= v * (w * n as f64).sin();
+                }
+                re * re + im * im
+            })
+            .collect()
+    };
+    let (mut snr, mut lsd) = (0.0, 0.0);
+    for &(s, r) in &active {
+        let src = |n: usize| src(s, n, delay);
+        let rcv = |n: usize| rcv(r, n) * gain;
+        let signal: f64 = (0..N).map(|n| src(n).powi(2)).sum();
+        let noise: f64 = (0..N).map(|n| (src(n) - rcv(n)).powi(2)).sum();
+        snr += (10.0 * (signal / noise.max(1e-12)).log10()).clamp(-10.0, 35.0);
+        let (ps, pr) = (power(&src), power(&rcv));
+        // bins more than 60 dB below the frame's strongest are floored there;
+        // the delayed source slice can be silent, so both spectra set the peak
+        let floor = ps.iter().chain(&pr).fold(1e-12f64, |m, p| m.max(*p)) * 1e-6;
+        let d: f64 = ps
+            .iter()
+            .zip(&pr)
+            .map(|(s, r)| (10.0 * (s.max(floor) / r.max(floor)).log10()).powi(2))
+            .sum();
+        lsd += (d / bins as f64).sqrt();
+    }
+    let frames = active.len().max(1) as f64;
+    Quality {
+        seg_snr_db: snr / frames,
+        lsd_db: lsd / frames,
+    }
 }
 
 fn energy_db(samples: &[f32]) -> f64 {
