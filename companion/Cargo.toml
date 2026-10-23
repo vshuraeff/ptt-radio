@@ -1,0 +1,22 @@
+[package]
+name = "ptt-radio-companion"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop companion for the ptt-radio Factorio mod: push-to-talk capture, Opus, playback"
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+cpal = "0.18"
+ctrlc = { version = "3", features = ["termination"] }
+global-hotkey = "0.9"
+hound = "3.5"
+# default feature "bundled": builds the vendored libopus 1.6.1 with cmake and links it statically,
+# so no system libopus is needed on any platform
+opusic-c = "1.6.1"
+
+# the macOS event loop the global hotkey needs (see src/ptt_key.rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSRunLoop", "NSString"] }
