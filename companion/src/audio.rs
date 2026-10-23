@@ -13,6 +13,18 @@ pub type Samples = Arc<Mutex<VecDeque<f32>>>;
 pub const OPUS_RATE: u32 = 48_000;
 // one second of capture is plenty: the transmit loop drains it every few ms
 const MAX_CAPTURE_SECONDS: usize = 1;
+// device callback period where the device lets us choose it, instead of the host
+// default (512 frames, ~11 ms on coreaudio)
+const CALLBACK_MS: u32 = 5;
+
+fn low_latency(supported: cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+    let mut config = supported.config();
+    if let cpal::SupportedBufferSize::Range { min, max } = *supported.buffer_size() {
+        let frames = (config.sample_rate * CALLBACK_MS / 1000).clamp(min, max);
+        config.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
+    config
+}
 
 /// drops the oldest captured samples beyond `MAX_CAPTURE_SECONDS` at `rate`
 pub fn cap_capture(queue: &mut VecDeque<f32>, rate: u32) {
@@ -27,7 +39,7 @@ pub fn open_input(samples: Samples) -> Result<(cpal::Stream, u32), Box<dyn Error
     let device = cpal::default_host()
         .default_input_device()
         .ok_or("no default input device")?;
-    let config = device.default_input_config()?.config();
+    let config = low_latency(device.default_input_config()?);
     let (channels, rate) = (config.channels as usize, config.sample_rate);
     println!(
         "input: {} ({} Hz, {} ch)",
@@ -57,7 +69,7 @@ pub fn open_output(samples: Samples) -> Result<(cpal::Stream, u32), Box<dyn Erro
     let device = cpal::default_host()
         .default_output_device()
         .ok_or("no default output device")?;
-    let config = device.default_output_config()?.config();
+    let config = low_latency(device.default_output_config()?);
     let (channels, rate) = (config.channels as usize, config.sample_rate);
     println!(
         "output: {} ({} Hz, {} ch)",

@@ -13,7 +13,7 @@
 //! assertions pin today's baseline with a margin so a regression fails; they
 //! are not targets. the numbers are printed either way.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::UdpSocket;
 use std::path::Path;
@@ -76,8 +76,9 @@ fn latency_a_talks_b_listens() {
     let stages = stage_table(&live, acoustic.lag_ms);
     let played = b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count();
     let silence = b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count();
+    let shed = b.trace.shed_from(A);
+    let shed_live = shed.iter().filter(|seq| !a.trace.tx[seq].preroll).count();
     let depth = median(live.iter().map(|f| f.queued as f64));
-    let target = ptt_radio_companion::jitter::TARGET_FRAMES;
     let first_live = live.first().map_or(f64::NAN, |f| f.total_ms());
     print_table(
         "latency: A talks (PTT), B listens",
@@ -88,15 +89,16 @@ fn latency_a_talks_b_listens() {
                 row("  xcorr peak", format!("{:.2}", acoustic.peak)),
                 row("first live frame, total", fmt_ms(first_live)),
                 row(
-                    "B jitter queue after pull",
-                    format!(
-                        "{depth:.0} frames, target {target}: {:.0} ms of pre-roll backlog",
-                        (depth - target as f64) * 20.0
-                    ),
+                    "B jitter queue after pull (median)",
+                    format!("{depth:.0} frames"),
                 ),
                 row(
-                    "frames A sent / B played",
-                    format!("{} / {played}", a.trace.stats.sent),
+                    "frames A sent / B played / shed (live of them)",
+                    format!(
+                        "{} / {played} / {} ({shed_live})",
+                        a.trace.stats.sent,
+                        shed.len()
+                    ),
                 ),
                 row(
                     "dropped / silence inserted at B",
@@ -115,23 +117,31 @@ fn latency_a_talks_b_listens() {
         "voice not found at B: {}",
         acoustic.peak
     );
-    // the delta is the codec (opus 6.5 ms lookahead) and the 1 ms envelope hop: measured 6.8-7.0 ms
-    // over three runs, so 10 ms leaves 3 ms for load
+    // the delta is the codec (opus 6.5 ms lookahead), the 1 ms envelope hop and the talker's
+    // echo canceller delay: measured 4.8-7.0 ms without a canceller, so 10 ms leaves 3 ms for load
+    let expected = a.trace.canceller_delay_ms;
     assert!(
-        (acoustic.lag_ms - total).abs() < 10.0,
-        "acoustic {} ms vs frames {total:.1} ms",
+        (acoustic.lag_ms - total - expected).abs() < 10.0,
+        "acoustic {} ms vs frames {total:.1} ms + canceller {expected} ms",
         acoustic.lag_ms
     );
-    // complete: every frame A sent was played, nothing dropped, no gaps
-    assert_eq!(played as u64, a.trace.stats.sent);
+    // complete: every frame A sent was played or shed as backlog, nothing dropped. with no
+    // margin kept until an underrun, a loaded machine can starve one pull (seen once in a debug
+    // build beside parallel test runs, never in 5 release runs); the decoder conceals it and
+    // the margin then holds, so one is allowed
+    assert_eq!((played + shed.len()) as u64, a.trace.stats.sent);
     assert_eq!(b.trace.stats.dropped, 0);
-    assert_eq!(silence, 0);
-    // baseline 2026-10-24: 262 ms mouth-to-ear; the jitter buffer holds 5 frames instead of
-    // 2 for the whole utterance because the pre-roll burst is never caught up. margin: one
-    // relay tick and one frame of jitter
+    assert!(silence <= 1, "{silence} underruns at B");
+    // the pre-roll burst is shed: the queue left after a pull is the tick-batching low water
     assert!(
-        acoustic.lag_ms < 300.0,
-        "mouth-to-ear regressed: {} ms",
+        depth <= 1.0,
+        "start backlog not drained: {depth} frames queued"
+    );
+    // 2026-10-24: 240-262 ms before the backlog was shed, 152-153 ms after (3 runs) without a
+    // canceller. margin: one relay tick and a few ms of load
+    assert!(
+        acoustic.lag_ms < 175.0 + expected,
+        "mouth-to-ear regressed: {} ms (canceller {expected} ms)",
         acoustic.lag_ms
     );
 }
@@ -323,24 +333,27 @@ fn stall_burst_recovers() {
         ],
     );
     // the stall starves B (silence) and the burst is trimmed, not played back to back
+    let shed = b.trace.shed_from(A).len() as u64;
     assert!(silence > 0, "the stall did not reach B");
     assert!(
-        b.trace.stats.dropped > 0,
+        b.trace.stats.dropped + shed > 0,
         "the burst was played instead of trimmed"
     );
-    // nothing lost besides what the jitter buffer dropped on purpose
+    // nothing lost besides what the jitter buffer dropped or shed on purpose
     assert_eq!(
-        frames.len() as u64 + b.trace.stats.dropped,
+        frames.len() as u64 + b.trace.stats.dropped + shed,
         a.trace.stats.sent
     );
-    // baseline 2026-10-24: the trim leaves 2..10 frames queued depending on the burst size,
-    // so latency after the stall ends up anywhere from 60 ms below to 100 ms above the
-    // latency before it (which carries the pre-roll backlog); pinned: bounded by MAX_FRAMES
-    // and stable within a second
-    let max_queue = ptt_radio_companion::jitter::MAX_FRAMES as f64;
-    assert!(depth_after <= max_queue);
+    // the burst after the stall is shed back to the depth before it; the underrun keeps one
+    // frame of margin for a while, so allow that one frame. 2026-10-24: 0 / 0 frames queued,
+    // 145 ms before and 142-143 ms after (3 runs); without shedding the trim left 2..10 frames
+    // and up to 100 ms extra for the rest of the utterance
     assert!(
-        after <= before + (max_queue - depth_before) * 20.0 + 10.0,
+        depth_after <= depth_before + 1.0,
+        "stall backlog not drained: {depth_before:.0} -> {depth_after:.0} frames"
+    );
+    assert!(
+        after <= before + 20.0,
         "latency after the stall {after:.0} ms vs before {before:.0} ms"
     );
     assert!(
@@ -578,10 +591,13 @@ struct Trace {
     /// wall clock of sample 0 of the virtual device timeline
     device_us: u64,
     canceller: String,
+    canceller_delay_ms: f64,
     ptt: Vec<(u64, bool)>,
     tx: HashMap<u16, TxFrame>,
     rx: HashMap<(u16, u16), u64>,
     pulls: Vec<PullEvent>,
+    /// (sender, seq) skipped by the receiver to cut a backlog
+    shed: HashSet<(u16, u16)>,
     stats: Stats,
 }
 
@@ -594,7 +610,11 @@ impl Trace {
             let num = |i: usize| -> u64 { f[i].parse().unwrap() };
             match f[1] {
                 "device" => trace.device_us = num(2),
-                "canceller" => trace.canceller = f[2].to_string(),
+                "canceller" => {
+                    trace.canceller = f[2].to_string();
+                    // optional: the canceller's algorithmic delay, invisible to the frame trace
+                    trace.canceller_delay_ms = f.get(3).map_or(0.0, |d| d.parse().unwrap());
+                }
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
                 "tx" => {
                     trace.tx.insert(
@@ -609,6 +629,9 @@ impl Trace {
                 }
                 "rx" => {
                     trace.rx.insert((num(2) as u16, num(3) as u16), num(0));
+                }
+                "shed" => {
+                    trace.shed.insert((num(2) as u16, num(3) as u16));
                 }
                 "pull" => trace.pulls.push(PullEvent {
                     at_us: num(0),
@@ -635,6 +658,18 @@ impl Trace {
             .find(|(_, held)| *held)
             .expect("PTT pressed")
             .0
+    }
+
+    /// seqs of `sender` this listener shed
+    fn shed_from(&self, sender: u16) -> Vec<u16> {
+        let mut seqs: Vec<u16> = self
+            .shed
+            .iter()
+            .filter(|(s, _)| *s == sender)
+            .map(|&(_, seq)| seq)
+            .collect();
+        seqs.sort_unstable();
+        seqs
     }
 
     fn pulls_from(&self, sender: u16) -> impl Iterator<Item = &PullEvent> {

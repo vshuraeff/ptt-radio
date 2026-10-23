@@ -353,8 +353,8 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     }
     let mix = &shared.mixer.lock().unwrap().stats;
     shared.trace(format_args!(
-        "stats {frames_sent} {} {} {} {}",
-        mix.decoded, mix.decode_errors, mix.dropped_late, mix.underruns
+        "stats {frames_sent} {} {} {} {} {}",
+        mix.decoded, mix.decode_errors, mix.dropped_late, mix.underruns, mix.shed
     ));
     if let Some(file) = &shared.trace {
         file.lock().unwrap().flush()?;
@@ -434,7 +434,8 @@ impl Source {
                 let captured: Vec<f32> = samples.lock().unwrap().drain(..).collect();
                 resampler.process(&captured, pending);
                 if pending.len() < FRAME_SAMPLES {
-                    thread::sleep(Duration::from_millis(5));
+                    // the poll period adds up to its own length to every frame
+                    thread::sleep(Duration::from_millis(1));
                 }
             },
         }
@@ -597,9 +598,10 @@ fn playout(
     let mut out = Vec::new();
     while !shared.done.load(Relaxed) {
         match &output {
-            // the output device's clock paces playout: keep about 40 ms queued ahead of it
+            // the output device's clock paces playout: top the queue up with the next frame
+            // once less than one frame is left
             Some((samples, rate, _)) => {
-                let ahead = 2 * *rate as usize * FRAME.as_millis() as usize / 1000;
+                let ahead = *rate as usize * FRAME.as_millis() as usize / 1000;
                 if samples.lock().unwrap().len() >= ahead {
                     thread::sleep(Duration::from_millis(2));
                     continue;
@@ -644,6 +646,9 @@ fn playout(
             queue.extend(&out);
         }
         for p in pulled {
+            if let Some(seq) = p.shed {
+                shared.trace(format_args!("shed {} {seq}", p.sender));
+            }
             match p.seq {
                 Some(seq) => {
                     shared.trace(format_args!("pull {} {seq} {} {slot}", p.sender, p.queued))
