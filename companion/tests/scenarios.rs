@@ -31,13 +31,16 @@ mod network;
 mod router;
 use network::{Mode, Network};
 
-thread_local! { static MODE: Cell<Mode> = const { Cell::new(Mode::Game) }; }
+thread_local! {
+    static MODE: Cell<Mode> = const { Cell::new(Mode::Game) };
+    static WARMUP: Cell<f64> = const { Cell::new(0.0) };
+}
 
 fn warmup_samples() -> usize {
-    (MODE.get().warmup() * FS as f64) as usize
+    (WARMUP.get() * FS as f64) as usize
 }
 fn warmup_us() -> u64 {
-    (MODE.get().warmup() * 1e6) as u64
+    (WARMUP.get() * 1e6) as u64
 }
 
 use lab::{Lab, LabPlayer};
@@ -755,6 +758,7 @@ macro_rules! transport_scenarios {
                 impl Drop for Reset {
                     fn drop(&mut self) {
                         MODE.set(Mode::Game);
+                        WARMUP.set(0.0);
                     }
                 }
                 let _reset = Reset;
@@ -940,6 +944,7 @@ fn hard_direct_cut_to_hub_and_game() {
         );
     }
     MODE.set(Mode::Game);
+    WARMUP.set(0.0);
 }
 
 #[test]
@@ -1124,8 +1129,11 @@ impl Session {
     }
 
     fn run_with_aec(mut self, enabled: bool) -> Outcome {
+        let started = Instant::now();
         let mode = MODE.get();
-        let warmup = mode.warmup();
+        let warmup = mode.warmup(&self.name);
+        WARMUP.set(warmup);
+        let content_seconds = self.seconds;
         if warmup > 0.0 {
             for player in &mut self.players {
                 let mut voice = vec![0.0; warmup_samples()];
@@ -1195,6 +1203,8 @@ impl Session {
             }
         }
 
+        let prepared = started.elapsed();
+        let spawn_us = ptt_radio_companion::unix_us();
         for (i, talker) in self.players.iter().enumerate() {
             let name = (b'a' + i as u8) as char;
             let mic = dir.join(format!("{name}-mic.wav"));
@@ -1244,6 +1254,7 @@ impl Session {
                 .children
                 .push(cmd.spawn().expect("companion binary"));
         }
+        let spawned = started.elapsed();
         let deadline = Instant::now() + Duration::from_secs_f64(self.seconds + 15.0);
         loop {
             if let Some(network) = &mut network {
@@ -1271,7 +1282,10 @@ impl Session {
             );
             thread::sleep(Duration::from_millis(1));
         }
+        let completed = started.elapsed();
         let relay = children.relay.take().unwrap().stop();
+        drop(children);
+        let stopped = started.elapsed();
         fs::write(
             dir.join("session.trace"),
             format!("stalls {:?}\n", relay.stalls),
@@ -1356,12 +1370,28 @@ impl Session {
                 );
             }
         }
-        Outcome {
+        let device_start_ms = players
+            .iter()
+            .map(|p| p.trace.device_us.saturating_sub(spawn_us) as f64 / 1000.0)
+            .fold(0.0, f64::max);
+        let outcome = Outcome {
             players,
             relay,
             network_origin_us: network.as_ref().map_or(0, |n| n.origin_us),
             network: network.as_ref().map_or_else(Vec::new, |n| n.pump.trace()),
-        }
+        };
+        drop(network);
+        println!(
+            "timing {mode:?}/{} aec={enabled}: wall={:.3}s setup={:.3}s spawn={:.3}s wait={:.3}s teardown={:.3}s read_check={:.3}s device_start={device_start_ms:.1}ms warmup={warmup:.1}s content={content_seconds:.1}s",
+            self.name,
+            started.elapsed().as_secs_f64(),
+            prepared.as_secs_f64(),
+            (spawned - prepared).as_secs_f64(),
+            (completed - spawned).as_secs_f64(),
+            (stopped - completed).as_secs_f64(),
+            (started.elapsed() - stopped).as_secs_f64(),
+        );
+        outcome
     }
 }
 

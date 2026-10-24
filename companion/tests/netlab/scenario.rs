@@ -20,8 +20,21 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn warmup(self) -> f64 {
-        if self == Self::Game { 0.0 } else { 6.0 }
+    pub fn warmup(self, scenario: &str) -> f64 {
+        match self {
+            Self::Game => 0.0,
+            // preserve the double-talk baseline, including the known hub gain flake.
+            _ if scenario == "double-talk" => 6.0,
+            // these windows still see startup jitter-buffer margin with less preparation.
+            Self::Direct if matches!(scenario, "echo" | "latency" | "stall") => 6.0,
+            Self::Hub | Self::Player if matches!(scenario, "stall" | "latency") => 6.0,
+            // traces select both directions within 1.5s; retain settling before speech.
+            Self::Direct | Self::Hub => 2.0,
+            // player relay settles near 2.7s; echo also checks the 10s hello refresh.
+            Self::Player if scenario == "echo" => 6.0,
+            Self::Player => 3.0,
+            _ => 6.0,
+        }
     }
     pub fn route(self) -> &'static str {
         match self {
