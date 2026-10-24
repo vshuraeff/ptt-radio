@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::packet::{self, HELLO, MAGIC, MIC_STATE, ROSTER, START, STOP, VERSION, VOICE};
+use crate::packet::{
+    self, ECHO_STATE, HELLO, MAGIC, MIC_STATE, ROSTER, START, STOP, VERSION, VOICE,
+};
 
 pub const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
@@ -86,10 +88,17 @@ pub struct Delivery {
 #[derive(Default)]
 pub struct Report {
     pub deliveries: Vec<Delivery>,
+    pub echo_states: Vec<EchoState>,
     pub hellos: u64,
     pub ignored: u64,
     /// wall-clock (start, end) of each stall that happened
     pub stalls: Vec<(u64, u64)>,
+}
+
+pub struct EchoState {
+    pub sender: u16,
+    pub engaged: bool,
+    pub received_us: u64,
 }
 
 struct Pending {
@@ -250,6 +259,13 @@ fn tick(
             let p = state.queue.pop_front().expect("checked above");
             let sender_index = p.player as u16 + 1;
             match p.payload[2] {
+                ECHO_STATE if matches!(p.payload.as_slice(), [_, _, _, 0, 0, 0 | 1]) => {
+                    state.report.echo_states.push(EchoState {
+                        sender: sender_index,
+                        engaged: p.payload[5] == 1,
+                        received_us: p.received_us,
+                    });
+                }
                 HELLO => {
                     state.report.hellos += 1;
                     let mut roster = vec!["0\tserver\t204,204,204".to_string()];
@@ -367,6 +383,12 @@ mod tests {
         );
 
         // alice has echo off: only bob hears her; bob has echo on: both hear him
+        b.send_to(&packet::encode(ECHO_STATE, 0, &[1]), game(2))
+            .unwrap();
+        a.send_to(&packet::encode(ECHO_STATE, 0, &[0]), game(1))
+            .unwrap();
+        a.send_to(&packet::encode(ECHO_STATE, 0, &[2]), game(1))
+            .unwrap();
         let voice = |sender, seq, frame| Incoming::Voice { sender, seq, frame };
         a.send_to(&packet::encode(VOICE, 7, &[1, 0, 2]), game(1))
             .unwrap();
@@ -377,6 +399,20 @@ mod tests {
 
         let report = relay.stop();
         assert_eq!(report.hellos, 1);
+        assert_eq!(report.echo_states.len(), 2);
+        assert!(
+            report
+                .echo_states
+                .iter()
+                .any(|s| s.sender == 2 && s.engaged)
+        );
+        assert!(
+            report
+                .echo_states
+                .iter()
+                .any(|s| s.sender == 1 && !s.engaged)
+        );
+        assert_eq!(report.ignored, 1);
         assert_eq!(
             report
                 .deliveries

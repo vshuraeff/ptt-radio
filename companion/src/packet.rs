@@ -13,6 +13,7 @@ pub const HELLO: u8 = 0x01;
 pub const START: u8 = 0x02;
 pub const VOICE: u8 = 0x03;
 pub const STOP: u8 = 0x04;
+pub const ECHO_STATE: u8 = 0x05;
 pub const ROSTER: u8 = 0x10;
 pub const MIC_STATE: u8 = 0x11;
 

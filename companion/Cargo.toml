@@ -14,6 +14,7 @@ hound = "3.5"
 # default feature "bundled": builds the vendored libopus 1.6.1 with cmake and links it statically,
 # so no system libopus is needed on any platform
 opusic-c = "1.6.1"
+sonora = "=0.2.0"
 
 # the macOS event loop the global hotkey needs (see src/ptt_key.rs)
 [target.'cfg(target_os = "macos")'.dependencies]

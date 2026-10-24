@@ -30,7 +30,7 @@ use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
 use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
 use ptt_radio_companion::mix::{self, Mixer, SLICE_SAMPLES};
-use ptt_radio_companion::packet::{self, HELLO, Incoming, RosterEntry, START, VOICE};
+use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
@@ -58,6 +58,9 @@ struct Args {
     /// Opus bitrate in bit/s
     #[arg(long, default_value_t = 16_000, value_parser = clap::value_parser!(u32).range(500..=512_000))]
     bitrate: u32,
+    /// acoustic echo cancellation, selected only after an echo path is detected
+    #[arg(long, value_parser = ["on", "off"], default_value = "on")]
+    aec: String,
     /// Opus frame (packet) duration in ms; receivers play any mix of durations
     #[arg(long, default_value_t = 20, value_parser = PossibleValuesParser::new(["10", "20"]).map(|s| s.parse::<usize>().unwrap()))]
     frame_ms: usize,
@@ -157,6 +160,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         Some(path) => Some(Mutex::new(BufWriter::new(File::create(path)?))),
         None => None,
     };
+    let aec = args.aec == "on";
     let shared = Arc::new(Shared {
         socket,
         game: SocketAddr::from(([127, 0, 0, 1], args.game_port)),
@@ -165,11 +169,14 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         open_mic: AtomicBool::new(false),
         roster_seen: AtomicBool::new(false),
         mixer: Mutex::new(Mixer::default()),
-        echo: EchoPath::default(),
+        echo: EchoPath::new(aec),
         sent: Mutex::new(HashMap::new()),
         trace,
     });
-    shared.trace(format_args!("canceller {}", echo::CANCELLER));
+    shared.trace(format_args!(
+        "canceller {} 0",
+        if aec { echo::CANCELLER } else { "none" }
+    ));
     let interrupted = Arc::new(AtomicBool::new(false));
     let flag = interrupted.clone();
     ctrlc::set_handler(move || flag.store(true, Relaxed))?;
@@ -325,6 +332,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         // heartbeat for the whole lifetime: the mod marks the companion offline after 15 s without HELLO
         if now >= next_hello {
             send(&shared, &hello);
+            send_echo_state(&shared, shared.echo.gate_state().engaged);
             next_hello += HELLO_EVERY;
         }
         let roster_seen = shared.roster_seen.load(Relaxed);
@@ -407,6 +415,11 @@ fn send(shared: &Shared, packet: &[u8]) {
     }
 }
 
+fn send_echo_state(shared: &Shared, engaged: bool) {
+    send(shared, &packet::encode(ECHO_STATE, 0, &[engaged as u8]));
+    shared.trace(format_args!("echo_state {}", engaged as u8));
+}
+
 enum Source {
     Tone {
         hz: f32,
@@ -473,9 +486,28 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
     let mut sent = 0;
     // captured frames so far: frame n holds samples [n * size, (n + 1) * size) of the capture
     let mut frame = 0;
+    let mut gate = false;
     while let Some(mut pcm) = source.next_frame(tx.frame_samples(), &shared.done) {
         let ready_us = unix_us();
         shared.echo.near_end(&mut pcm);
+        let state = shared.echo.gate_state();
+        if state.engaged != gate {
+            send_echo_state(shared, state.engaged);
+            shared.trace(format_args!(
+                "aec_gate {} {} {} {}",
+                state.engaged as u8, state.score, state.lag_ms, state.capture_sample
+            ));
+            shared.trace(format_args!(
+                "canceller {} {}",
+                echo::CANCELLER,
+                if state.engaged {
+                    echo::ALGORITHMIC_DELAY_MS
+                } else {
+                    0.0
+                }
+            ));
+            gate = state.engaged;
+        }
         tx.set_ptt(shared.ptt.load(Relaxed));
         tx.set_open_mic(shared.open_mic.load(Relaxed));
         sent += send_packets(shared, tx.frame(&pcm), frame, ready_us);

@@ -52,7 +52,7 @@ const ROOM: [(f64, f32); 8] = [
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// A talks with `codec` (extra companion flags), B listens with the defaults
-fn latency_session(name: &str, codec: &[String]) -> Outcome {
+fn latency_session(name: &str, codec: &[String], aec: bool) -> Outcome {
     Session {
         name: name.to_string(),
         players: vec![
@@ -62,11 +62,12 @@ fn latency_session(name: &str, codec: &[String]) -> Outcome {
         stall: None,
         seconds: 6.0,
     }
-    .run()
+    .run_with_aec(aec)
 }
 
 /// what the latency scenario reads from one run
 struct Latency {
+    canceller_delay: f64,
     acoustic: Lag,
     stages: Vec<(String, String)>,
     /// mean of the per-frame trace totals
@@ -90,6 +91,7 @@ fn latency(run: &Outcome) -> Latency {
     let acoustic = acoustic_lag(a, b, None);
     let shed = b.trace.shed_from(A);
     Latency {
+        canceller_delay: mean(live.iter().map(|f| f.canceller_delay_ms)),
         stages: stage_table(&live, acoustic.lag_ms),
         acoustic,
         total: mean(live.iter().map(|f| f.total_ms())),
@@ -141,7 +143,7 @@ fn quality_sweep() {
         if fec {
             codec.push("--fec".into());
         }
-        let run = latency_session(&name, &codec);
+        let run = latency_session(&name, &codec, false);
         let l = latency(&run);
         let (a, b) = (&run.players[0], &run.players[1]);
         let live: Vec<&TxFrame> = a.trace.tx.values().filter(|t| !t.preroll).collect();
@@ -162,6 +164,7 @@ fn quality_sweep() {
             Path::new(env!("CARGO_TARGET_TMPDIR"))
                 .join("scenarios")
                 .join(&name)
+                .join("aec-off")
                 .join("b-speaker.wav")
                 .display()
         ));
@@ -178,7 +181,7 @@ fn quality_sweep() {
 #[test]
 fn latency_a_talks_b_listens() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let run = latency_session("latency", &[]);
+    let run = latency_session("latency", &[], true);
     let (a, b) = (&run.players[0], &run.players[1]);
     let press = a.trace.first_ptt_us();
     assert!(
@@ -224,7 +227,7 @@ fn latency_a_talks_b_listens() {
     );
     // the delta is the codec (opus 6.5 ms lookahead), the 1 ms envelope hop and the talker's
     // echo canceller delay: measured 3.8-7.0 ms without a canceller, so 10 ms leaves 3 ms for load
-    let expected = a.trace.canceller_delay_ms;
+    let expected = l.canceller_delay;
     let total = l.total;
     assert!(
         (acoustic.lag_ms - total - expected).abs() < 10.0,
@@ -257,7 +260,7 @@ fn latency_a_talks_b_listens() {
 #[test]
 fn echo_return_b_has_speakers_and_open_mic() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let run = Session {
+    let session = || Session {
         name: "echo".into(),
         players: vec![
             Talker::ptt(place(0.8, talk(3.0), 6.0), 3.8),
@@ -265,17 +268,39 @@ fn echo_return_b_has_speakers_and_open_mic() {
         ],
         stall: None,
         seconds: 6.0,
-    }
-    .run();
+    };
+    let baseline = session().run_with_aec(false);
+    let run = session().run();
     let (a, b) = (&run.players[0], &run.players[1]);
     // A's echo setting is off: anything A hears is its own voice coming back through B
     let back = acoustic_lag(a, a, None);
     let echo_return = energy_db(&a.speaker) - energy_db(&a.voice);
+    let baseline_return =
+        energy_db(&baseline.players[0].speaker) - energy_db(&baseline.players[0].voice);
+    // the return at A arrives another transport leg after B's gate switches
+    let acquisition_window = 5 * FS / 2..9 * FS / 2;
+    let acquisition_reduction = energy_db(&baseline.players[0].speaker[acquisition_window.clone()])
+        - energy_db(&a.speaker[acquisition_window]);
+    let warm = 3 * FS..9 * FS / 2;
+    let warm_reduction =
+        energy_db(&baseline.players[0].speaker[warm.clone()]) - energy_db(&a.speaker[warm]);
     let coupling = coupling_db();
     print_table(
         "echo: A talks, B has speakers (coupled) and open mic",
         &[
             row("canceller at B", b.trace.canceller.clone()),
+            row(
+                "cold total echo reduction",
+                format!("{:.1} dB", baseline_return - echo_return),
+            ),
+            row(
+                "acquisition + warm (2.5-4.5 s)",
+                format!("{acquisition_reduction:.1} dB"),
+            ),
+            row(
+                "warm echo reduction (3-4.5 s)",
+                format!("{warm_reduction:.1} dB"),
+            ),
             row("coupling at B (gain + room)", format!("{coupling:.1} dB")),
             row(
                 "A's voice back at A (echo return)",
@@ -289,20 +314,49 @@ fn echo_return_b_has_speakers_and_open_mic() {
             ),
         ],
     );
-    assert_eq!(b.trace.canceller, "none");
-    // without a canceller the echo comes back at about the coupling level, codec and limiter
-    // included; a canceller only has to push this down, so only the upper bound is pinned
+    assert_eq!(b.trace.canceller, ptt_radio_companion::echo::CANCELLER);
+    assert!(
+        !b.trace.gate_samples.is_empty(),
+        "coupled microphone never engaged cancellation"
+    );
+    assert!(
+        b.trace.gate_samples[0] + ((FS / 5) as u64) < 3 * FS as u64,
+        "acquisition left no settling interval"
+    );
+    assert!(
+        run.relay
+            .echo_states
+            .iter()
+            .any(|s| s.sender == 2 && s.engaged)
+    );
+    assert!(
+        run.relay
+            .echo_states
+            .iter()
+            .any(|s| s.sender == 2 && s.engaged && s.received_us >= b.trace.device_us + 5_000_000),
+        "HELLO did not refresh the engaged state"
+    );
+    assert!(
+        run.relay
+            .echo_states
+            .iter()
+            .filter(|s| s.sender == 1)
+            .all(|s| !s.engaged)
+    );
     assert!(
         echo_return < coupling + 3.0,
         "echo return {echo_return:.1} dB above the coupling {coupling:.1} dB"
     );
-    assert!(back.peak > 0.5 && back.lag_ms > 300.0 && back.lag_ms < 700.0);
+    assert!(
+        warm_reduction > 20.0,
+        "warm echo reduction only {warm_reduction:.1} dB"
+    );
 }
 
 #[test]
 fn double_talk_a_and_b_at_once() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let run = Session {
+    let session = || Session {
         name: "double-talk".into(),
         players: vec![
             Talker::ptt(place(0.8, talk(3.5), 6.0), 4.3),
@@ -310,8 +364,9 @@ fn double_talk_a_and_b_at_once() {
         ],
         stall: None,
         seconds: 6.0,
-    }
-    .run();
+    };
+    let baseline = session().run_with_aec(false);
+    let run = session().run();
     let (a, b) = (&run.players[0], &run.players[1]);
     // A's output holds B's voice plus A's echo; B's output holds A's voice
     let b_at_a = acoustic_lag(b, a, None);
@@ -320,10 +375,25 @@ fn double_talk_a_and_b_at_once() {
     let (b_gain, echo_gain) = fit_two(a, (b, b_at_a.lag_ms), (a, echo_at_a.lag_ms));
     // B's echo setting is off, so B hears nothing but A
     let a_gain = energy_db(&b.speaker) - energy_db(&a.voice);
+    let (base_a, base_b) = (&baseline.players[0], &baseline.players[1]);
+    let (base_b_gain, _) = fit_two(
+        base_a,
+        (base_b, acoustic_lag(base_b, base_a, None).lag_ms),
+        (base_a, acoustic_lag(base_a, base_a, None).lag_ms),
+    );
+    let base_a_gain = energy_db(&base_b.speaker) - energy_db(&base_a.voice);
     print_table(
         "double talk: A and B talk at once, B coupled",
         &[
             row("canceller at B", b.trace.canceller.clone()),
+            row(
+                "loss B / uncoupled A vs off",
+                format!(
+                    "{:.1} / {:.1} dB",
+                    base_b_gain - b_gain,
+                    base_a_gain - a_gain
+                ),
+            ),
             row(
                 "B's voice at A",
                 format!("{b_gain:.1} dB (lag {})", fmt_ms(b_at_a.lag_ms)),
@@ -345,7 +415,20 @@ fn double_talk_a_and_b_at_once() {
     // both voices must come through at about their own level; a canceller that clips
     // B during double talk shows up as a drop of "B's voice at A"
     assert!(b_gain > -4.0, "B's voice lost at A: {b_gain:.1} dB");
-    assert!(a_gain > -4.0, "A's voice lost at B: {a_gain:.1} dB");
+    assert!(
+        b_gain >= base_b_gain - 6.0,
+        "AEC lost {:.1} dB of B",
+        base_b_gain - b_gain
+    );
+    assert!(
+        (a_gain - base_a_gain).abs() <= 0.5,
+        "uncoupled A changed by {:.1} dB",
+        a_gain - base_a_gain
+    );
+    assert!(
+        a.trace.gate_samples.is_empty(),
+        "uncoupled A engaged cancellation"
+    );
     assert!(echo_gain < coupling_db() + 3.0);
 }
 
@@ -537,9 +620,14 @@ struct Outcome {
 
 impl Session {
     fn run(self) -> Outcome {
+        self.run_with_aec(true)
+    }
+
+    fn run_with_aec(self, enabled: bool) -> Outcome {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("scenarios")
-            .join(&self.name);
+            .join(&self.name)
+            .join(if enabled { "aec-on" } else { "aec-off" });
         // the previous run's files, if any; create_dir_all below reports real trouble
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -593,6 +681,7 @@ impl Session {
             if let Some(hold) = talker.auto_ptt {
                 cmd.arg("--auto-ptt").arg(hold.to_string());
             }
+            cmd.args(["--aec", if enabled { "on" } else { "off" }]);
             cmd.args(&talker.args);
             if talker.coupled {
                 cmd.arg("--couple-gain-db")
@@ -712,7 +801,8 @@ struct Trace {
     /// wall clock of sample 0 of the virtual device timeline
     device_us: u64,
     canceller: String,
-    canceller_delay_ms: f64,
+    canceller_delays: Vec<(u64, f64)>,
+    gate_samples: Vec<u64>,
     /// this companion's own encoder: samples per frame, bitrate, complexity, fec
     frame_samples: usize,
     ptt: Vec<(u64, bool)>,
@@ -725,8 +815,20 @@ struct Trace {
 }
 
 impl Trace {
+    fn canceller_delay_at(&self, sample: u64) -> f64 {
+        self.canceller_delays
+            .iter()
+            .rev()
+            .find(|&&(at, _)| at <= sample)
+            .map_or(0.0, |&(_, delay)| delay)
+    }
+
     fn read(path: &Path) -> Trace {
         let text = fs::read_to_string(path).unwrap();
+        Self::parse(&text)
+    }
+
+    fn parse(text: &str) -> Trace {
         let mut trace = Trace::default();
         for line in text.lines() {
             let f: Vec<&str> = line.split(' ').collect();
@@ -736,8 +838,13 @@ impl Trace {
                 "canceller" => {
                     trace.canceller = f[2].to_string();
                     // optional: the canceller's algorithmic delay, invisible to the frame trace
-                    trace.canceller_delay_ms = f.get(3).map_or(0.0, |d| d.parse().unwrap());
+                    let delay = f.get(3).map_or(0.0, |d| d.parse().unwrap());
+                    trace
+                        .canceller_delays
+                        .push((trace.gate_samples.last().copied().unwrap_or(0), delay));
                 }
+                "aec_gate" => trace.gate_samples.push(num(5)),
+                "echo_state" => {}
                 "codec" => trace.frame_samples = num(2) as usize,
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
                 "tx" => {
@@ -774,7 +881,7 @@ impl Trace {
                         dropped: num(5),
                     }
                 }
-                other => panic!("unknown trace event {other} in {}", path.display()),
+                other => panic!("unknown trace event {other}"),
             }
         }
         trace
@@ -820,9 +927,27 @@ impl Trace {
     }
 }
 
+#[test]
+fn canceller_delay_follows_the_capture_interval() {
+    let trace = Trace::parse(
+        "1 canceller gated 0\n2 aec_gate 1 0.9 20 480\n3 canceller gated 9.083333333333334\n4 aec_gate 0 0.1 20 960\n5 canceller gated 0\n",
+    );
+    assert_eq!(trace.canceller_delay_at(479), 0.0);
+    assert_eq!(
+        trace.canceller_delay_at(480),
+        ptt_radio_companion::echo::ALGORITHMIC_DELAY_MS
+    );
+    assert_eq!(
+        trace.canceller_delay_at(959),
+        ptt_radio_companion::echo::ALGORITHMIC_DELAY_MS
+    );
+    assert_eq!(trace.canceller_delay_at(960), 0.0);
+}
+
 // ---- per-frame timing of one sender's frames at one listener
 
 struct FrameTiming {
+    canceller_delay_ms: f64,
     preroll: bool,
     /// the talker's frame duration
     frame_us: f64,
@@ -867,6 +992,9 @@ fn frame_timings(
             let d = relayed[&seq];
             let frame_us = talker.trace.frame_us();
             Some(FrameTiming {
+                canceller_delay_ms: talker
+                    .trace
+                    .canceller_delay_at(tx.frame * talker.trace.frame_samples as u64),
                 preroll: tx.preroll,
                 frame_us,
                 mic_us: talker.trace.device_us as f64 + tx.frame as f64 * frame_us,
@@ -893,6 +1021,7 @@ fn stage_table(live: &[&FrameTiming], acoustic_ms: f64) -> Vec<(String, String)>
         row(name, format!("{m:6.1}  p95 {:6.1}", percentile(&v, 95)))
     };
     let total = mean(live.iter().map(|f| f.total_ms()));
+    let canceller = mean(live.iter().map(|f| f.canceller_delay_ms));
     vec![
         row("stage (live frames)", "mean ms      ms".into()),
         stage("capture buffering", &|t| t.ready_us - t.mic_us - t.frame_us),
@@ -908,8 +1037,12 @@ fn stage_table(live: &[&FrameTiming], acoustic_ms: f64) -> Vec<(String, String)>
         stage("output queue + device", &|t| t.play_us - t.pull_us),
         stage("total, frame first sample", &|t| t.play_us - t.mic_us),
         row(
-            "codec delay (acoustic - total)",
-            format!("{:6.1}", acoustic_ms - total),
+            "AEC delay (mean applicable interval)",
+            format!("{canceller:6.1}"),
+        ),
+        row(
+            "codec delay (acoustic - total - AEC)",
+            format!("{:6.1}", acoustic_ms - total - canceller),
         ),
     ]
 }
