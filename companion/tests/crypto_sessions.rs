@@ -154,7 +154,16 @@ fn lost_noise1_noise2_metadata_confirmation_and_ack_recover_without_media() {
 #[test]
 fn lost_confirmation_pong_then_any_valid_kind_activates_pending_key() {
     for suite in [Suite::Aes256Gcm, Suite::ChaChaPoly] {
-        for kind in [Kind::Start, Kind::Voice, Kind::Stop, Kind::Ping, Kind::Pong] {
+        for kind in [
+            Kind::Start,
+            Kind::Voice,
+            Kind::Stop,
+            Kind::Ping,
+            Kind::Pong,
+            Kind::PolicyStart,
+            Kind::PolicyVoice,
+            Kind::PolicyStop,
+        ] {
             let now = Instant::now();
             let (mut a, mut b) = pair(suite);
             let first = a.begin(1, ReceiverHandle(100), now).unwrap();
@@ -179,6 +188,8 @@ fn lost_confirmation_pong_then_any_valid_kind_activates_pending_key() {
                 Kind::Voice => &[1, 2, 3][..],
                 Kind::Ping | Kind::Pong => &probe,
                 Kind::Start | Kind::Stop => &[],
+                Kind::PolicyVoice => &[0; 9][..],
+                Kind::PolicyStart | Kind::PolicyStop => &probe,
             };
             let packet = b
                 .encrypt(Inner {

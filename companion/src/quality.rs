@@ -353,7 +353,7 @@ mod tests {
                 .batch(&active, start + BATCH_INTERVAL * u32::from(n))
                 .unwrap();
             assert!(batch[6] <= 32);
-            for record in batch[7..].chunks_exact(15) {
+            for record in batch[7..].as_chunks::<15>().0 {
                 seen.insert(u16::from_be_bytes([record[0], record[1]]));
             }
         }

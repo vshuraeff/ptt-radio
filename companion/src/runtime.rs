@@ -35,6 +35,497 @@ pub struct RuntimeConfig {
 mod tests {
     use super::*;
 
+    fn install_policy(
+        runtime: &mut Runtime,
+        revision: u64,
+        receive: &[u16],
+        tx: bool,
+        own: bool,
+        now: Instant,
+    ) {
+        let policy = signaling::Policy {
+            audience: Audience {
+                revision,
+                send_to: vec![1, 2],
+                receive_from: receive.to_vec(),
+            },
+            tx_permitted: tx,
+            self_monitor: own,
+        };
+        runtime
+            .game(&signaling::encode_policy(&policy).unwrap(), now)
+            .unwrap();
+    }
+
+    fn policy_arrival(pair: &mut Pair, path: Path, revision: u64, sequence: u16) -> usize {
+        let generation = pair.peers[0].generation;
+        if path == Path::Game {
+            let bytes = wire::encode_policy_game(
+                wire::PolicyGameMedia {
+                    media: GameMedia {
+                        kind: Kind::PolicyVoice,
+                        stream: StreamId {
+                            player: 1,
+                            generation,
+                        },
+                        sequence,
+                        talkspurt: 11,
+                        opus: &[1, 2],
+                    },
+                    revision,
+                },
+                true,
+            )
+            .unwrap();
+            pair.peers[1].game(&bytes, pair.now).unwrap();
+        } else {
+            let mut body = revision.to_be_bytes().to_vec();
+            body.extend_from_slice(&[1, 2]);
+            let bytes = pair.peers[0]
+                .peers
+                .get_mut(&2)
+                .unwrap()
+                .session
+                .as_mut()
+                .unwrap()
+                .encrypt(Inner {
+                    kind: Kind::PolicyVoice,
+                    sequence,
+                    talkspurt: 11,
+                    body: &body,
+                })
+                .unwrap();
+            let destination = pair.peers[1].sockets[0];
+            let (source, bytes) = if path == Path::Direct {
+                (pair.peers[0].sockets[0], bytes)
+            } else {
+                let session = match path {
+                    Path::Hub { session } | Path::PlayerRelay { session, .. } => session,
+                    _ => unreachable!(),
+                };
+                (
+                    "127.0.0.1:45000".parse().unwrap(),
+                    wire::encode_datagram(Datagram::Relay {
+                        session,
+                        datagram: &bytes,
+                    })
+                    .unwrap(),
+                )
+            };
+            pair.peers[1]
+                .udp(source, destination, &bytes, pair.now)
+                .unwrap();
+        }
+        std::iter::from_fn(|| pair.peers[1].poll())
+            .filter(|output| matches!(output, Output::Media(_) | Output::UdpMedia(_)))
+            .count()
+    }
+
+    #[test]
+    fn policy_revocation_continuity_and_unseen_old_talkspurt_on_every_ingress() {
+        for route in 0..4 {
+            let mut pair = Pair::new();
+            pair.advance(2500);
+            let path = match route {
+                0 => Path::Game,
+                1 => Path::Direct,
+                _ => {
+                    add_hub(&mut pair, 1);
+                    if route == 2 {
+                        Path::Hub { session: 9 }
+                    } else {
+                        let peer = pair.peers[1].peers.get_mut(&1).unwrap();
+                        let mut binding = peer.bindings.remove(&(0, 9)).unwrap();
+                        binding.grant.relay = 3;
+                        peer.bindings.insert((3, 9), binding);
+                        Path::PlayerRelay {
+                            player: 3,
+                            session: 9,
+                        }
+                    }
+                }
+            };
+            pair.peers[1].audience = None;
+            assert_eq!(policy_arrival(&mut pair, path, 7, 1), 0, "cold {path:?}");
+            install_policy(&mut pair.peers[1], 7, &[1], true, false, pair.now);
+            assert_eq!(policy_arrival(&mut pair, path, 7, 2), 1, "current {path:?}");
+            let reset = pair.peers[1].capture_reset;
+            install_policy(&mut pair.peers[1], 8, &[1], true, false, pair.now);
+            assert_eq!(pair.peers[1].capture_reset, reset);
+            assert_eq!(
+                policy_arrival(&mut pair, path, 7, 3),
+                1,
+                "previous {path:?}"
+            );
+            assert_eq!(
+                policy_arrival(&mut pair, path, 8, 4),
+                1,
+                "continuing {path:?}"
+            );
+            assert_eq!(policy_arrival(&mut pair, path, 9, 5), 0, "future {path:?}");
+            install_policy(&mut pair.peers[1], 9, &[], false, false, pair.now);
+            assert_eq!(policy_arrival(&mut pair, path, 8, 6), 0, "revoked {path:?}");
+            assert_eq!(policy_arrival(&mut pair, path, 9, 7), 0);
+            install_policy(&mut pair.peers[1], 10, &[1], true, false, pair.now);
+            assert_eq!(
+                policy_arrival(&mut pair, path, 9, 8),
+                0,
+                "new eligibility {path:?}"
+            );
+            assert_eq!(policy_arrival(&mut pair, path, 10, 9), 1);
+            install_policy(&mut pair.peers[1], 12, &[1], true, false, pair.now);
+            assert_eq!(
+                policy_arrival(&mut pair, path, 10, 10),
+                0,
+                "skipped {path:?}"
+            );
+            assert_eq!(policy_arrival(&mut pair, path, 12, 11), 1);
+            let playout_reset = pair.peers[1].playout_reset;
+            install_policy(&mut pair.peers[1], 12, &[1], true, false, pair.now);
+            assert_eq!(pair.peers[1].playout_reset, playout_reset);
+            let legacy = wire::encode_game(
+                GameMedia {
+                    stream: StreamId {
+                        player: 1,
+                        generation: pair.peers[0].generation,
+                    },
+                    kind: Kind::Voice,
+                    sequence: 20,
+                    talkspurt: 12,
+                    opus: &[1],
+                },
+                true,
+            )
+            .unwrap();
+            pair.peers[1].game(&legacy, pair.now).unwrap();
+            assert!(
+                !std::iter::from_fn(|| pair.peers[1].poll()).any(|o| matches!(o, Output::Media(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn policy_transmit_stamps_each_packet_without_restarting_unaffected_talkspurts() {
+        let mut pair = Pair::new();
+        pair.advance(2500);
+        install_policy(&mut pair.peers[0], 7, &[2], true, false, pair.now);
+        pair.peers[0].transmit(&packet::encode(packet::START, 0, &[]), pair.now);
+        pair.peers[0].transmit(&packet::encode(packet::VOICE, 1, &[1]), pair.now);
+        let talkspurt = pair.peers[0].talkspurt;
+        install_policy(&mut pair.peers[0], 8, &[2], true, false, pair.now);
+        pair.peers[0].transmit(&packet::encode(packet::VOICE, 2, &[2]), pair.now);
+        let packets: Vec<_> = std::iter::from_fn(|| pair.peers[0].poll())
+            .filter_map(|o| match o {
+                Output::Game(bytes) if bytes[2] == wire::GAME_POLICY_VOICE => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        let mut stamped = Vec::new();
+        for bytes in packets {
+            let mut forwarded = bytes[..3].to_vec();
+            forwarded.extend_from_slice(&1u16.to_be_bytes());
+            forwarded.extend_from_slice(&bytes[3..]);
+            let media = wire::decode_policy_game(&forwarded).unwrap();
+            stamped.push((media.revision, media.media.sequence, media.media.talkspurt));
+        }
+        assert_eq!(stamped, [(7, 1, talkspurt), (8, 2, talkspurt)]);
+        pair.peers[0].transmit(&packet::encode(packet::VOICE, 3, &[3]), pair.now);
+        install_policy(&mut pair.peers[0], 9, &[2], false, false, pair.now);
+        pair.peers[0].transmit(&packet::encode(packet::VOICE, 4, &[4]), pair.now);
+        install_policy(&mut pair.peers[0], 10, &[2], true, false, pair.now);
+        assert!(!std::iter::from_fn(|| pair.peers[0].poll()).any(|o| outgoing_media(&o)));
+        pair.peers[0].transmit(&packet::encode(packet::START, 4, &[]), pair.now);
+        assert_ne!(pair.peers[0].talkspurt, talkspurt);
+    }
+
+    #[test]
+    fn policy_rollback_retires_streams_and_keys_only_at_a_fresh_roster_boundary() {
+        let mut pair = Pair::new();
+        pair.advance(2500);
+        let old_generation = pair.peers[0].generation;
+        install_policy(&mut pair.peers[0], 7, &[2], true, false, pair.now);
+        install_policy(&mut pair.peers[1], 7, &[1], true, false, pair.now);
+        let old_receiver_generation = pair.peers[1].generation;
+        let mut body = 1u64.to_be_bytes().to_vec();
+        body.push(1);
+        let delayed_udp = pair.peers[0]
+            .peers
+            .get_mut(&2)
+            .unwrap()
+            .session
+            .as_mut()
+            .unwrap()
+            .encrypt(Inner {
+                kind: Kind::PolicyVoice,
+                sequence: 8,
+                talkspurt: 1,
+                body: &body,
+            })
+            .unwrap();
+        install_policy(&mut pair.peers[1], 1, &[1], true, false, pair.now);
+        assert_eq!(pair.peers[1].generation, old_receiver_generation);
+        pair.peers[1].roster(vec![1, 2], pair.now).unwrap();
+        install_policy(&mut pair.peers[1], 1, &[1], true, false, pair.now);
+        assert_ne!(pair.peers[1].generation, old_receiver_generation);
+        assert!(pair.peers[1].peers[&1].retired.contains(&old_generation));
+        assert_eq!(policy_arrival(&mut pair, Path::Game, 1, 9), 0);
+        let source = pair.peers[0].sockets[0];
+        let destination = pair.peers[1].sockets[0];
+        pair.peers[1]
+            .udp(source, destination, &delayed_udp, pair.now)
+            .unwrap();
+        assert!(
+            !std::iter::from_fn(|| pair.peers[1].poll())
+                .any(|o| matches!(o, Output::Media(_) | Output::UdpMedia(_)))
+        );
+        pair.peers[0].roster(vec![1, 2], pair.now).unwrap();
+        install_policy(&mut pair.peers[0], 1, &[2], true, false, pair.now);
+        pair.advance(3000);
+        assert_eq!(policy_arrival(&mut pair, Path::Direct, 1, 10), 1);
+    }
+
+    #[test]
+    fn policy_start_keeps_its_playout_clock_through_enforcement_before_voice() {
+        let mut pair = Pair::new();
+        pair.advance(2500);
+        let now = pair.now;
+        let stream = StreamId {
+            player: 1,
+            generation: pair.peers[0].generation,
+        };
+        let receiver = &mut pair.peers[1];
+        install_policy(receiver, 7, &[1], true, false, now);
+        let mut mixer = crate::mix::Mixer::default();
+        mixer.select(stream, now);
+        for (kind, sequence, opus, delay) in [
+            (Kind::PolicyStart, 0, &[][..], 0),
+            (Kind::PolicyVoice, 1, &[0xf8, 0xff, 0xfe][..], 50),
+        ] {
+            let at = now + Duration::from_millis(delay);
+            let packet = wire::encode_policy_game(
+                wire::PolicyGameMedia {
+                    media: GameMedia {
+                        stream,
+                        kind,
+                        sequence,
+                        talkspurt: 1,
+                        opus,
+                    },
+                    revision: 7,
+                },
+                true,
+            )
+            .unwrap();
+            receiver.game(&packet, at).unwrap();
+            let media = std::iter::from_fn(|| receiver.poll())
+                .find_map(|output| match output {
+                    Output::Media(media) => Some(media),
+                    _ => None,
+                })
+                .expect("policy media admitted");
+            assert!(receiver.accepts_media(1, media.revision));
+            assert_eq!(
+                mixer.receive_game_at(media.borrowed(), media.revision, at),
+                crate::mix::MediaOutcome::Accepted
+            );
+            if kind == Kind::PolicyStart {
+                assert!(
+                    mixer
+                        .tick_checked(
+                            now + Duration::from_millis(20),
+                            crate::mix::SLICE_SAMPLES,
+                            |player, revision| receiver.accepts_media(player, revision),
+                        )
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            mixer
+                .tick_checked(
+                    now + crate::jitter::START_WAIT,
+                    crate::mix::SLICE_SAMPLES,
+                    |player, revision| receiver.accepts_media(player, revision),
+                )
+                .is_some(),
+            "the START clock must not move to the first voice"
+        );
+        assert_eq!(mixer.pulled[0].slice, Some((1, 0)));
+    }
+
+    #[test]
+    fn roster_equal_policy_reset_rotates_only_when_contents_change() {
+        let mut pair = Pair::new();
+        pair.advance(2500);
+        install_policy(&mut pair.peers[0], 7, &[2], true, false, pair.now);
+        install_policy(&mut pair.peers[1], 6, &[1], true, false, pair.now);
+        install_policy(&mut pair.peers[1], 7, &[1], true, false, pair.now);
+        let generation = pair.peers[1].generation;
+        let capture_reset = pair.peers[1].capture_reset;
+        while pair.peers[1].poll().is_some() {}
+        pair.peers[1].roster(vec![1, 2], pair.now).unwrap();
+        install_policy(&mut pair.peers[1], 7, &[1], true, false, pair.now);
+        assert_eq!(pair.peers[1].generation, generation);
+        assert_eq!(pair.peers[1].capture_reset, capture_reset);
+        assert!(
+            !std::iter::from_fn(|| pair.peers[1].poll())
+                .any(|output| { matches!(output, Output::Purge { .. } | Output::ResetStreams) })
+        );
+        install_policy(&mut pair.peers[1], 7, &[], true, false, pair.now);
+        assert!(pair.peers[1].accepts_media(1, Some(7)));
+        assert_eq!(pair.peers[1].generation, generation);
+        pair.peers[1].roster(vec![1, 2], pair.now).unwrap();
+        install_policy(&mut pair.peers[1], 7, &[1, 3], true, false, pair.now);
+        assert_ne!(pair.peers[1].generation, generation);
+        assert!(!pair.peers[1].accepts_media(1, Some(6)));
+        assert!(pair.peers[1].accepts_media(3, Some(7)));
+        let outputs: Vec<_> = std::iter::from_fn(|| pair.peers[1].poll()).collect();
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::ResetStreams))
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| matches!(output, Output::Purge { all: true, .. }))
+        );
+        assert_eq!(policy_arrival(&mut pair, Path::Game, 7, 10), 0);
+        assert_eq!(policy_arrival(&mut pair, Path::Direct, 7, 11), 0);
+        pair.peers[0].roster(vec![1, 2], pair.now).unwrap();
+        install_policy(&mut pair.peers[0], 7, &[2, 3], true, false, pair.now);
+        pair.advance(3000);
+        assert_eq!(policy_arrival(&mut pair, Path::Direct, 7, 12), 1);
+    }
+
+    #[test]
+    fn legacy_own_game_echo_is_compatible_but_never_bypasses_installed_policy() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(
+            vec!["127.0.0.1:0".parse().unwrap()],
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime.identify(1, now).unwrap();
+        assert!(!runtime.allows_receive(2));
+        let media = GameMedia {
+            stream: StreamId {
+                player: 1,
+                generation: runtime.generation,
+            },
+            kind: Kind::Voice,
+            sequence: 1,
+            talkspurt: 1,
+            opus: &[1],
+        };
+        let legacy = wire::encode_game(media, true).unwrap();
+        runtime.game(&legacy, now).unwrap();
+        assert!(
+            std::iter::from_fn(|| runtime.poll()).any(|output| matches!(output, Output::Media(_)))
+        );
+        install_policy(&mut runtime, 7, &[], true, true, now);
+        runtime.game(&legacy, now).unwrap();
+        assert!(
+            !std::iter::from_fn(|| runtime.poll()).any(|output| matches!(output, Output::Media(_)))
+        );
+        let own = |revision| {
+            wire::encode_policy_game(
+                wire::PolicyGameMedia {
+                    media: GameMedia {
+                        kind: Kind::PolicyVoice,
+                        ..media
+                    },
+                    revision,
+                },
+                true,
+            )
+            .unwrap()
+        };
+        runtime.game(&own(7), now).unwrap();
+        assert!(
+            std::iter::from_fn(|| runtime.poll()).any(|output| matches!(output, Output::Media(_)))
+        );
+        install_policy(&mut runtime, 8, &[], false, false, now);
+        for bytes in [&legacy, &own(7), &own(8)] {
+            runtime.game(bytes, now).unwrap();
+            assert!(
+                !std::iter::from_fn(|| runtime.poll())
+                    .any(|output| matches!(output, Output::Media(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn tx_muted_player_relay_forwards_opaque_third_party_media_but_cancels_its_own_queue() {
+        let now = Instant::now();
+        let local: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let endpoints: [SocketAddr; 2] = [
+            "127.0.0.1:41001".parse().unwrap(),
+            "127.0.0.1:41002".parse().unwrap(),
+        ];
+        let mut runtime = Runtime::new(vec![local], RuntimeConfig::default()).unwrap();
+        runtime.identify(3, now).unwrap();
+        install_policy(&mut runtime, 7, &[], true, false, now);
+        runtime.transmit(&packet::encode(packet::VOICE, 1, &[1]), now);
+        install_policy(&mut runtime, 8, &[], false, false, now);
+        assert!(!std::iter::from_fn(|| runtime.poll()).any(|output| outgoing_media(&output)));
+        let now_ms = runtime.now_ms(now);
+        let frames = runtime.relay.as_mut().unwrap().offer(1, 2, now_ms).unwrap();
+        let (_, Signal::RelayGrant(grant)) =
+            signaling::decode_game(&frames[0].frame, false).unwrap()
+        else {
+            panic!("relay grant");
+        };
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let mut client = BindClient::new(grant.clone(), index as u16 + 1, 1).unwrap();
+            runtime
+                .udp(*endpoint, local, &client.request(), now)
+                .unwrap();
+            let challenge = std::iter::from_fn(|| runtime.poll())
+                .find_map(|output| match output {
+                    Output::Udp(tx) => match wire::decode_datagram(&tx.contents) {
+                        Ok(Datagram::Bind(Bind::Challenge(challenge))) => Some(challenge),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap();
+            runtime
+                .udp(
+                    *endpoint,
+                    local,
+                    &client.on_challenge(challenge).unwrap(),
+                    now,
+                )
+                .unwrap();
+            assert!(std::iter::from_fn(|| runtime.poll()).any(|output| matches!(output, Output::Udp(tx) if tx.destination == *endpoint && matches!(wire::decode_datagram(&tx.contents), Ok(Datagram::BindAck { .. })))));
+        }
+        let ciphertext = vec![0; wire::INNER_HEADER + wire::TAG + 9];
+        let encrypted = wire::encode_datagram(Datagram::Encrypted {
+            header: wire::Header {
+                kind: Kind::PolicyVoice,
+                phase: false,
+                receiver: ReceiverHandle(11),
+                counter: 1,
+            },
+            ciphertext: &ciphertext,
+        })
+        .unwrap();
+        let wrapped = wire::encode_datagram(Datagram::Relay {
+            session: grant.session,
+            datagram: &encrypted,
+        })
+        .unwrap();
+        runtime.udp(endpoints[0], local, &wrapped, now).unwrap();
+        let forwarded: Vec<_> = std::iter::from_fn(|| runtime.poll())
+            .filter_map(|output| match output {
+                Output::Udp(tx) => Some((tx.destination, tx.contents)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(forwarded, [(endpoints[1], wrapped)]);
+    }
+
     #[test]
     fn bound_hub_rediscovery_renews_attempt_reflection_and_route_without_rekey() {
         let mut pair = Pair::new();
@@ -1458,12 +1949,31 @@ mod tests {
     }
 }
 
+fn ordinary_kind(kind: Kind) -> Kind {
+    match kind {
+        Kind::PolicyVoice => Kind::Voice,
+        Kind::PolicyStart => Kind::Start,
+        Kind::PolicyStop => Kind::Stop,
+        kind => kind,
+    }
+}
+
+fn policy_kind(kind: Kind) -> Kind {
+    match kind {
+        Kind::Voice => Kind::PolicyVoice,
+        Kind::Start => Kind::PolicyStart,
+        Kind::Stop => Kind::PolicyStop,
+        kind => kind,
+    }
+}
+
 pub struct Media {
     pub stream: StreamId,
     pub kind: Kind,
     pub sequence: u16,
     pub talkspurt: u16,
     pub opus: Vec<u8>,
+    pub revision: Option<u64>,
 }
 
 impl Media {
@@ -1485,7 +1995,48 @@ pub enum Output {
     Media(Media),
     UdpMedia(Media),
     Reorder(u16, Duration),
+    Purge { all: bool, players: Vec<u16> },
+    ResetStreams,
     Trace(String),
+}
+
+struct PendingOutput {
+    output: Output,
+    local_media: bool,
+}
+
+impl From<Output> for PendingOutput {
+    fn from(output: Output) -> Self {
+        Self {
+            output,
+            local_media: false,
+        }
+    }
+}
+
+#[cfg(test)]
+fn outgoing_media(output: &Output) -> bool {
+    match output {
+        Output::Game(bytes) => matches!(
+            bytes.get(2).copied(),
+            Some(
+                wire::GAME_START
+                    | wire::GAME_VOICE
+                    | wire::GAME_STOP
+                    | wire::GAME_POLICY_START
+                    | wire::GAME_POLICY_VOICE
+                    | wire::GAME_POLICY_STOP
+            )
+        ),
+        Output::Udp(tx) => {
+            let datagram = match wire::decode_datagram(&tx.contents) {
+                Ok(Datagram::Relay { datagram, .. }) => wire::decode_datagram(datagram),
+                packet => packet,
+            };
+            matches!(datagram, Ok(Datagram::Encrypted { header, .. }) if !matches!(header.kind, Kind::Ping | Kind::Pong))
+        }
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -1623,6 +2174,9 @@ pub struct Runtime {
     peers: BTreeMap<u16, Peer>,
     roster: Vec<u16>,
     audience: Option<Audience>,
+    policy: Option<crate::policy::PolicyGate>,
+    capture_reset: u64,
+    playout_reset: u64,
     audience_reset: bool,
     audience_blocked: bool,
     relay: Option<Relay>,
@@ -1632,7 +2186,7 @@ pub struct Runtime {
     /// rebuilt pair starting here is a restart to it, not a mutation it drops.
     restart_floor: u32,
     next_handle: u32,
-    out: VecDeque<Output>,
+    out: VecDeque<PendingOutput>,
     talkspurt: u16,
     sequence: u16,
     on_air: bool,
@@ -1662,6 +2216,9 @@ impl Runtime {
             peers: BTreeMap::new(),
             roster: Vec::new(),
             audience: None,
+            policy: None,
+            capture_reset: 0,
+            playout_reset: 0,
             audience_reset: false,
             audience_blocked: false,
             relay: None,
@@ -1683,7 +2240,22 @@ impl Runtime {
     }
 
     pub fn poll(&mut self) -> Option<Output> {
-        self.out.pop_front()
+        while let Some(PendingOutput {
+            output,
+            local_media,
+        }) = self.out.pop_front()
+        {
+            if local_media && !self.capture_policy().0 {
+                continue;
+            }
+            if let Output::Media(media) | Output::UdpMedia(media) = &output
+                && !self.accepts_media(media.stream.player, media.revision)
+            {
+                continue;
+            }
+            return Some(output);
+        }
+        None
     }
 
     fn now_ms(&self, now: Instant) -> u64 {
@@ -1692,7 +2264,7 @@ impl Runtime {
     }
 
     fn trace(&mut self, text: String) {
-        self.out.push_back(Output::Trace(text));
+        self.out.push_back(PendingOutput::from(Output::Trace(text)));
     }
 
     fn handle(&mut self) -> Result<ReceiverHandle> {
@@ -1705,7 +2277,7 @@ impl Runtime {
 
     fn signal(&mut self, peer: u16, signal: &Signal) {
         match signaling::encode_game(signal, peer, false) {
-            Ok(bytes) => self.out.push_back(Output::Game(bytes)),
+            Ok(bytes) => self.out.push_back(PendingOutput::from(Output::Game(bytes))),
             Err(_) => self.trace(format!("drop {peer} signal-encoding")),
         }
     }
@@ -1736,10 +2308,15 @@ impl Runtime {
             return Err("game changed local identity".into());
         }
         self.player = Some(player);
-        self.out.push_back(Output::Select(StreamId {
-            player,
-            generation: self.generation,
-        }));
+        if let Some(policy) = &mut self.policy {
+            policy.identify(player);
+            self.purge(true, Vec::new());
+        }
+        self.out
+            .push_back(PendingOutput::from(Output::Select(StreamId {
+                player,
+                generation: self.generation,
+            })));
         self.relay = Some(Relay::new(player, self.generation, Limits::default()));
         self.trace(format!("generation {player} {}", self.generation));
         self.apply_roster(self.roster.clone(), now)
@@ -1827,11 +2404,74 @@ impl Runtime {
     }
 
     pub fn allows_receive(&self, sender: u16) -> bool {
-        self.player == Some(sender)
-            || self
-                .audience
-                .as_ref()
-                .is_none_or(|a| a.receive_from.contains(&sender))
+        self.accepts_media(sender, None)
+    }
+
+    pub fn accepts_media(&self, sender: u16, revision: Option<u64>) -> bool {
+        if let Some(policy) = &self.policy {
+            self.player.is_some()
+                && revision.is_some_and(|revision| policy.accepts(sender, revision))
+        } else {
+            revision.is_none()
+                && (self.player == Some(sender)
+                    || self
+                        .audience
+                        .as_ref()
+                        .is_some_and(|a| a.receive_from.contains(&sender)))
+        }
+    }
+
+    pub fn capture_policy(&self) -> (bool, Option<u64>, u64) {
+        let current = self.policy.as_ref().and_then(|gate| gate.current());
+        (
+            self.policy.is_none() || current.is_some_and(|p| p.tx_permitted),
+            current.map(|p| p.audience.revision),
+            self.capture_reset,
+        )
+    }
+
+    pub fn playout_reset(&self) -> u64 {
+        self.playout_reset
+    }
+
+    fn purge(&mut self, all: bool, players: Vec<u16>) {
+        if all || !players.is_empty() {
+            self.playout_reset = self.playout_reset.wrapping_add(1);
+            self.out
+                .push_back(PendingOutput::from(Output::Purge { all, players }));
+        }
+    }
+
+    fn reset_policy_epoch(&mut self, now: Instant) -> Result<()> {
+        let retired: BTreeMap<_, _> = self
+            .peers
+            .iter()
+            .map(|(player, peer)| {
+                let mut retired = peer.retired.clone();
+                if let Some(remote) = &peer.remote {
+                    retired.push_back(remote.stream_generation);
+                }
+                (*player, retired)
+            })
+            .collect();
+        let mut fresh = Self::new(self.sockets.clone(), self.config.clone())?;
+        fresh.capture_reset = self.capture_reset;
+        fresh.playout_reset = self.playout_reset;
+        fresh.policy = Some(crate::policy::PolicyGate::new(self.player.unwrap_or(0)));
+        fresh
+            .out
+            .push_back(PendingOutput::from(Output::ResetStreams));
+        fresh.roster = self.roster.clone();
+        if let Some(player) = self.player {
+            fresh.identify(player, now)?;
+        }
+        for (player, peer) in &mut fresh.peers {
+            if let Some(retired) = retired.get(player) {
+                peer.retired = retired.clone();
+            }
+        }
+        *self = fresh;
+        Ok(())
     }
 
     pub fn stun_servers(&mut self, servers: Vec<SocketAddr>, now: Instant) -> Result<()> {
@@ -1867,7 +2507,58 @@ impl Runtime {
     }
 
     pub fn game(&mut self, bytes: &[u8], now: Instant) -> Result<bool> {
+        if let Ok(policy) = signaling::decode_policy(bytes) {
+            let reset = self.audience_reset
+                && self
+                    .policy
+                    .as_ref()
+                    .and_then(|gate| gate.current())
+                    .is_some_and(|p| {
+                        policy.audience.revision < p.audience.revision
+                            || (policy.audience.revision == p.audience.revision && policy != *p)
+                    });
+            if reset {
+                self.reset_policy_epoch(now)?;
+            }
+            let gate = self
+                .policy
+                .get_or_insert_with(|| crate::policy::PolicyGate::new(self.player.unwrap_or(0)));
+            let first = gate.current().is_none();
+            let update = gate.install(policy);
+            self.audience_reset = false;
+            match update {
+                Ok(crate::policy::PolicyUpdate::Unchanged) => {}
+                Ok(crate::policy::PolicyUpdate::Installed {
+                    purge_all,
+                    removed_receivers,
+                    tx_changed,
+                    self_monitor_changed,
+                }) => {
+                    if first || reset || tx_changed || self_monitor_changed {
+                        self.out.retain(|pending| !pending.local_media);
+                        self.capture_reset = self.capture_reset.wrapping_add(1);
+                        self.on_air = false;
+                        self.next_start = None;
+                    }
+                    self.purge(purge_all, removed_receivers);
+                    self.trace(format!("policy {}", self.capture_policy().1.unwrap()));
+                }
+                Err(error) => self.trace(format!("drop 0 policy-{error:?}")),
+            }
+            return Ok(true);
+        }
         if let Ok(audience) = signaling::decode_audience(bytes) {
+            if self.policy.is_some() {
+                return Ok(true);
+            }
+            let removed = self.audience.as_ref().map_or_else(Vec::new, |old| {
+                old.receive_from
+                    .iter()
+                    .copied()
+                    .filter(|p| !audience.receive_from.contains(p))
+                    .collect()
+            });
+            let first = self.audience.is_none();
             let rollback = self
                 .audience
                 .as_ref()
@@ -1876,31 +2567,37 @@ impl Runtime {
                 self.audience = Some(audience);
                 self.audience_reset = false;
                 self.audience_blocked = false;
+                self.purge(first || rollback, removed);
             } else if rollback {
                 if let Some(scope) = &mut self.audience {
                     scope.send_to.clear();
                     scope.receive_from.clear();
                 }
                 self.audience_blocked = true;
+                self.purge(true, Vec::new());
                 self.trace("drop 0 audience-rollback".to_string());
             }
             return Ok(true);
         }
-        if let Ok(media) = wire::decode_game(bytes) {
+        let decoded_media = wire::decode_policy_game(bytes)
+            .map(|packet| (packet.media, Some(packet.revision)))
+            .or_else(|_| wire::decode_game(bytes).map(|media| (media, None)));
+        if let Ok((media, revision)) = decoded_media {
             if self
                 .peers
                 .get(&media.stream.player)
                 .is_some_and(|p| p.retired.contains(&media.stream.generation))
             {
                 self.trace(format!("drop {} retired-game", media.stream.player));
-            } else if self.allows_receive(media.stream.player) {
-                self.out.push_back(Output::Media(Media {
+            } else if self.accepts_media(media.stream.player, revision) {
+                self.out.push_back(PendingOutput::from(Output::Media(Media {
                     stream: media.stream,
-                    kind: media.kind,
+                    kind: ordinary_kind(media.kind),
                     sequence: media.sequence,
                     talkspurt: media.talkspurt,
                     opus: media.opus.to_vec(),
-                }));
+                    revision,
+                })));
             } else {
                 self.trace(format!("drop {} audience-game", media.stream.player));
             }
@@ -1914,7 +2611,7 @@ impl Runtime {
                 relay
                     .on_signal(sender, &signal)
                     .into_iter()
-                    .map(|f| Output::Game(f.frame)),
+                    .map(|f| PendingOutput::from(Output::Game(f.frame))),
             );
         }
         if let Signal::RelayGrant(grant) = signal {
@@ -2029,7 +2726,8 @@ impl Runtime {
                 peer.ice.probes_mut().register(Path::Game, now);
             }
             peer.remote = Some(remote.clone());
-            self.out.push_back(Output::Select(stream));
+            self.out
+                .push_back(PendingOutput::from(Output::Select(stream)));
             self.trace(format!("generation {sender} {}", stream.generation));
             self.signal(sender, &Signal::Announce(peer.local.clone()));
             if !self.config.game_only && remote.capabilities & signaling::CAP_UDP != 0 {
@@ -2092,10 +2790,10 @@ impl Runtime {
         }
         for datagram in actions.datagrams {
             if let Some(path) = arrival {
-                self.send_udp(peer, path, &datagram);
+                self.send_udp(peer, path, &datagram, false);
             } else {
                 if peer.ice.direct().is_some() {
-                    self.send_udp(peer, Path::Direct, &datagram);
+                    self.send_udp(peer, Path::Direct, &datagram, false);
                 }
                 let paths: Vec<_> = peer
                     .bindings
@@ -2104,7 +2802,7 @@ impl Runtime {
                     .map(Binding::path)
                     .collect();
                 for path in paths {
-                    self.send_udp(peer, path, &datagram);
+                    self.send_udp(peer, path, &datagram, false);
                 }
             }
         }
@@ -2124,7 +2822,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn send_udp(&mut self, peer: &Peer, path: Path, bytes: &[u8]) {
+    fn send_udp(&mut self, peer: &Peer, path: Path, bytes: &[u8], local_media: bool) {
         let route = match path {
             Path::Direct => peer
                 .ice
@@ -2145,11 +2843,14 @@ impl Runtime {
             Path::Game => None,
         };
         if let Some((source, destination, contents)) = route {
-            self.out.push_back(Output::Udp(DatagramTx {
-                source,
-                destination,
-                contents,
-            }));
+            self.out.push_back(PendingOutput {
+                output: Output::Udp(DatagramTx {
+                    source,
+                    destination,
+                    contents,
+                }),
+                local_media,
+            });
         }
     }
 
@@ -2174,7 +2875,7 @@ impl Runtime {
                         body: &token.to_be_bytes(),
                     })
                 {
-                    self.send_udp(peer, route.path, &bytes);
+                    self.send_udp(peer, route.path, &bytes, false);
                 }
             }
             ProbeEvent::NetworkRtt { route, rtt, .. } => {
@@ -2345,11 +3046,12 @@ impl Runtime {
                     Reply::Send(to, contents) => (to, contents),
                     Reply::Forward(to) => (to, bytes.to_vec()),
                 };
-                self.out.push_back(Output::Udp(DatagramTx {
-                    source: destination,
-                    destination: to,
-                    contents,
-                }));
+                self.out
+                    .push_back(PendingOutput::from(Output::Udp(DatagramTx {
+                        source: destination,
+                        destination: to,
+                        contents,
+                    })));
             }
             return Ok(());
         }
@@ -2400,11 +3102,12 @@ impl Runtime {
                         if let Some(packet) = binding.client.on_challenge(c) {
                             binding.packet = packet.clone();
                             binding.next = now + RETRY;
-                            self.out.push_back(Output::Udp(DatagramTx {
-                                source: destination,
-                                destination: source,
-                                contents: packet,
-                            }));
+                            self.out
+                                .push_back(PendingOutput::from(Output::Udp(DatagramTx {
+                                    source: destination,
+                                    destination: source,
+                                    contents: packet,
+                                })));
                         }
                     }
                     Datagram::BindAck { challenge, proof }
@@ -2469,18 +3172,28 @@ impl Runtime {
                 }
             }
         } else if packet.kind != Kind::Ping {
-            if self
-                .audience
-                .as_ref()
-                .is_some_and(|a| a.receive_from.contains(&sender))
-            {
-                self.out.push_back(Output::UdpMedia(Media {
-                    stream: packet.context.sender,
-                    kind: packet.kind,
-                    sequence: packet.sequence,
-                    talkspurt: packet.talkspurt,
-                    opus: packet.body,
-                }));
+            let revision = if matches!(
+                packet.kind,
+                Kind::PolicyVoice | Kind::PolicyStart | Kind::PolicyStop
+            ) {
+                Some(u64::from_be_bytes(packet.body[..8].try_into().unwrap()))
+            } else {
+                None
+            };
+            if self.accepts_media(sender, revision) {
+                self.out
+                    .push_back(PendingOutput::from(Output::UdpMedia(Media {
+                        stream: packet.context.sender,
+                        kind: ordinary_kind(packet.kind),
+                        sequence: packet.sequence,
+                        talkspurt: packet.talkspurt,
+                        opus: if revision.is_some() {
+                            packet.body[8..].to_vec()
+                        } else {
+                            packet.body
+                        },
+                        revision,
+                    })));
             } else {
                 self.trace(format!("drop {sender} audience-udp"));
             }
@@ -2489,7 +3202,7 @@ impl Runtime {
     }
 
     pub fn transmit(&mut self, packet: &[u8], now: Instant) {
-        if packet.len() < 5 {
+        if packet.len() < 5 || !self.capture_policy().0 {
             return;
         }
         let kind = match packet[2] {
@@ -2512,10 +3225,32 @@ impl Runtime {
     }
 
     fn send_media(&mut self, kind: Kind, opus: &[u8]) {
+        let (allowed, revision, _) = self.capture_policy();
+        if !allowed {
+            return;
+        }
+        let kind = if revision.is_some() {
+            policy_kind(kind)
+        } else {
+            kind
+        };
+        let mut policy_body = Vec::new();
+        if let Some(revision) = revision {
+            policy_body.extend_from_slice(&revision.to_be_bytes());
+            policy_body.extend_from_slice(opus);
+        }
+        let body = if revision.is_some() {
+            &policy_body[..]
+        } else {
+            opus
+        };
         let player = self.player.unwrap_or(0);
         let listeners = self
-            .audience
+            .policy
             .as_ref()
+            .and_then(|p| p.current())
+            .map(|p| &p.audience)
+            .or(self.audience.as_ref())
             .map_or_else(Vec::new, |a| a.send_to.clone());
         for listener in listeners {
             if listener == player {
@@ -2539,11 +3274,11 @@ impl Runtime {
                     kind,
                     sequence: self.sequence,
                     talkspurt: self.talkspurt,
-                    body: opus,
+                    body,
                 }) {
                     Ok(bytes) => {
                         for path in paths {
-                            self.send_udp(&peer, path, &bytes);
+                            self.send_udp(&peer, path, &bytes, true);
                             self.trace(format!(
                                 "route_tx {listener} {:?} {} {}",
                                 path, self.sequence, self.talkspurt
@@ -2555,22 +3290,28 @@ impl Runtime {
             }
             self.peers.insert(listener, peer);
         }
-        // the bridge converts this one representation for legacy recipients.
-        match wire::encode_game(
-            GameMedia {
-                stream: StreamId {
-                    player,
-                    generation: self.generation,
-                },
-                kind,
-                sequence: self.sequence,
-                talkspurt: self.talkspurt,
-                opus,
+        let media = GameMedia {
+            stream: StreamId {
+                player,
+                generation: self.generation,
             },
-            false,
-        ) {
+            kind,
+            sequence: self.sequence,
+            talkspurt: self.talkspurt,
+            opus,
+        };
+        let encoded = match revision {
+            Some(revision) => {
+                wire::encode_policy_game(wire::PolicyGameMedia { media, revision }, false)
+            }
+            None => wire::encode_game(media, false),
+        };
+        match encoded {
             Ok(bytes) => {
-                self.out.push_back(Output::Game(bytes));
+                self.out.push_back(PendingOutput {
+                    output: Output::Game(bytes),
+                    local_media: true,
+                });
                 self.trace(format!(
                     "route_tx 0 Game {} {}",
                     self.sequence, self.talkspurt
@@ -2622,7 +3363,7 @@ impl Runtime {
                 Action::Send(tx) | Action::Discovery(DiscoveryAction::Send(tx))
                     if !self.config.game_only =>
                 {
-                    self.out.push_back(Output::Udp(tx))
+                    self.out.push_back(PendingOutput::from(Output::Udp(tx)))
                 }
                 Action::Discovery(DiscoveryAction::BeginHubBinding {
                     source,
@@ -2693,11 +3434,12 @@ impl Runtime {
             {
                 binding.new_attempt(self.player.unwrap(), now)?;
             }
-            self.out.push_back(Output::Udp(DatagramTx {
-                source: binding.source,
-                destination: binding.endpoint,
-                contents: binding.packet.clone(),
-            }));
+            self.out
+                .push_back(PendingOutput::from(Output::Udp(DatagramTx {
+                    source: binding.source,
+                    destination: binding.endpoint,
+                    contents: binding.packet.clone(),
+                })));
             binding.next = now + RETRY;
         }
         if peer.retry_until.is_some_and(|at| now >= at) {
@@ -2787,7 +3529,8 @@ impl Runtime {
         let wait = wait.min(Duration::from_millis(200));
         if peer.reorder_wait != Some(wait) {
             peer.reorder_wait = Some(wait);
-            self.out.push_back(Output::Reorder(sender, wait));
+            self.out
+                .push_back(PendingOutput::from(Output::Reorder(sender, wait)));
         }
         Ok(())
     }
@@ -2836,7 +3579,7 @@ impl Runtime {
                 relay
                     .withdraw(session)
                     .into_iter()
-                    .map(|f| Output::Game(f.frame)),
+                    .map(|f| PendingOutput::from(Output::Game(f.frame))),
             );
             self.offers.remove(&pair);
         }
@@ -2856,7 +3599,7 @@ impl Runtime {
                     self.out.extend(
                         grant_frames(grant)
                             .into_iter()
-                            .map(|f| Output::Game(f.frame)),
+                            .map(|f| PendingOutput::from(Output::Game(f.frame))),
                     );
                 }
             }
@@ -2867,7 +3610,7 @@ impl Runtime {
                     self.out.extend(
                         grant_frames(grant.clone())
                             .into_iter()
-                            .map(|f| Output::Game(f.frame)),
+                            .map(|f| PendingOutput::from(Output::Game(f.frame))),
                     );
                 }
             }

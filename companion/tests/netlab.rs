@@ -739,6 +739,9 @@ fn labels_cover_every_type_byte() {
             6 => "STOP",
             7 => "PING",
             8 => "PONG",
+            9 => "POLICY-VOICE",
+            10 => "POLICY-START",
+            11 => "POLICY-STOP",
             0x10 => "RELAY",
             0x11 => "BIND",
             0x12 => "BIND-ACK",
@@ -754,6 +757,9 @@ fn labels_cover_every_type_byte() {
         (Kind::Stop, "STOP"),
         (Kind::Ping, "PING"),
         (Kind::Pong, "PONG"),
+        (Kind::PolicyVoice, "POLICY-VOICE"),
+        (Kind::PolicyStart, "POLICY-START"),
+        (Kind::PolicyStop, "POLICY-STOP"),
     ] {
         let wire = encode_datagram(Datagram::Encrypted {
             header: Header {

@@ -11,7 +11,7 @@
 
 mod ptt_key;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -20,7 +20,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -154,6 +154,61 @@ struct Shared {
     sent: Mutex<HashMap<u16, (Instant, Vec<u8>)>>,
     trace: Option<Mutex<BufWriter<File>>>,
     runtime: Mutex<(Runtime, Network)>,
+    output: OnceLock<(Samples, u32)>,
+    output_history: Mutex<OutputHistory>,
+    output_reset: AtomicU64,
+}
+
+#[derive(Default)]
+struct OutputHistory {
+    queued: VecDeque<(usize, Vec<(u16, usize)>)>,
+    carry: Vec<u16>,
+}
+
+impl OutputHistory {
+    fn synchronize(&mut self, samples: usize) {
+        let mut consumed = self
+            .queued
+            .iter()
+            .map(|entry| entry.0)
+            .sum::<usize>()
+            .saturating_sub(samples);
+        while consumed > 0 {
+            let entry = self.queued.front_mut().expect("counted queued samples");
+            let take = consumed.min(entry.0);
+            entry.0 -= take;
+            entry.1.retain_mut(|(_, until)| {
+                *until = until.saturating_sub(take);
+                *until > 0
+            });
+            consumed -= take;
+            if entry.0 == 0 {
+                self.queued.pop_front();
+            }
+        }
+    }
+
+    fn purge(&mut self, queue: &mut VecDeque<f32>, all: bool, players: &[u16]) -> (usize, bool) {
+        self.synchronize(queue.len());
+        let queued = all
+            || self
+                .queued
+                .iter()
+                .any(|(_, senders)| senders.iter().any(|(sender, _)| players.contains(sender)));
+        let carry = all || self.carry.iter().any(|sender| players.contains(sender));
+        let dropped = if queued {
+            let dropped = queue.len();
+            queue.clear();
+            self.queued.clear();
+            dropped
+        } else {
+            0
+        };
+        if queued || carry {
+            self.carry.clear();
+        }
+        (dropped, queued || carry)
+    }
 }
 
 impl Shared {
@@ -240,11 +295,18 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         sent: Mutex::new(HashMap::new()),
         trace,
         runtime: Mutex::new((runtime, network)),
+        output: OnceLock::new(),
+        output_history: Mutex::new(OutputHistory::default()),
+        output_reset: AtomicU64::new(0),
     });
     let hello = packet::encode(
         HELLO,
         0,
-        format!("ptt-radio-companion {} hud1 v2", env!("CARGO_PKG_VERSION")).as_bytes(),
+        format!(
+            "ptt-radio-companion {} hud1 pol1 v2",
+            env!("CARGO_PKG_VERSION")
+        )
+        .as_bytes(),
     );
     send(&shared, &hello);
     send_echo_state(&shared, shared.echo.gate_state().engaged);
@@ -362,6 +424,12 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         )?),
         None => None,
     };
+    if let Some((samples, rate, _)) = &output {
+        shared
+            .output
+            .set((samples.clone(), *rate))
+            .expect("output configured once");
+    }
 
     let codec = Codec {
         frame_ms: args.frame_ms,
@@ -591,14 +659,25 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
         }
         tx.set_ptt(shared.ptt.load(Relaxed));
         tx.set_open_mic(shared.open_mic.load(Relaxed));
-        sent += send_packets(shared, tx.frame(&pcm), frame, ready_us);
+        let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+        let (permitted, revision, reset) = runtime.capture_policy();
+        tx.set_policy(permitted, revision, reset);
+        sent += send_packets(shared, runtime, network, tx.frame(&pcm), frame, ready_us);
         frame += 1;
     }
-    sent + send_packets(shared, tx.close(), frame, unix_us())
+    let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+    sent + send_packets(shared, runtime, network, tx.close(), frame, unix_us())
 }
 
 /// sends what the transmitter made of captured frame `frame`; returns the VOICE count
-fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u64) -> u64 {
+fn send_packets(
+    shared: &Shared,
+    runtime: &mut Runtime,
+    network: &mut Network,
+    packets: Vec<Vec<u8>>,
+    frame: u64,
+    ready_us: u64,
+) -> u64 {
     let voices = packets.iter().filter(|p| p[2] == VOICE).count() as u64;
     // a START burst carries the pre-roll: its VOICE frames end with the current one
     let mut voice_frame = frame + 1 - voices;
@@ -611,7 +690,6 @@ fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u6
                     .lock()
                     .unwrap()
                     .insert(seq, (Instant::now(), p[5..].to_vec()));
-                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
                 runtime.transmit(&p, Instant::now());
                 drain_runtime(shared, runtime, network, None);
                 shared.trace(format_args!(
@@ -623,7 +701,6 @@ fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u6
             }
             kind => {
                 println!("sent {}", if kind == START { "START" } else { "STOP" });
-                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
                 runtime.transmit(&p, Instant::now());
                 drain_runtime(shared, runtime, network, None);
             }
@@ -665,7 +742,10 @@ fn drain_runtime(
                 }
             }
             Output::Select(stream) => {
-                let received = shared.mixer.lock().unwrap().select(stream, Instant::now());
+                let mut mixer = shared.mixer.lock().unwrap();
+                mixer.enforce(|sender, revision| runtime.accepts_media(sender, revision));
+                let received = mixer.select(stream, Instant::now());
+                drop(mixer);
                 for (sender, sequence) in received {
                     shared.trace(format_args!("rx {sender} {sequence}"));
                     if let Some(stats) = stats.as_deref_mut() {
@@ -676,21 +756,53 @@ fn drain_runtime(
             Output::Reorder(player, wait) => {
                 shared.mixer.lock().unwrap().reorder_wait(player, wait)
             }
+            Output::Purge { all, players } => {
+                shared.mixer.lock().unwrap().purge(all, &players);
+                let dropped = shared.output.get().map_or(0, |(samples, _)| {
+                    let mut queue = samples.lock().unwrap();
+                    let (dropped, reset) = shared
+                        .output_history
+                        .lock()
+                        .unwrap()
+                        .purge(&mut queue, all, &players);
+                    if reset {
+                        shared.output_reset.fetch_add(1, Relaxed);
+                    }
+                    dropped
+                });
+                let enforced_us = unix_us();
+                shared.trace(format_args!(
+                    "policy_purge {enforced_us} {} {dropped}",
+                    runtime.playout_reset()
+                ));
+            }
+            Output::ResetStreams => shared.mixer.lock().unwrap().reset_streams(),
             Output::Trace(text) => shared.trace(format_args!("{text}")),
-            Output::Media(media) => accept_media(shared, media, true, stats.as_deref_mut()),
-            Output::UdpMedia(media) => accept_media(shared, media, false, stats.as_deref_mut()),
+            Output::Media(media) => {
+                accept_media(shared, runtime, media, true, stats.as_deref_mut())
+            }
+            Output::UdpMedia(media) => {
+                accept_media(shared, runtime, media, false, stats.as_deref_mut())
+            }
         }
     }
 }
 
-fn accept_media(shared: &Shared, media: Media, game: bool, stats: Option<&mut RxStats>) {
+fn accept_media(
+    shared: &Shared,
+    runtime: &Runtime,
+    media: Media,
+    game: bool,
+    stats: Option<&mut RxStats>,
+) {
     let now = Instant::now();
     let outcome = {
         let mut mixer = shared.mixer.lock().unwrap();
+        mixer.enforce(|sender, revision| runtime.accepts_media(sender, revision));
         if game {
-            mixer.receive_game(media.borrowed(), now)
+            mixer.receive_game_at(media.borrowed(), media.revision, now)
         } else {
-            mixer.receive_authenticated(media.borrowed(), now)
+            mixer.receive_authenticated_at(media.borrowed(), media.revision, now)
         }
     };
     let taken = outcome == MediaOutcome::Accepted;
@@ -870,7 +982,8 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
                 }
             }
             Incoming::Start { sender, seq } => {
-                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                let runtime = shared.runtime.lock().unwrap();
+                if !runtime.0.allows_receive(sender) {
                     continue;
                 }
                 let s = stats.senders.entry(sender).or_default();
@@ -879,7 +992,8 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
                 shared.mixer.lock().unwrap().start(sender, now);
             }
             Incoming::Voice { sender, seq, frame } => {
-                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                let runtime = shared.runtime.lock().unwrap();
+                if !runtime.0.allows_receive(sender) {
                     continue;
                 }
                 let s = stats.senders.entry(sender).or_default();
@@ -900,7 +1014,8 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
                 }
             }
             Incoming::Stop { sender, .. } => {
-                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                let runtime = shared.runtime.lock().unwrap();
+                if !runtime.0.allows_receive(sender) {
                     continue;
                 }
                 stats.senders.entry(sender).or_default().stops += 1;
@@ -911,10 +1026,117 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
     stats
 }
 
+type Playback = (Samples, u32, Option<Arc<AtomicU64>>);
+
+struct PlayoutSlice {
+    audible: bool,
+    pcm: [f32; SLICE_SAMPLES],
+    pulled: Vec<mix::Pulled>,
+    slot: u64,
+    muted: bool,
+}
+
+fn pull_playout(
+    shared: &Shared,
+    output: &Option<Playback>,
+    resampler: &mut Option<Resampler>,
+    reset: &mut u64,
+    mute: &mut Mute,
+) -> PlayoutSlice {
+    // admission and rendering share this fence through the final queue append.
+    let runtime = shared.runtime.lock().unwrap();
+    let epoch = shared.output_reset.load(Relaxed);
+    if *reset != epoch {
+        *reset = epoch;
+        *resampler = output
+            .as_ref()
+            .map(|(_, rate, _)| Resampler::new(OPUS_RATE, *rate));
+    }
+    let muted = shared.half_duplex.load(Relaxed)
+        && shared.ptt.load(Relaxed)
+        && !shared.open_mic.load(Relaxed);
+    let mut gains = [1.0; SLICE_SAMPLES];
+    mute.apply(muted, &mut gains);
+    let audible_samples = gains
+        .iter()
+        .position(|gain| *gain == 0.0)
+        .unwrap_or(SLICE_SAMPLES);
+    let (mix, contributions) = {
+        let mut mixer = shared.mixer.lock().unwrap();
+        let mix = mixer.tick_checked(Instant::now(), audible_samples, |sender, revision| {
+            runtime.0.accepts_media(sender, revision)
+        });
+        let contributions: Vec<_> = mixer
+            .pulled
+            .iter()
+            .filter(|pull| pull.audible_until > 0)
+            .map(|pull| (pull.sender, pull.audible_until))
+            .collect();
+        (mix, contributions)
+    };
+    let mut pcm = [0.0; SLICE_SAMPLES];
+    if let Some(mix) = &mix {
+        pcm.copy_from_slice(mix);
+    }
+    for (sample, gain) in pcm.iter_mut().zip(gains) {
+        *sample *= gain;
+    }
+    shared.echo.far_end(&pcm);
+    let mut slot = 0;
+    if let (Some((samples, _, popped)), Some(resampler)) = (output, resampler.as_mut()) {
+        let mut out = Vec::new();
+        let carry_until = resampler.prefix_samples(1);
+        let endpoints: Vec<_> = contributions
+            .iter()
+            .map(|(sender, until)| (*sender, resampler.prefix_samples(until + 1)))
+            .collect();
+        resampler.process(&pcm, &mut out);
+        let mut queue = samples.lock().unwrap();
+        let mut history = shared.output_history.lock().unwrap();
+        history.synchronize(queue.len());
+        let mut contributors: BTreeMap<_, _> = history
+            .carry
+            .iter()
+            .map(|sender| (*sender, carry_until.min(out.len())))
+            .collect();
+        if pcm.iter().any(|sample| *sample != 0.0) {
+            for (sender, until) in endpoints {
+                let end = contributors.entry(sender).or_default();
+                *end = (*end).max(until.min(out.len()));
+            }
+        }
+        let contributors = contributors
+            .into_iter()
+            .filter(|(_, until)| *until > 0)
+            .collect();
+        history.queued.push_back((out.len(), contributors));
+        history.carry = if pcm[SLICE_SAMPLES - 1] != 0.0 {
+            contributions
+                .iter()
+                .filter(|(_, until)| *until == SLICE_SAMPLES)
+                .map(|(sender, _)| *sender)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        slot = popped.as_ref().map_or(0, |p| p.load(Relaxed)) + queue.len() as u64;
+        queue.extend(&out);
+    }
+    let pulled = std::mem::take(&mut shared.mixer.lock().unwrap().pulled);
+    drop(runtime);
+    PlayoutSlice {
+        audible: mix.is_some(),
+        pcm,
+        pulled,
+        slot,
+        muted,
+    }
+}
+
 /// returns the number of slices written to the wav
 fn playout(
     shared: &Shared,
-    output: Option<(Samples, u32, Option<Arc<AtomicU64>>)>,
+    output: Option<Playback>,
     mut wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
 ) -> Result<u64, hound::Error> {
     let mut resampler = output
@@ -922,8 +1144,8 @@ fn playout(
         .map(|(_, rate, _)| Resampler::new(OPUS_RATE, *rate));
     let mut next = Instant::now();
     let mut recorded = 0;
-    let mut out = Vec::new();
     let (mut mute, mut was_muted) = (Mute::default(), false);
+    let mut reset = 0;
     while !shared.done.load(Relaxed) {
         match &output {
             // the output device's clock paces playout: top the queue up with the next slice
@@ -941,47 +1163,25 @@ fn playout(
                 thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         }
-        let (mix, pulled) = {
-            let mut mixer = shared.mixer.lock().unwrap();
-            let mix = mixer.tick(Instant::now());
-            (mix, std::mem::take(&mut mixer.pulled))
-        };
-        // half-duplex: silent speakers while PTT is held, so the microphone cannot pick the
-        // others up; the mixer keeps pulling, so playback resumes in sync on release
-        let muted = shared.half_duplex.load(Relaxed)
-            && shared.ptt.load(Relaxed)
-            && !shared.open_mic.load(Relaxed);
-        let mut slice = [0.0; SLICE_SAMPLES];
-        if let Some(mix) = &mix {
-            slice.copy_from_slice(mix);
-        }
-        mute.apply(muted, &mut slice);
-        let frame = &slice[..];
-        shared.echo.far_end(frame);
-        if let (Some(_), Some(writer)) = (&mix, wav.as_mut()) {
+        let PlayoutSlice {
+            audible,
+            pcm,
+            pulled,
+            slot,
+            muted,
+        } = pull_playout(shared, &output, &mut resampler, &mut reset, &mut mute);
+        if let (true, Some(writer)) = (audible, wav.as_mut()) {
+            let frame = &pcm[..];
             let written = frame.iter().try_for_each(|s| {
                 writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             });
             match written {
                 Ok(()) => recorded += 1,
-                // a failing recording must not silence playback: stop recording, keep playing
                 Err(err) => {
                     eprintln!("--record-received: write failed, recording stopped: {err}");
                     wav = None;
                 }
             }
-        }
-        // the frame's first sample sounds after everything the device took before plus what is
-        // queued now; both are read under the queue lock, so the index does not depend on when
-        // the device thread wakes (it counts only with the virtual device, else it is the queue
-        // length)
-        let mut slot = 0;
-        if let (Some((samples, _, popped)), Some(resampler)) = (&output, resampler.as_mut()) {
-            out.clear();
-            resampler.process(frame, &mut out);
-            let mut queue = samples.lock().unwrap();
-            slot = popped.as_ref().map_or(0, |p| p.load(Relaxed)) + queue.len() as u64;
-            queue.extend(&out);
         }
         if muted != was_muted {
             shared.trace(format_args!("mute {} {slot}", muted as u8));
@@ -1052,4 +1252,269 @@ fn summary(frames_sent: u64, rx: &RxStats, mix: &mix::MixStats, recorded: u64) -
         recorded as f64 * SLICE.as_secs_f64(),
         rx.ignored
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ptt_radio_companion::transport::signaling::{self, Audience};
+
+    fn shared() -> (Arc<Shared>, Samples) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let game = socket.local_addr().unwrap();
+        let network = Network::bind(vec!["127.0.0.1:0".parse().unwrap()], None).unwrap();
+        let mut runtime = Runtime::new(
+            network.addresses().unwrap(),
+            RuntimeConfig {
+                game_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        runtime.identify(1, Instant::now()).unwrap();
+        runtime
+            .game(
+                &signaling::encode_audience(&Audience {
+                    revision: 1,
+                    send_to: vec![],
+                    receive_from: vec![2, 3],
+                })
+                .unwrap(),
+                Instant::now(),
+            )
+            .unwrap();
+        while runtime.poll().is_some() {}
+        let shared = Arc::new(Shared {
+            socket,
+            game,
+            done: AtomicBool::new(false),
+            ptt: AtomicBool::new(false),
+            open_mic: AtomicBool::new(false),
+            half_duplex: AtomicBool::new(false),
+            roster_seen: AtomicBool::new(false),
+            mixer: Mutex::new(Mixer::default()),
+            echo: EchoPath::new(false),
+            sent: Mutex::new(HashMap::new()),
+            trace: None,
+            runtime: Mutex::new((runtime, network)),
+            output: OnceLock::new(),
+            output_history: Mutex::new(OutputHistory::default()),
+            output_reset: AtomicU64::new(0),
+        });
+        let samples = Samples::default();
+        shared.output.set((samples.clone(), OPUS_RATE)).unwrap();
+        (shared, samples)
+    }
+
+    fn remove(shared: &Shared, players: &[u16]) {
+        let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+        runtime
+            .game(
+                &signaling::encode_audience(&Audience {
+                    revision: 2,
+                    send_to: vec![],
+                    receive_from: players.to_vec(),
+                })
+                .unwrap(),
+                Instant::now(),
+            )
+            .unwrap();
+        drain_runtime(shared, runtime, network, None);
+    }
+
+    fn queue_voice(shared: &Shared, sender: u16, level: f32) {
+        let mut tx = Transmitter::new(Codec {
+            frame_ms: 10,
+            ..Codec::default()
+        })
+        .unwrap();
+        tx.set_ptt(true);
+        let packets = tx.frame(&[level; SLICE_SAMPLES]);
+        let voice = packets.iter().find(|packet| packet[2] == VOICE).unwrap();
+        let now = Instant::now() - Duration::from_millis(100);
+        let mut mixer = shared.mixer.lock().unwrap();
+        mixer.start(sender, now);
+        assert!(mixer.voice(sender, 1, &voice[5..], now));
+    }
+
+    #[test]
+    fn a_silent_removed_player_preserves_unaffected_queued_audio_and_resampler_carry() {
+        let (shared, samples) = shared();
+        queue_voice(&shared, 2, 0.25);
+        {
+            // the existing malformed-opus rule produces exactly zero pcm.
+            let now = Instant::now() - Duration::from_millis(100);
+            let mut mixer = shared.mixer.lock().unwrap();
+            mixer.start(3, now);
+            assert!(mixer.voice(3, 1, &[255], now));
+            assert_eq!(mixer.stats.decode_errors, 1);
+        }
+        let rendered = pull_playout(
+            &shared,
+            &Some((samples.clone(), OPUS_RATE, None)),
+            &mut Some(Resampler::new(OPUS_RATE, OPUS_RATE)),
+            &mut 0,
+            &mut Mute::default(),
+        );
+        assert!(
+            rendered
+                .pulled
+                .iter()
+                .any(|pull| pull.sender == 3 && pull.audible_until == 0)
+        );
+        let before = samples.lock().unwrap().clone();
+        assert!(before.iter().any(|sample| *sample != 0.0));
+        remove(&shared, &[2]);
+        assert_eq!(*samples.lock().unwrap(), before);
+        assert_eq!(shared.output_history.lock().unwrap().carry, [2]);
+        assert_eq!(shared.output_reset.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn consumed_resampler_carry_no_longer_tags_the_remaining_other_speaker_samples() {
+        for rate in [44_100, 48_000, 96_000] {
+            let (shared, samples) = shared();
+            let output = Some((samples.clone(), rate, None));
+            let mut resampler = Some(Resampler::new(OPUS_RATE, rate));
+            let mut reset = 0;
+            let mut mute = Mute::default();
+            queue_voice(&shared, 3, 0.25);
+            pull_playout(&shared, &output, &mut resampler, &mut reset, &mut mute);
+            assert_eq!(shared.output_history.lock().unwrap().carry, [3]);
+            samples.lock().unwrap().clear();
+            shared.mixer.lock().unwrap().stop(3);
+            queue_voice(&shared, 2, 0.3);
+            let carry_samples = resampler.as_ref().unwrap().prefix_samples(1);
+            if rate >= OPUS_RATE {
+                assert!(carry_samples > 0);
+            }
+            pull_playout(&shared, &output, &mut resampler, &mut reset, &mut mute);
+            samples.lock().unwrap().drain(..carry_samples);
+            let before = samples.lock().unwrap().clone();
+            assert!(before.iter().any(|sample| *sample != 0.0));
+            remove(&shared, &[2]);
+            assert_eq!(*samples.lock().unwrap(), before, "rate {rate}");
+            assert_eq!(shared.output_reset.load(Relaxed), 0, "rate {rate}");
+            assert_eq!(shared.output_history.lock().unwrap().carry, [2]);
+        }
+    }
+
+    #[test]
+    fn output_ledger_distinguishes_the_mute_fade_from_a_fully_zero_muted_slice() {
+        let (shared, samples) = shared();
+        shared.half_duplex.store(true, Relaxed);
+        shared.ptt.store(true, Relaxed);
+        queue_voice(&shared, 2, 0.25);
+        let output = Some((samples.clone(), OPUS_RATE, None));
+        let mut resampler = Some(Resampler::new(OPUS_RATE, OPUS_RATE));
+        let mut mute = Mute::default();
+        pull_playout(&shared, &output, &mut resampler, &mut 0, &mut mute);
+        assert!(
+            !shared
+                .output_history
+                .lock()
+                .unwrap()
+                .queued
+                .back()
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        samples.lock().unwrap().clear();
+        pull_playout(&shared, &output, &mut resampler, &mut 0, &mut mute);
+        assert!(
+            shared
+                .output_history
+                .lock()
+                .unwrap()
+                .queued
+                .back()
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        assert!(shared.output_history.lock().unwrap().carry.is_empty());
+        assert!(samples.lock().unwrap().iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn revoking_a_contributor_clears_remaining_mixed_audio_and_resampler_carry() {
+        let (shared, samples) = shared();
+        let queued =
+            OPUS_RATE as usize * OUTPUT_AHEAD.as_millis() as usize / 1000 - 1 + SLICE_SAMPLES;
+        samples.lock().unwrap().extend(vec![0.25; queued]);
+        *shared.output_history.lock().unwrap() = OutputHistory {
+            queued: VecDeque::from([
+                (SLICE_SAMPLES, vec![(2, SLICE_SAMPLES)]),
+                (
+                    queued - SLICE_SAMPLES,
+                    vec![(2, queued - SLICE_SAMPLES), (3, queued - SLICE_SAMPLES)],
+                ),
+            ]),
+            carry: vec![2, 3],
+        };
+        assert_eq!(queued, 1439);
+        remove(&shared, &[2]);
+        assert!(samples.lock().unwrap().is_empty());
+        assert!(shared.output_history.lock().unwrap().carry.is_empty());
+        assert_eq!(shared.output_reset.load(Relaxed), 1);
+        println!(
+            "mixed output cut: {queued} -> 0 samples ({:.6} ms at {OPUS_RATE} Hz)",
+            queued as f64 * 1000.0 / OPUS_RATE as f64
+        );
+        let mut resampler = Some(Resampler::new(OPUS_RATE, OPUS_RATE));
+        resampler.as_mut().unwrap().process(&[0.5], &mut Vec::new());
+        let slice = pull_playout(
+            &shared,
+            &Some((samples.clone(), OPUS_RATE, None)),
+            &mut resampler,
+            &mut 0,
+            &mut Mute::default(),
+        );
+        assert!(!slice.audible);
+        assert!(samples.lock().unwrap().iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn a_pre_purge_pull_cannot_append_after_the_revocation_fence() {
+        let (shared, samples) = shared();
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
+        tx.set_ptt(true);
+        let packets = tx.frame(&[0.25; 960]);
+        let voice = packets.iter().find(|packet| packet[2] == VOICE).unwrap();
+        let now = Instant::now() - Duration::from_millis(100);
+        shared.mixer.lock().unwrap().start(2, now);
+        assert!(shared.mixer.lock().unwrap().voice(2, 1, &voice[5..], now));
+        let queue = samples.lock().unwrap();
+        let renderer = {
+            let shared = shared.clone();
+            let samples = samples.clone();
+            thread::spawn(move || {
+                pull_playout(
+                    &shared,
+                    &Some((samples, OPUS_RATE, None)),
+                    &mut Some(Resampler::new(OPUS_RATE, OPUS_RATE)),
+                    &mut 0,
+                    &mut Mute::default(),
+                )
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while shared.mixer.lock().unwrap().pulled.is_empty() {
+            assert!(Instant::now() < deadline, "renderer never pulled");
+            thread::yield_now();
+        }
+        assert!(
+            shared.runtime.try_lock().is_err(),
+            "policy fence released before sample append"
+        );
+        let revoker = {
+            let shared = shared.clone();
+            thread::spawn(move || remove(&shared, &[]))
+        };
+        drop(queue);
+        assert!(renderer.join().unwrap().audible);
+        revoker.join().unwrap();
+        assert!(samples.lock().unwrap().is_empty());
+    }
 }

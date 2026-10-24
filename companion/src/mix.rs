@@ -69,6 +69,7 @@ struct Held {
     talkspurt: u16,
     opus: Vec<u8>,
     at: Instant,
+    revision: Option<u64>,
 }
 
 struct Early {
@@ -102,7 +103,7 @@ impl Early {
         }
     }
 
-    fn push(&mut self, media: GameMedia<'_>, now: Instant) -> bool {
+    fn push(&mut self, media: GameMedia<'_>, revision: Option<u64>, now: Instant) -> bool {
         if media.opus.len() > MAX_OPUS {
             return false;
         }
@@ -112,6 +113,7 @@ impl Early {
             talkspurt: media.talkspurt,
             opus: media.opus.to_vec(),
             at: now,
+            revision,
         };
         match media.kind {
             Kind::Voice => {
@@ -180,6 +182,7 @@ impl Early {
 pub struct Slice {
     pub seq: u16,
     pub offset: usize,
+    revision: Option<u64>,
     pcm: [f32; SLICE_SAMPLES],
     impaired: usize,
     talkspurt: u16,
@@ -192,7 +195,10 @@ struct Speaker {
     order: Reorder,
     decoder: Decoder,
     /// decoded samples not yet a whole slice, each with its packet seq and offset
-    pending: VecDeque<(u16, usize, f32, bool, u16)>,
+    /// (seq, offset, policy revision, sample, impaired, talkspurt)
+    pending: VecDeque<(u16, usize, Option<u64>, f32, bool, u16)>,
+    /// outer none means reset/unbound; inner none is legacy media.
+    last_revision: Option<Option<u64>>,
     /// recent rms level of this speaker's decoded packets
     level: f32,
     /// length of the last decoded packet: how long a missing one is concealed
@@ -238,10 +244,34 @@ pub struct Pulled {
     pub shed: Option<(u16, usize)>,
     /// slices still queued after this pull
     pub queued: usize,
+    /// exclusive end of this speaker's nonzero contribution within the audible prefix.
+    pub audible_until: usize,
 }
 
 impl Speaker {
-    fn new(stream: StreamId, wait: Option<Duration>, now: Instant) -> Self {
+    fn enforce(&mut self, player: u16, allowed: &impl Fn(u16, Option<u64>) -> bool) -> bool {
+        self.order.retain(|frame| allowed(player, frame.revision));
+        self.pending.retain(|sample| allowed(player, sample.2));
+        if let Some(pcm) = &mut self.stream {
+            pcm.retain(|slice| allowed(player, slice.revision));
+        }
+        if self
+            .last_revision
+            .is_some_and(|revision| !allowed(player, revision))
+        {
+            self.decoder.reset().expect("opus decoder reset");
+            self.last_revision = None;
+        }
+        if self.last_revision.is_none()
+            && self.order.deadline().is_none()
+            && self.pending.is_empty()
+            && self.stream.as_ref().is_none_or(|pcm| pcm.queued() == 0)
+        {
+            return false;
+        }
+        true
+    }
+    fn new(stream: StreamId, wait: Option<Duration>, revision: Option<u64>, now: Instant) -> Self {
         let mut order = Reorder::new(stream, reorder::GAME_ONLY);
         if let Some(wait) = wait {
             order.set_wait(wait);
@@ -251,6 +281,7 @@ impl Speaker {
             order,
             decoder: Decoder::new(Channels::Mono, SampleRate::Hz48000).expect("opus decoder"),
             pending: VecDeque::new(),
+            last_revision: Some(revision),
             level: 0.0,
             // 20 ms, the default packet, until one is decoded
             packet_samples: OPUS_RATE as usize / 50,
@@ -267,8 +298,13 @@ impl Speaker {
         loop {
             let dropped = match self.order.poll(now) {
                 Ordered::Frame(frame) => {
-                    let (ok, dropped) =
-                        self.decode(frame.id.sequence as u16, frame.talkspurt, &frame.opus, now);
+                    let (ok, dropped) = self.decode(
+                        frame.id.sequence as u16,
+                        frame.talkspurt,
+                        &frame.opus,
+                        frame.revision,
+                        now,
+                    );
                     if ok {
                         stats.decoded += 1;
                     } else {
@@ -278,7 +314,7 @@ impl Speaker {
                 }
                 Ordered::Missing { id, next } => {
                     stats.missing += 1;
-                    self.missing(id.sequence as u16, next.map(|f| f.opus), now)
+                    self.missing(id.sequence as u16, next, now)
                 }
                 Ordered::Wait => return,
             };
@@ -288,7 +324,14 @@ impl Speaker {
     }
 
     /// decodes one packet into slices; false when it was not opus
-    fn decode(&mut self, seq: u16, talkspurt: u16, packet: &[u8], now: Instant) -> (bool, usize) {
+    fn decode(
+        &mut self,
+        seq: u16,
+        talkspurt: u16,
+        packet: &[u8],
+        revision: Option<u64>,
+        now: Instant,
+    ) -> (bool, usize) {
         let mut decoded = [0.0f32; MAX_DECODE];
         let (ok, n) = match self
             .decoder
@@ -303,14 +346,21 @@ impl Speaker {
                 (false, GARBAGE_SAMPLES)
             }
         };
-        (ok, self.queue(seq, talkspurt, &decoded[..n], !ok, now))
+        self.last_revision = Some(revision);
+        (
+            ok,
+            self.queue(seq, talkspurt, &decoded[..n], revision, !ok, now),
+        )
     }
 
     /// a packet that never came: FEC from the one after it, or with none of that (or no
     /// FEC in it) the decoder's own concealment; returns slices dropped like `decode`
-    fn missing(&mut self, seq: u16, next: Option<Vec<u8>>, now: Instant) -> usize {
+    fn missing(&mut self, seq: u16, next: Option<CompressedFrame>, now: Instant) -> usize {
         let mut pcm = [0.0f32; MAX_DECODE];
-        let next = next.as_deref();
+        let revision = next
+            .as_ref()
+            .map_or(self.last_revision.flatten(), |frame| frame.revision);
+        let next = next.as_ref().map(|frame| frame.opus.as_slice());
         let n = next
             .and_then(|p| self.decoder.get_nb_samples(p).ok())
             .unwrap_or(self.packet_samples)
@@ -319,7 +369,7 @@ impl Speaker {
             .decoder
             .decode_float_to_slice(next.unwrap_or(&[]), &mut pcm[..n], next.is_some())
             .unwrap_or(n);
-        self.queue(seq, self.talkspurt, &pcm[..n], true, now)
+        self.queue(seq, self.talkspurt, &pcm[..n], revision, true, now)
     }
 
     /// queues decoded samples of packet `seq` as slices; returns how many were dropped
@@ -328,6 +378,7 @@ impl Speaker {
         seq: u16,
         talkspurt: u16,
         pcm: &[f32],
+        revision: Option<u64>,
         impaired: bool,
         now: Instant,
     ) -> usize {
@@ -336,22 +387,27 @@ impl Speaker {
         let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / n as f32).sqrt();
         let decay = LEVEL_DECAY.powf(n as f32 / 960.0);
         self.level = rms.max(self.level * decay);
+        // never combine a sub-slice tail from one policy with another policy's samples.
+        if self.pending.front().is_some_and(|p| p.2 != revision) {
+            self.pending.clear();
+        }
         self.pending.extend(
             pcm.iter()
                 .enumerate()
-                .map(|(i, &s)| (seq, i, s, impaired, talkspurt)),
+                .map(|(i, &s)| (seq, i, revision, s, impaired, talkspurt)),
         );
         let mut dropped = 0;
         while self.pending.len() >= SLICE_SAMPLES {
-            let (seq, offset, _, _, talkspurt) = self.pending[0];
+            let (seq, offset, revision, _, _, talkspurt) = self.pending[0];
             let mut slice = Slice {
                 seq,
                 offset,
+                revision,
                 pcm: [0.0; SLICE_SAMPLES],
                 impaired: 0,
                 talkspurt,
             };
-            for (out, (_, _, s, impaired, _)) in slice
+            for (out, (_, _, _, s, impaired, _)) in slice
                 .pcm
                 .iter_mut()
                 .zip(self.pending.drain(..SLICE_SAMPLES))
@@ -402,6 +458,46 @@ fn legacy(sender: u16) -> StreamId {
 }
 
 impl Mixer {
+    pub fn reset_streams(&mut self) {
+        self.purge(true, &[]);
+        self.selected.clear();
+    }
+    pub fn purge(&mut self, all: bool, players: &[u16]) {
+        self.speakers
+            .retain(|player, _| !all && !players.contains(player));
+        self.early
+            .retain(|player, _| !all && !players.contains(player));
+        for (player, selection) in &mut self.selected {
+            if all || players.contains(player) {
+                selection.talkspurt = None;
+            }
+        }
+        self.pulled.clear();
+    }
+
+    /// apply at admission and before every pull, with the runtime's installed policy.
+    pub fn enforce(&mut self, allowed: impl Fn(u16, Option<u64>) -> bool) {
+        self.early.retain(|player, early| {
+            early.voice.retain(|media| allowed(*player, media.revision));
+            if early
+                .start
+                .as_ref()
+                .is_some_and(|m| !allowed(*player, m.revision))
+            {
+                early.start = None;
+            }
+            if early
+                .stop
+                .as_ref()
+                .is_some_and(|m| !allowed(*player, m.revision))
+            {
+                early.stop = None;
+            }
+            early.len() != 0
+        });
+        self.speakers
+            .retain(|player, speaker| speaker.enforce(*player, &allowed));
+    }
     /// changes the gap budget without replacing the decoder or queued identities.
     pub fn reorder_wait(&mut self, player: u16, wait: Duration) {
         self.waits.insert(player, wait);
@@ -416,7 +512,7 @@ impl Mixer {
         if self.selected.contains_key(&sender) {
             return;
         }
-        self.start_stream(legacy(sender), now);
+        self.start_stream(legacy(sender), None, now);
         let speaker = self.speakers.get_mut(&sender).expect("opened above");
         speaker.continuity = Continuity::default();
         speaker.heard = false;
@@ -435,7 +531,7 @@ impl Mixer {
             self.stats.discarded += 1;
             return false;
         }
-        self.push(legacy(sender), 0, seq, packet, now) == MediaOutcome::Accepted
+        self.push(legacy(sender), 0, seq, packet, None, now) == MediaOutcome::Accepted
     }
 
     /// legacy STOP
@@ -482,7 +578,10 @@ impl Mixer {
                     talkspurt: held.talkspurt,
                     opus: &held.opus,
                 };
-                if self.authenticated(media, now) && held.kind == Kind::Voice {
+                if self.receive_authenticated_at(media, held.revision, now)
+                    == MediaOutcome::Accepted
+                    && held.kind == Kind::Voice
+                {
                     received.push((player, held.sequence));
                 }
             }
@@ -508,6 +607,15 @@ impl Mixer {
     }
 
     pub fn receive_game(&mut self, media: GameMedia<'_>, now: Instant) -> MediaOutcome {
+        self.receive_game_at(media, None, now)
+    }
+
+    pub fn receive_game_at(
+        &mut self,
+        media: GameMedia<'_>,
+        revision: Option<u64>,
+        now: Instant,
+    ) -> MediaOutcome {
         self.expire_early(now);
         if self
             .selected
@@ -536,7 +644,7 @@ impl Mixer {
                     .any(|m| m.sequence == media.sequence && m.talkspurt == media.talkspurt)
             {
                 MediaOutcome::Duplicate
-            } else if early.push(media, now) {
+            } else if early.push(media, revision, now) {
                 MediaOutcome::Held
             } else {
                 MediaOutcome::Dropped("hold-control")
@@ -546,7 +654,7 @@ impl Mixer {
             }
             return outcome;
         }
-        self.receive_authenticated(media, now)
+        self.receive_authenticated_at(media, revision, now)
     }
 
     /// authenticated UDP never establishes a stream or enters the game hold.
@@ -555,6 +663,15 @@ impl Mixer {
     }
 
     pub fn receive_authenticated(&mut self, media: GameMedia<'_>, now: Instant) -> MediaOutcome {
+        self.receive_authenticated_at(media, None, now)
+    }
+
+    pub fn receive_authenticated_at(
+        &mut self,
+        media: GameMedia<'_>,
+        revision: Option<u64>,
+        now: Instant,
+    ) -> MediaOutcome {
         let player = media.stream.player;
         let Some(selection) = self.selected.get_mut(&player) else {
             self.stats.discarded += 1;
@@ -613,7 +730,7 @@ impl Mixer {
             self.speakers.remove(&player);
         }
         if opens || media.kind == Kind::Start {
-            self.start_stream(selected, now);
+            self.start_stream(selected, revision, now);
         }
         if opens {
             let speaker = self.speakers.get_mut(&player).expect("opened above");
@@ -624,13 +741,20 @@ impl Mixer {
             speaker.late_samples = 0;
         }
         if media.kind == Kind::Voice {
-            return self.push(selected, media.talkspurt, media.sequence, media.opus, now);
+            return self.push(
+                selected,
+                media.talkspurt,
+                media.sequence,
+                media.opus,
+                revision,
+                now,
+            );
         }
         MediaOutcome::Accepted
     }
 
     /// START on a stream that still plays keeps its decoder and queues (Stream::restart)
-    fn start_stream(&mut self, stream: StreamId, now: Instant) {
+    fn start_stream(&mut self, stream: StreamId, revision: Option<u64>, now: Instant) {
         match self.speakers.get_mut(&stream.player) {
             Some(speaker) => match &mut speaker.stream {
                 Some(pcm) => pcm.restart(now),
@@ -639,7 +763,12 @@ impl Mixer {
             None => {
                 self.speakers.insert(
                     stream.player,
-                    Speaker::new(stream, self.waits.get(&stream.player).copied(), now),
+                    Speaker::new(
+                        stream,
+                        self.waits.get(&stream.player).copied(),
+                        revision,
+                        now,
+                    ),
                 );
             }
         }
@@ -652,13 +781,18 @@ impl Mixer {
         talkspurt: u16,
         seq: u16,
         opus: &[u8],
+        revision: Option<u64>,
         now: Instant,
     ) -> MediaOutcome {
         // without a speaker the START was missed (companion started mid-transmission)
-        let speaker = self
-            .speakers
-            .entry(stream.player)
-            .or_insert_with(|| Speaker::new(stream, self.waits.get(&stream.player).copied(), now));
+        let speaker = self.speakers.entry(stream.player).or_insert_with(|| {
+            Speaker::new(
+                stream,
+                self.waits.get(&stream.player).copied(),
+                revision,
+                now,
+            )
+        });
         let outcome = speaker
             .order
             .media_id(seq)
@@ -667,6 +801,7 @@ impl Mixer {
                     id,
                     talkspurt,
                     opus: opus.to_vec(),
+                    revision,
                 };
                 match speaker.order.push(frame, now) {
                     InsertResult::Queued => MediaOutcome::Accepted,
@@ -723,6 +858,16 @@ impl Mixer {
 
     /// one SLICE of the mix at 48 kHz, or None when nobody is audible
     pub fn tick(&mut self, now: Instant) -> Option<Vec<f32>> {
+        self.tick_checked(now, SLICE_SAMPLES, |_, _| true)
+    }
+
+    pub fn tick_checked(
+        &mut self,
+        now: Instant,
+        audible_samples: usize,
+        allowed: impl Fn(u16, Option<u64>) -> bool,
+    ) -> Option<Vec<f32>> {
+        self.enforce(&allowed);
         self.expire_early(now);
         let mut mix = vec![0.0f32; SLICE_SAMPLES];
         let mut audible = false;
@@ -734,6 +879,9 @@ impl Mixer {
         self.speakers.retain(|&sender, speaker| {
             // a gap whose deadline passed since the last packet
             speaker.drain(now, stats);
+            if !speaker.enforce(sender, &allowed) {
+                return false;
+            }
             let Some(pull) = speaker.stream.as_mut().map(|s| s.pull(now)) else {
                 return true;
             };
@@ -762,6 +910,10 @@ impl Mixer {
                         slice: None,
                         shed: None,
                         queued: 0,
+                        audible_until: pcm[..audible_samples]
+                            .iter()
+                            .rposition(|sample| *sample != 0.0)
+                            .map_or(0, |index| index + 1),
                     });
                     true
                 }
@@ -803,6 +955,10 @@ impl Mixer {
                         slice: Some((slice.seq, slice.offset)),
                         shed,
                         queued: stream.queued(),
+                        audible_until: slice.pcm[..audible_samples]
+                            .iter()
+                            .rposition(|sample| *sample != 0.0)
+                            .map_or(0, |index| index + 1),
                     });
                     true
                 }
@@ -956,7 +1112,7 @@ mod tests {
                     // losses occur in the final two seconds, separated to avoid a long gap.
                     let seq = n / frame_slices;
                     let lost = seq >= loss_start
-                        && (seq - loss_start) % 5 == 0
+                        && (seq - loss_start).is_multiple_of(5)
                         && (seq - loss_start) / 5 < losses;
                     if n % frame_slices == 0 && !lost {
                         let voice = v2(Kind::Voice, GEN_A, 7, seq, &opus[0]);
@@ -970,7 +1126,7 @@ mod tests {
                     let prior = seq.saturating_sub(5);
                     if n % frame_slices == 0
                         && seq >= loss_start + 5
-                        && (prior - loss_start) % 5 == 0
+                        && (prior - loss_start).is_multiple_of(5)
                         && (prior - loss_start) / 5 < losses
                     {
                         // inject each missing identity only after its gap deadline and playout.
@@ -1138,6 +1294,97 @@ mod tests {
             assert_eq!((records[0].talkspurt, records[0].level), (next_spurt, 1));
             assert!(reporter.batch(&records, active_at).is_some());
         }
+    }
+
+    #[test]
+    fn policy_pruned_compressed_audio_is_not_recreated_as_fec_or_plc() {
+        let now = Instant::now();
+        let frames = opus_frames(20, 4);
+        let mut mixer = Mixer::default();
+        mixer.select(v2(Kind::Start, GEN_A, 1, 0, &[]).stream, now);
+        for (sequence, revision) in [(0, 7), (2, 7), (3, 8)] {
+            assert_eq!(
+                mixer.receive_game_at(
+                    v2(Kind::Voice, GEN_A, 1, sequence, &frames[sequence as usize]),
+                    Some(revision),
+                    now
+                ),
+                MediaOutcome::Accepted
+            );
+        }
+        let allowed = |_, revision| matches!(revision, Some(8 | 9));
+        for tick in 0..5 {
+            mixer.tick_checked(
+                now + Duration::from_millis(100 + 10 * tick),
+                SLICE_SAMPLES,
+                allowed,
+            );
+            assert!(
+                mixer
+                    .pulled
+                    .iter()
+                    .all(|p| p.slice.is_none_or(|(sequence, _)| sequence == 3)),
+                "expired samples reached pull"
+            );
+        }
+        assert_eq!(
+            mixer.stats.missing, 1,
+            "known pruned sequence must not be concealed"
+        );
+        assert_eq!(
+            mixer.receive_game_at(v2(Kind::Voice, GEN_A, 1, 2, &frames[2]), Some(9), now),
+            MediaOutcome::Dropped("late")
+        );
+    }
+
+    #[test]
+    fn policy_recheck_purges_held_and_pcm_but_keeps_an_adjacent_intersection() {
+        let now = Instant::now();
+        let frames = opus_frames(20, 3);
+        let mut mixer = Mixer::default();
+        assert_eq!(
+            mixer.receive_game_at(v2(Kind::Voice, GEN_A, 1, 1, &frames[0]), Some(7), now),
+            MediaOutcome::Held
+        );
+        mixer.enforce(|_, _| false);
+        assert!(
+            mixer
+                .select(v2(Kind::Start, GEN_A, 1, 0, &[]).stream, now)
+                .is_empty()
+        );
+        for (sequence, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                mixer.receive_game_at(
+                    v2(Kind::Voice, GEN_A, 1, sequence as u16 + 1, frame),
+                    Some(7),
+                    now
+                ),
+                MediaOutcome::Accepted
+            );
+        }
+        let before = queued(&mixer);
+        mixer.enforce(|_, revision| matches!(revision, Some(7 | 8)));
+        assert_eq!(queued(&mixer), before);
+        assert_eq!(
+            mixer.receive_authenticated_at(v2(Kind::Voice, GEN_A, 1, 2, &frames[1]), Some(8), now),
+            MediaOutcome::Duplicate
+        );
+        assert!(
+            mixer
+                .tick_checked(now, SLICE_SAMPLES, |_, revision| matches!(
+                    revision,
+                    Some(7 | 8)
+                ))
+                .is_some()
+        );
+        assert!(
+            mixer
+                .tick_checked(now, SLICE_SAMPLES, |_, _| false)
+                .is_none()
+        );
+        assert!(mixer.is_idle());
+        assert!(mixer.early.is_empty());
+        assert!(mixer.pulled.is_empty());
     }
 
     #[test]

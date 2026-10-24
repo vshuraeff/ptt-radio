@@ -67,6 +67,14 @@ pub struct Stream<F> {
 }
 
 impl<F> Stream<F> {
+    pub fn retain(&mut self, allowed: impl FnMut(&F) -> bool) {
+        let before = self.queue.len();
+        self.queue.retain(allowed);
+        if self.queue.len() != before {
+            self.depths.clear();
+            self.backlog_since = None;
+        }
+    }
     pub fn new(now: Instant) -> Self {
         Stream {
             queue: VecDeque::new(),

@@ -1,7 +1,9 @@
 //! trusted-game signaling schema; no ICE, Noise, authorization or key storage.
 
 use super::Path;
-use super::wire::{AUDIENCE, CodecError, Reader, ReceiverHandle, SIGNAL_IN, SIGNAL_OUT, bounded};
+use super::wire::{
+    AUDIENCE, CodecError, POLICY, Reader, ReceiverHandle, SIGNAL_IN, SIGNAL_OUT, bounded,
+};
 use crate::packet::{MAGIC, VERSION};
 
 pub const PROTOCOL_VERSION: u16 = 2;
@@ -92,6 +94,31 @@ pub struct Audience {
     pub revision: u64,
     pub send_to: Vec<u16>,
     pub receive_from: Vec<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub audience: Audience,
+    pub tx_permitted: bool,
+    pub self_monitor: bool,
+}
+
+impl Policy {
+    pub fn validate(&self) -> Result<(), CodecError> {
+        if self.self_monitor && !self.tx_permitted {
+            return Err(CodecError::Invalid);
+        }
+        validate_players(&self.audience.send_to)?;
+        validate_players(&self.audience.receive_from)
+    }
+
+    pub fn allows_receiver(&self, sender: u16, local_player: u16) -> bool {
+        if sender == local_player {
+            self.tx_permitted && self.self_monitor
+        } else {
+            self.audience.receive_from.binary_search(&sender).is_ok()
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -192,13 +219,18 @@ fn read_candidates(r: &mut Reader<'_>) -> Result<(Vec<String>, bool), CodecError
     Ok((candidates, complete))
 }
 
-fn write_players(out: &mut Vec<u8>, players: &[u16]) -> Result<(), CodecError> {
+fn validate_players(players: &[u16]) -> Result<(), CodecError> {
     if players.len() > 256 {
         return Err(CodecError::Oversize);
     }
     if players.windows(2).any(|w| w[0] >= w[1]) {
         return Err(CodecError::Invalid);
     }
+    Ok(())
+}
+
+fn write_players(out: &mut Vec<u8>, players: &[u16]) -> Result<(), CodecError> {
+    validate_players(players)?;
     out.extend_from_slice(&(players.len() as u16).to_be_bytes());
     for player in players {
         out.extend_from_slice(&player.to_be_bytes());
@@ -212,9 +244,7 @@ fn read_players(r: &mut Reader<'_>) -> Result<Vec<u16>, CodecError> {
         return Err(CodecError::Oversize);
     }
     let players = (0..count).map(|_| r.u16()).collect::<Result<Vec<_>, _>>()?;
-    if players.windows(2).any(|w| w[0] >= w[1]) {
-        return Err(CodecError::Invalid);
-    }
+    validate_players(&players)?;
     Ok(players)
 }
 
@@ -519,4 +549,50 @@ pub fn decode_audience(data: &[u8]) -> Result<Audience, CodecError> {
     };
     r.finish()?;
     Ok(audience)
+}
+
+pub fn encode_policy(policy: &Policy) -> Result<Vec<u8>, CodecError> {
+    policy.validate()?;
+    let mut out = vec![MAGIC, VERSION, POLICY, 0, 0, 1];
+    out.extend_from_slice(&policy.audience.revision.to_be_bytes());
+    out.push(u8::from(policy.tx_permitted) | (u8::from(policy.self_monitor) << 1));
+    write_players(&mut out, &policy.audience.send_to)?;
+    write_players(&mut out, &policy.audience.receive_from)?;
+    bounded(out)
+}
+
+pub fn decode_policy(data: &[u8]) -> Result<Policy, CodecError> {
+    let mut r = Reader::new(data)?;
+    if r.u8()? != MAGIC {
+        return Err(CodecError::Invalid);
+    }
+    if r.u8()? != VERSION {
+        return Err(CodecError::UnsupportedVersion);
+    }
+    if r.u8()? != POLICY {
+        return Err(CodecError::UnknownType);
+    }
+    if r.u16()? != 0 {
+        return Err(CodecError::Invalid);
+    }
+    if r.u8()? != 1 {
+        return Err(CodecError::UnsupportedVersion);
+    }
+    let revision = r.u64()?;
+    let flags = r.u8()?;
+    if flags & !3 != 0 {
+        return Err(CodecError::Invalid);
+    }
+    let policy = Policy {
+        audience: Audience {
+            revision,
+            send_to: read_players(&mut r)?,
+            receive_from: read_players(&mut r)?,
+        },
+        tx_permitted: flags & 1 != 0,
+        self_monitor: flags & 2 != 0,
+    };
+    r.finish()?;
+    policy.validate()?;
+    Ok(policy)
 }
