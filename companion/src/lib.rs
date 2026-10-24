@@ -3,6 +3,7 @@
 //! scenarios (tests/scenarios.rs). see ../DESIGN.md.
 
 pub mod audio;
+pub mod crypto;
 pub mod echo;
 pub mod jitter;
 pub mod mix;
