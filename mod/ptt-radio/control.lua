@@ -30,6 +30,7 @@ local SIGNAL_OUT = 0x06
 local START2 = 0x07
 local VOICE2 = 0x08
 local STOP2 = 0x09
+local HUD_STATUS = 0x0A
 local SIGNAL_IN = 0x13
 local AUDIENCE = 0x14
 local MAX_SIGNAL_BODY = 1200
@@ -263,9 +264,48 @@ end
 local function forget_companion(player_index)
   storage.companions[player_index] = nil
   storage.v2[player_index] = nil
+  storage.hud1[player_index] = nil
   storage.open_mic[player_index] = nil
   set_echo(player_index, false)
   storage.talks[player_index] = nil
+  storage.speakers[player_index] = nil
+  hud.stop(player_index)
+  local player = player_index ~= 0 and game.get_player(player_index) or nil
+  if player then hud.clear_links(player) end
+end
+
+local function hello_capabilities(player, payload)
+  local v2, hud1
+  for token in string.gmatch(string.sub(payload, 6), "%S+") do
+    if token == "v2" then v2 = true end
+    if token == "hud1" then hud1 = true end
+  end
+  if storage.v2[player.index] ~= v2 or storage.hud1[player.index] ~= hud1 then
+    hud.clear_links(player)
+  end
+  storage.v2[player.index], storage.hud1[player.index] = v2, hud1
+end
+
+local function receive_hud_status(reporter, payload)
+  if reporter == 0 or not storage.companions[reporter] or not storage.hud1[reporter] or #payload < 7 then return end
+  local version, count = string.byte(payload, 6, 7)
+  if version ~= 1 or count > 32 or #payload ~= 7 + count * 15 then return end
+  -- validate the whole bounded packet before applying even its first record.
+  for at = 8, #payload, 15 do
+    local level, route, delay_class = string.byte(payload, at + 12, at + 14)
+    if level > 3 or route > 3 or delay_class > 3 then return end
+  end
+  local viewer = game.get_player(reporter)
+  for at = 8, #payload, 15 do
+    local sender = read_u16(payload, at)
+    local talk = storage.talks[sender]
+    if storage.speakers[sender] and talk and not talk.closed
+      and talk.generation == string.sub(payload, at + 2, at + 9)
+      and talk.talkspurt == read_u16(payload, at + 10)
+      and hud.visible(sender, reporter) then
+      hud.set_link(viewer, sender, string.byte(payload, at + 12, at + 14))
+    end
+  end
 end
 
 local LEGACY_KIND = { [START2] = START, [VOICE2] = VOICE, [STOP2] = STOP }
@@ -339,6 +379,7 @@ local function init_storage()
   storage.companions = storage.companions or {}
   -- companions whose HELLO announced v2 game media; the rest are legacy
   storage.v2 = storage.v2 or {}
+  storage.hud1 = storage.hud1 or {}
   storage.open_mic = storage.open_mic or {}
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
@@ -358,14 +399,15 @@ script.on_configuration_changed(function()
   render_all_huds()
 end)
 
-script.on_event(defines.events.on_tick, function()
+script.on_event(defines.events.on_tick, function(event)
   helpers.recv_udp()
+  hud.expire(event.tick)
 end)
 
 script.on_event(defines.events.on_udp_packet_received, function(event)
   local payload = event.payload
   local magic, version, kind = string.byte(payload, 1, 3)
-  if magic ~= MAGIC or version ~= VERSION then
+  if #payload < 5 or magic ~= MAGIC or version ~= VERSION then
     return
   end
   local sender_index = event.player_index
@@ -384,10 +426,12 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
         send_audience(0)
       end
     elseif sender_index ~= 0 then
-      -- the body is the companion version, followed by the token " v2" when it speaks v2
-      storage.v2[sender_index] = string.sub(string.sub(payload, 6), -3) == " v2" or nil
-      companion_seen(game.get_player(sender_index), event.tick)
+      local player = game.get_player(sender_index)
+      hello_capabilities(player, payload)
+      companion_seen(player, event.tick)
     end
+  elseif kind == HUD_STATUS then
+    receive_hud_status(sender_index, payload)
   elseif kind == SIGNAL_OUT then
     forward_signal(sender_index, payload)
   elseif kind == START2 or kind == VOICE2 or kind == STOP2 then

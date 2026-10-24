@@ -530,6 +530,21 @@ up to 32, and 15 bytes per record: sender BE16, opaque stream generation[8],
 talkspurt BE16, level, route and delay class. The largest packet is 487 bytes.
 The mod obtains the reporter from the input event, not the header's zero field.
 
+The mod recognizes exact whitespace-delimited HELLO capability tokens in any
+order. `hud1` enables reports; `v2` independently enables v2 media, and unrelated
+future tokens do not disable either. Without `hud1`, bars remain unknown. The
+decoder validates the complete size, body version, count and enum ranges before
+applying any record. Each record must name an active talker visible to that
+reporter and match its eight opaque generation bytes and current talkspurt.
+An identity or eligibility mismatch drops that record, not its valid neighbors.
+
+Only the reporter's own row bars repaint. Reports expire exactly 300 game ticks
+after arrival, and STOP, generation/talkspurt replacement, lost-STOP timeout,
+capability loss and companion disconnect clear the corresponding cached state.
+The expiry loop scans link tables only at the next stored deadline. A level-0
+report can still show its selected route and unknown delay in the tooltip; it
+stays grey. Echo replaces the bars, including during reports and expiry.
+
 `mix.rs` measures each sender's last two seconds of measured playout, excluding
 idle time and weighted by audio samples rather than packet count. Missing
 packets mark their decoded PLC/FEC samples as impaired; undecodable samples and playout underruns

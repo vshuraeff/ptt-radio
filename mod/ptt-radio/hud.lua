@@ -25,6 +25,7 @@ local ICON_SIZE, NAME_WIDTH, TAIL_WIDTH = 24, 136, 56
 local TOP, BOTTOM = 0.4, 0.8
 local SEGMENT_WIDTH, SEGMENT_HEIGHTS = 6, { 8, 12, 16 }
 local UNKNOWN_COLOR = { r = 0.45, g = 0.45, b = 0.45 }
+local LINK_TICKS = 300
 local LEVEL_COLOR = {
   { r = 0.9, g = 0.25, b = 0.2 },
   { r = 0.95, g = 0.75, b = 0.2 },
@@ -33,6 +34,7 @@ local LEVEL_COLOR = {
 
 function hud.init()
   storage.hud = storage.hud or { rows = {}, links = {} }
+  if not storage.hud.next_expiry and next(storage.hud.links) then storage.hud.next_expiry = game.tick end
 end
 
 local function find(sender)
@@ -55,7 +57,7 @@ local function paint(bars, link)
       segment.value, segment.style.color = i <= level and 1 or 0, LEVEL_COLOR[level]
     end
   end
-  bars.tooltip = link and { "ptt-radio.hud-link", { "ptt-radio.hud-route-" .. link.route }, { "ptt-radio.hud-delay-" .. link.delay_class } }
+  bars.tooltip = link and { level == 0 and "ptt-radio.hud-link-unknown-details" or "ptt-radio.hud-link", { "ptt-radio.hud-route-" .. link.route }, { "ptt-radio.hud-delay-" .. link.delay_class } }
     or { "ptt-radio.hud-link-unknown" }
 end
 
@@ -111,6 +113,9 @@ end
 
 -- rebuilds one viewer's stack; capacity depends on the screen, so this is also the reflow
 function hud.render(viewer)
+  for sender in pairs(storage.hud.links[viewer.index] or {}) do
+    if not hud.visible(sender, viewer.index) then storage.hud.links[viewer.index][sender] = nil end
+  end
   local screen = viewer.gui.screen
   if screen[ROOT] then screen[ROOT].destroy() end
   local shown = {}
@@ -172,15 +177,45 @@ function hud.stop(sender)
   render_viewers_of(sender)
 end
 
--- level 0 means unknown; only the bars of that one row are repainted
-function hud.set_link(viewer, sender, level, route, delay_class)
-  local links = storage.hud.links[viewer.index] or {}
-  storage.hud.links[viewer.index] = links
-  links[sender] = level ~= 0 and { level = level, route = route, delay_class = delay_class } or nil
+local function repaint_link(viewer, sender, link)
   local root = viewer.gui.screen[ROOT]
   local row = root and root[ROW .. sender]
   local bars = row and row[CONTENT][TAIL][BARS]
-  if bars then paint(bars, links[sender]) end
+  if bars then paint(bars, link) end
+end
+
+-- level 0 remains unknown even when the selected route is known.
+function hud.set_link(viewer, sender, level, route, delay_class)
+  local links = storage.hud.links[viewer.index] or {}
+  storage.hud.links[viewer.index] = links
+  links[sender] = { level = level, route = route, delay_class = delay_class, tick = game.tick }
+  local expires = game.tick + LINK_TICKS
+  if not storage.hud.next_expiry or expires < storage.hud.next_expiry then storage.hud.next_expiry = expires end
+  repaint_link(viewer, sender, links[sender])
+end
+
+function hud.clear_links(viewer)
+  local links = storage.hud.links[viewer.index]
+  storage.hud.links[viewer.index] = nil
+  for sender in pairs(links or {}) do repaint_link(viewer, sender, nil) end
+end
+
+function hud.expire(tick)
+  if not storage.hud.next_expiry or tick < storage.hud.next_expiry then return end
+  local next_expiry
+  for index, links in pairs(storage.hud.links) do
+    local viewer = game.get_player(index)
+    for sender, link in pairs(links) do
+      if not link.tick or tick - link.tick >= LINK_TICKS then
+        links[sender] = nil
+        if viewer and viewer.connected then repaint_link(viewer, sender, nil) end
+      else
+        local expires = link.tick + LINK_TICKS
+        if not next_expiry or expires < next_expiry then next_expiry = expires end
+      end
+    end
+  end
+  storage.hud.next_expiry = next_expiry
 end
 
 return hud
