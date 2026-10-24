@@ -1544,7 +1544,19 @@ mod tests {
         fn drop(&mut self) {
             let mut buf = [0; 4096];
             let mut stops = Vec::new();
-            while let Ok(len) = self.game.recv(&mut buf) {
+            // loopback delivery is asynchronous on macOS: wait a bounded time for both stops,
+            // then drain whatever else already arrived. nothing sends while this drop runs
+            self.game.set_nonblocking(false).unwrap();
+            self.game
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            loop {
+                if stops.len() == 2 {
+                    self.game.set_nonblocking(true).unwrap();
+                }
+                let Ok(len) = self.game.recv(&mut buf) else {
+                    break;
+                };
                 if len >= 3 && buf[2] == ptt_radio_companion::transport::wire::GAME_POLICY_STOP {
                     let mut forwarded = buf[..3].to_vec();
                     forwarded.extend_from_slice(&1u16.to_be_bytes());
