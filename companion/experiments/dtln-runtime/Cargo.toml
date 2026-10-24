@@ -1,0 +1,12 @@
+[package]
+name = "dtln-runtime-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+tract-onnx = "=0.23.9"
+rustfft = "6.4"
+hound = "3.5"
+cpu-time = "1.0"
