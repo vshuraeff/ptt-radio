@@ -1,0 +1,99 @@
+# the non-real-time part of tools/gate.sh; the real-time suites (scenarios, aec_gate, ignored policy_playout)
+# measure audio timing and stay on a dedicated machine.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: companion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: install rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --release -- -D warnings
+      - name: hub build without the audio feature
+        run: cargo build --locked --release --no-default-features --bin ptt-radio-hub
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: companion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install system packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: install rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: cargo test --locked --lib --bins
+      - name: integration suites
+        if: runner.os == 'Linux'
+        run: |
+          for t in bridge_repr connectivity crypto_sessions game_probe multiparty_lab netlab policy_contract policy_playout receive_order relay_hub transport_contract; do
+            cargo test --locked --test "$t" -- --test-threads 1
+          done
+      - name: release lib tests
+        if: runner.os == 'Linux'
+        run: cargo test --locked --release --lib
+
+  lua:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install lua
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends lua5.4
+      - name: syntax
+        run: luac5.4 -p mod/ptt-radio/*.lua mod/tests/*.lua
+      # the mod's tests resolve its modules relative to the repository root
+      - name: suites
+        run: |
+          for t in control channels admin settings_gui; do
+            lua5.4 "mod/tests/${t}_test.lua" mod/ptt-radio/control.lua
+          done
+
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: tools/check-version.sh
