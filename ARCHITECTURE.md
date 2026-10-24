@@ -27,7 +27,7 @@ Each companion talks only to its own local game over loopback Lua UDP; the game 
 
 ### The mod
 
-`mod/ptt-radio/` is plain Lua, required on the server and on every client. Factorio syncs the server's copy to clients, so every game instance runs the same version.
+`mod/ptt-radio/` is plain Lua, required on the server and on every client. A client can join only with the same mod version as the server; the game's mod sync on join downloads from the mod portal, so before the mod is published there every player installs it by hand.
 
 - `control.lua` wires every event and owns the packet dispatch from `on_udp_packet_received`: HELLO and companion presence, POLICY snapshots (`policy_snapshot`, `audience_changed`), media acceptance (`accept_policy`) and forwarding (`fan_out`), opaque SIGNAL routing (`forward_signal`), `HUD_STATUS` reports, `ECHO_STATE`, open-mic state and the timeouts in `on_nth_tick(15)` and `on_nth_tick(60)`. All timeouts count `game.tick`, so they stand still during saves and pauses.
 - `channels.lua` is the channel model with no event wiring: the per-player radio record, the server policy (`storage.radio_policy`: mute, ban, pin, deny, lock, confine, publishers, admin channel), `channels.eligible(sender, listener)` and `channels.tx_permitted(sender)`.
@@ -72,7 +72,7 @@ The library modules fall into layers:
 3. `fan_out` calls `helpers.send_udp(port, data, listener.index)` for each permitted listener. The call takes effect only on that listener's own instance, so each machine sends one local copy to its own companion on the `ptt-radio-companion-port` setting (default 34555), with the sender index inserted after the kind byte.
 4. The companion's receive thread drops game datagrams whose source IP is not the configured game IP.
 
-At this version `control.lua` forwards only the policy media kinds START3, VOICE3 and STOP3 (`0x0B`–`0x0D`) and authors only POLICY (`0x15`). It has no branch for the v1 kinds `0x02`–`0x04`, the v2 kinds `0x07`–`0x09` or AUDIENCE (`0x14`). The `relay` emulator still speaks AUDIENCE and the v1/v2 bridge, so `tests/scenarios.rs` runs the companion's pre-POLICY branch; `tests/policy_playout.rs` feeds POLICY bytes to the companions itself. The packet layouts are in [Формат пакетов](DESIGN.md#формат-пакетов) and [Companion policy transitions](DESIGN.md#companion-policy-transitions).
+At this version `control.lua` forwards only the policy media kinds START3, VOICE3 and STOP3 (`0x0B`–`0x0D`) and authors POLICY (`0x15`), never AUDIENCE. It has no branch for the v1 kinds `0x02`–`0x04`, the v2 kinds `0x07`–`0x09` or AUDIENCE (`0x14`). The `relay` emulator still speaks AUDIENCE and the v1/v2 bridge, so `tests/scenarios.rs` runs the companion's pre-POLICY branch; `tests/policy_playout.rs` feeds POLICY bytes to the companions itself. The packet layouts are in [Формат пакетов](DESIGN.md#формат-пакетов) and [Companion policy transitions](DESIGN.md#companion-policy-transitions).
 
 The game path stops whenever the game stops ticking: a pause, an autosave, or a player joining with `auto_pause_when_players_connect`. See [Ограничения](DESIGN.md#ограничения).
 
