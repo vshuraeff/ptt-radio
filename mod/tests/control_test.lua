@@ -170,7 +170,8 @@ emit(1, v2(9, gen, 1))
 assert(storage.talks[1] == nil and #sent == 0)
 emit(1, v2(7, gen, 1))
 assert(#sent == 2 and #sounds == 2 and storage.speakers[1] == 0)
-assert(sent[1].data == string.char(0x52, 1, 7) .. u16(1) .. u16(42) .. gen .. u16(1))
+-- no listener said v2 in HELLO: both get the legacy START
+assert(sent[1].data == packet(2, 1, u16(42)) and sent[2].data == sent[1].data)
 emit(1, v2(7, gen, 1), 15)
 assert(#sounds == 2 and storage.speakers[1] == 15)
 emit(1, packet(3, 43, "legacy"), 16)
@@ -233,6 +234,91 @@ assert(storage.talks[1] == nil and storage.companions[1] == 3600)
 clear()
 emit(1, v2(7, string.rep("\0", 7) .. string.char(18), 1), 3661)
 assert(#sent == 2)
+
+-- one representation per listener: player 1 and 2 say v2, player 3 is legacy
+setup()
+local function to(index)
+  local rows = {}
+  for _, row in ipairs(sent) do
+    if row.target == index then rows[#rows + 1] = row.data end
+  end
+  return rows
+end
+local function only(index, data)
+  local rows = to(index)
+  assert(#rows == 1 and rows[1] == data, "listener " .. index .. " got " .. #rows)
+end
+for _, body in ipairs({ "", "0.4.0", "0.4.0v2", "0.4.0 v2 ", "0.4.0 V2", "v2" }) do
+  emit(1, packet(1, 0, body))
+  assert(storage.v2[1] == nil, body)
+end
+-- the token is read from the body, not the header
+emit(1, packet(1, 32, "v2"))
+assert(storage.v2[1] == nil)
+emit(1, packet(1, 0, " v2"))
+assert(storage.v2[1] == true)
+emit(1, packet(1, 0, "0.4.0"))
+assert(storage.v2[1] == nil)
+emit(0, packet(1, 45678))
+assert(storage.v2[0] == nil and storage.companions[0] == 0)
+emit(1, packet(1, 0, "ptt-radio-companion 0.4.0 v2"))
+emit(2, packet(1, 0, "ptt-radio-companion 0.4.0 v2"))
+emit(3, packet(1, 0, "ptt-radio-companion 0.4.0"))
+assert(storage.v2[1] and storage.v2[2] and storage.v2[3] == nil)
+clear()
+emit(1, v2(7, gen, 1))
+only(2, string.char(0x52, 1, 7, 0, 1, 0, 42) .. gen .. u16(1))
+only(3, string.char(0x52, 1, 2, 0, 1, 0, 42))
+assert(#to(1) == 0 and #to(0) == 0)
+clear()
+emit(1, v2(8, gen, 1, "opus"))
+only(2, string.char(0x52, 1, 8, 0, 1, 0, 42) .. gen .. u16(1) .. "opus")
+only(3, string.char(0x52, 1, 3, 0, 1, 0, 42) .. "opus")
+clear()
+-- a v1 copy from a v2 sender reaches legacy listeners only
+emit(1, packet(3, 44, "copy"))
+assert(#to(2) == 0)
+only(3, packet(3, 1, u16(44) .. "copy"))
+clear()
+-- a legacy sender reaches every listener unchanged
+emit(3, packet(3, 7, "legacy"))
+only(1, packet(3, 3, u16(7) .. "legacy"))
+only(2, packet(3, 3, u16(7) .. "legacy"))
+clear()
+emit(1, v2(9, gen, 1))
+only(2, string.char(0x52, 1, 9, 0, 1, 0, 42) .. gen .. u16(1))
+only(3, string.char(0x52, 1, 4, 0, 1, 0, 42))
+clear()
+-- self-echo: a v2 sender hears its own v2 frame and no v1 copy; a legacy one hears v1
+players[1].mod_settings["ptt-radio-echo"].value = true
+players[3].mod_settings["ptt-radio-echo"].value = true
+emit(1, v2(7, gen, 2), 1)
+only(1, string.char(0x52, 1, 7, 0, 1, 0, 42) .. gen .. u16(2))
+only(3, packet(2, 1, u16(42)))
+clear()
+emit(1, packet(2, 45))
+assert(#to(1) == 0 and #to(2) == 0)
+only(3, packet(2, 1, u16(45)))
+clear()
+emit(3, v2(7, gen2, 1), 1)
+only(3, packet(2, 3, u16(42)))
+only(1, string.char(0x52, 1, 7, 0, 3, 0, 42) .. gen2 .. u16(1))
+clear()
+-- the synthetic badge-timeout STOP goes to legacy listeners only, self-echo included
+game.tick = 60
+nth[15]({ tick = 60 })
+assert(storage.speakers[1] == nil and storage.speakers[3] == nil)
+assert(#to(1) == 0 and #to(2) == 0 and #sent == 2)
+local stops = { [to(3)[1]] = true, [to(3)[2]] = true }
+assert(stops[packet(4, 1, u16(0))] and stops[packet(4, 3, u16(0))])
+-- capability goes with the companion record: on leave and on HELLO timeout
+players[2].connected = false
+game.connected_players = { players[3], players[1] }
+handlers.on_player_left_game({ player_index = 2 })
+assert(storage.v2[2] == nil and storage.v2[1])
+game.tick = 960
+nth[60]({ tick = game.tick })
+assert(storage.v2[1] == nil and storage.companions[1] == nil)
 
 setup()
 storage.audience_revision = string.rep("\0", 7) .. string.char(255)

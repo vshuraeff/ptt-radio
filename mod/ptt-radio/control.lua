@@ -286,17 +286,30 @@ end
 
 local function forget_companion(player_index)
   storage.companions[player_index] = nil
+  storage.v2[player_index] = nil
   storage.open_mic[player_index] = nil
   set_echo(player_index, false)
   storage.talks[player_index] = nil
 end
 
-local function fan_out(sender_index, kind, payload)
+local LEGACY_KIND = { [START2] = START, [VOICE2] = VOICE, [STOP2] = STOP }
+
+-- each listener gets one representation of a sender: a v2 companion gets v2 frames
+-- and never a v1 copy of a v2 sender; a legacy companion gets v2 frames as v1, with
+-- sequence and opus kept and generation and talkspurt dropped
+local function fan_out(sender_index, kind, payload, legacy_only)
   local out = header(kind, sender_index) .. string.sub(payload, 4)
+  local legacy_kind = LEGACY_KIND[kind]
+  local legacy = legacy_kind and header(legacy_kind, sender_index) .. string.sub(payload, 4, 5) .. string.sub(payload, 16) or out
+  local to_v2 = not legacy_only and (legacy_kind ~= nil or not storage.v2[sender_index])
   for _, listener in pairs(game.connected_players) do
     local is_sender = listener.index == sender_index
     if (not is_sender or listener.mod_settings["ptt-radio-echo"].value) and in_scope(sender_index, listener) then
-      helpers.send_udp(companion_port(listener), out, listener.index)
+      if not storage.v2[listener.index] then
+        helpers.send_udp(companion_port(listener), legacy, listener.index)
+      elseif to_v2 then
+        helpers.send_udp(companion_port(listener), out, listener.index)
+      end
     end
   end
 end
@@ -344,6 +357,8 @@ end
 local function init_storage()
   storage.speakers = storage.speakers or {}
   storage.companions = storage.companions or {}
+  -- companions whose HELLO announced v2 game media; the rest are legacy
+  storage.v2 = storage.v2 or {}
   storage.open_mic = storage.open_mic or {}
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
@@ -379,6 +394,8 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
         send_audience(0)
       end
     elseif sender_index ~= 0 then
+      -- the body is the companion version, followed by the token " v2" when it speaks v2
+      storage.v2[sender_index] = string.sub(string.sub(payload, 6), -3) == " v2" or nil
       companion_seen(game.get_player(sender_index), event.tick)
     end
   elseif kind == SIGNAL_OUT then
@@ -414,8 +431,8 @@ script.on_nth_tick(15, function(event)
     if event.tick - last_tick > STALE_TICKS then
       local talk = storage.talks[index]
       set_speaking(index, false, talk ~= nil)
-      -- legacy listeners need a timeout stop; v2 listeners ignore it
-      fan_out(index, STOP, string.char(MAGIC, VERSION, STOP, 0, 0))
+      -- legacy listeners need a timeout stop; v2 listeners are not sent it
+      fan_out(index, STOP, string.char(MAGIC, VERSION, STOP, 0, 0), true)
     end
   end
 end)

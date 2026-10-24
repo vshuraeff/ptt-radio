@@ -7,7 +7,10 @@
 //!   player's own index) and the authoritative AUDIENCE to that player's companion;
 //! - START/VOICE/STOP are forwarded to every other player's companion, and to
 //!   the sender's own one when its echo setting is on, with the sender's
-//!   player index inserted before the sequence. v2 media follows the same rule.
+//!   player index inserted before the sequence. v2 media follows the same rule,
+//!   but each listener gets one representation: a companion whose HELLO body
+//!   ends with " v2" gets v2 frames and never a v1 copy of such a sender, a
+//!   legacy one gets v2 frames converted to v1 and the synthetic timeout STOP.
 //! - opaque SIGNAL follows the roster independently of force-scoped media;
 //!   optional player 0 registers its server-only companion port with HELLO.
 //!
@@ -131,6 +134,8 @@ struct Member {
     connected: bool,
     force: u16,
     seen: Option<u64>,
+    /// the last HELLO announced v2 game media
+    v2: bool,
     speaking: Option<u64>,
     talk: Option<Talk>,
 }
@@ -257,6 +262,7 @@ impl Relay {
                     connected: true,
                     force: 1,
                     seen: None,
+                    v2: false,
                     speaking: None,
                     talk: None,
                 })
@@ -323,6 +329,7 @@ impl Relay {
             member.talk = None;
             member.speaking = None;
             member.seen = None;
+            member.v2 = false;
         }
         state.revision += 1;
         state.membership_changed = true;
@@ -430,6 +437,24 @@ fn tick(
                 || !state.force_scope
                 || state.members[sender].force == state.members[listener].force
         };
+        // one representation per listener: `legacy` to legacy companions, `out`
+        // to v2 companions only when `to_v2`
+        let fan_out = |state: &State, sender: usize, out: &[u8], legacy: &[u8], to_v2: bool| {
+            for (listener, player) in players.iter().enumerate() {
+                let member = &state.members[listener];
+                if member.connected
+                    && member.index != 0
+                    && (listener != sender || player.echo)
+                    && in_scope(sender, listener, state)
+                {
+                    if !member.v2 {
+                        send(listener, legacy);
+                    } else if to_v2 {
+                        send(listener, out);
+                    }
+                }
+            }
+        };
         let audience = |listener: usize, state: &State| {
             let peers: Vec<u16> = state
                 .members
@@ -523,6 +548,11 @@ fn tick(
                         send(p.player, &audience(p.player, &state));
                         continue;
                     }
+                    // the body is the companion version, then " v2" when it speaks v2
+                    state.members[p.player].v2 = p
+                        .payload
+                        .get(5..)
+                        .is_some_and(|body| body.ends_with(b" v2"));
                     let open = players[p.player].open_mic as u8;
                     send(p.player, &packet::encode(MIC_STATE, sender_index, &[open]));
                     let half = players[p.player].half_duplex as u8;
@@ -556,15 +586,26 @@ fn tick(
                         member.speaking = (kind != STOP).then_some(game_tick);
                     }
                     let out = packet::encode(kind, sender_index, &p.payload[3..]);
-                    for (listener, player) in players.iter().enumerate() {
-                        if state.members[listener].connected
-                            && state.members[listener].index != 0
-                            && (listener != p.player || player.echo)
-                            && in_scope(p.player, listener, &state)
-                        {
-                            send(listener, &out);
-                        }
-                    }
+                    // a legacy listener gets v2 as v1: sequence and opus kept,
+                    // generation and talkspurt dropped
+                    let legacy_kind = match kind {
+                        GAME_START => Some(START),
+                        GAME_VOICE => Some(VOICE),
+                        GAME_STOP => Some(STOP),
+                        _ => None,
+                    };
+                    let legacy = legacy_kind.map(|legacy_kind| {
+                        let body = [&p.payload[3..5], &p.payload[15..]].concat();
+                        packet::encode(legacy_kind, sender_index, &body)
+                    });
+                    let to_v2 = legacy_kind.is_some() || !state.members[p.player].v2;
+                    fan_out(
+                        &state,
+                        p.player,
+                        &out,
+                        legacy.as_deref().unwrap_or(&out),
+                        to_v2,
+                    );
                     // only a packet with a sequence number is a frame the report can time
                     if let [_, _, _, hi, lo, ..] = p.payload[..] {
                         state.report.deliveries.push(Delivery {
@@ -597,20 +638,14 @@ fn tick(
                 }
                 if member.seen.is_some_and(|last| game_tick - last > 900) {
                     member.seen = None;
+                    member.v2 = false;
                     member.talk = None;
                 }
             }
         }
+        // legacy listeners need a timeout stop; v2 listeners are not sent it
         for (sender, out) in synthetic {
-            for (listener, player) in players.iter().enumerate() {
-                if state.members[listener].connected
-                    && state.members[listener].index != 0
-                    && (listener != sender || player.echo)
-                    && in_scope(sender, listener, &state)
-                {
-                    send(listener, &out);
-                }
-            }
+            fan_out(&state, sender, &out, &out, false);
         }
     }
 }
@@ -736,17 +771,21 @@ mod tests {
             talkspurt: 3,
             opus,
         };
-        for (kind, opus) in [
-            (Kind::Start, &[][..]),
-            (Kind::Voice, &[4, 0]),
-            (Kind::Stop, &[]),
+        // bob's HELLO did not say v2: he gets the legacy kind with seq and opus
+        for (kind, legacy, opus) in [
+            (Kind::Start, START, &[][..]),
+            (Kind::Voice, VOICE, &[4, 0]),
+            (Kind::Stop, STOP, &[]),
         ] {
             a.send_to(
                 &wire::encode_game(v2(0, kind, opus), false).unwrap(),
                 game(1),
             )
             .unwrap();
-            assert_eq!(wire::decode_game(&recv(&b)), Ok(v2(1, kind, opus)));
+            assert_eq!(
+                recv(&b),
+                packet::encode(legacy, 1, &[&[0, 10][..], opus].concat())
+            );
         }
 
         let report = relay.stop();
@@ -938,6 +977,15 @@ mod tests {
         let send = |data: &[u8]| {
             a.send_to(data, ("127.0.0.1", relay.game_port(1))).unwrap();
         };
+        // b listens as v2; a, which never says HELLO, stays a legacy sender
+        b.send_to(
+            &packet::encode(HELLO, 0, b"test v2"),
+            ("127.0.0.1", relay.game_port(2)),
+        )
+        .unwrap();
+        for _ in 0..4 {
+            recv(&b);
+        }
         let media = |kind, generation, talkspurt, sequence, opus| {
             wire::encode_game(
                 GameMedia {
@@ -973,8 +1021,8 @@ mod tests {
         let mixed = packet::encode(VOICE, 10, &[5]);
         send(&mixed);
         assert_eq!(recv(&b), forwarded(&mixed));
+        // the badge times out; the synthetic STOP is for legacy listeners only
         thread::sleep(Duration::from_millis(750));
-        assert_eq!(recv(&b), packet::encode(STOP, 1, &[0, 0]));
         quiet(&b);
         send(&start);
         assert_eq!(recv(&b), forwarded(&start));
