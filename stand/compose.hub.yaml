@@ -1,0 +1,24 @@
+# opt-in relay hub beside the stand server: docker compose -f compose.yaml -f compose.hub.yaml up -d --build
+# the hub shares the server's network namespace, so 127.0.0.1 is the server's loopback and the
+# lua udp link works as player 0. ports of a shared namespace belong to the service that owns it,
+# which is why the public port is added to factorio here and not in compose.yaml
+services:
+  factorio:
+    ports:
+      - "${HUB_PUBLIC_PORT-34560}:34560/udp"
+
+  hub:
+    build:
+      context: ../companion
+      dockerfile: ../stand/Dockerfile.hub
+    container_name: ptt-radio-hub
+    network_mode: "service:factorio"
+    depends_on:
+      - factorio
+    command:
+      - --public
+      - 0.0.0.0:34560
+      - --game
+      - 127.0.0.1:${LUA_UDP_PORT-34556}
+      - --receive
+      - 127.0.0.1:34557

@@ -133,6 +133,11 @@ impl Hub {
                 Some(grant) => frames.extend(Outgoing::signal(player, &Signal::RelayGrant(grant))),
                 None => {
                     let offered = self.relay.offer(sender, recipient, now_ms);
+                    if offered.is_ok() {
+                        // the fresh grant supersedes a refused renewal: closing it later
+                        // must not revive the pair through the old retry
+                        self.retries.remove(&(sender, recipient));
+                    }
                     frames.extend(self.counted(offered));
                 }
             }

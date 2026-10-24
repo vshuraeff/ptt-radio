@@ -723,6 +723,33 @@ fn post_expiry_close_requires_an_endpoint_and_cancels_recovery() {
 }
 
 #[test]
+fn closing_an_announce_grant_after_a_refused_renewal_revives_nothing() {
+    let (mut hub, old) = hub_with_refused_renewal();
+    hub.relay.expire(4000);
+    // the same companion again, same generation: the pair has no live grant, so a fresh one
+    let fresh = grants(&hub.on_game(4001, &announce(1, 11, CAP_UDP)));
+    assert_eq!(fresh.len(), 2);
+    let session = fresh[0].1.session;
+    assert_ne!(session, old.session);
+    let close = encode_game(
+        &Signal::RelayClose {
+            relay: 0,
+            session,
+            hub_generation: GEN,
+        },
+        1,
+        true,
+    )
+    .unwrap();
+    let closed = hub.on_game(4002, &close);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].to, 2);
+    // the endpoint ended the pair's grant: the old retry must not mint another
+    assert!(grants(&hub.tick(4100)).is_empty());
+    assert_eq!(hub.relay.live(4100).count(), 0);
+}
+
+#[test]
 fn direct_withdraw_after_expiry_cancels_recovery() {
     let (mut hub, old) = hub_with_refused_renewal();
     hub.relay.expire(4000);
