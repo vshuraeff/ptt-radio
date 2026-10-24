@@ -2710,6 +2710,11 @@ impl Runtime {
         Ok(())
     }
 
+    /// the local player index, once the game has told it
+    pub fn local_player(&self) -> Option<u16> {
+        self.player
+    }
+
     pub fn allows_receive(&self, sender: u16) -> bool {
         self.accepts_media(sender, None)
     }

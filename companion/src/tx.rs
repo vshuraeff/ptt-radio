@@ -106,6 +106,11 @@ impl Transmitter {
         self.policy_reset = reset;
     }
 
+    /// forgets the captured lead-in, so the next transmission starts with its own first frame
+    pub fn clear_preroll(&mut self) {
+        self.preroll.clear();
+    }
+
     /// takes one 48 kHz mono frame of `frame_samples` and returns the packets to send, in order
     pub fn frame(&mut self, pcm: &[f32]) -> Vec<Vec<u8>> {
         if !self.permitted {
@@ -356,6 +361,17 @@ mod tests {
         }
         // the encoder runs at the cap, so a larger buffer would have overrun it
         assert!(largest > MAX_POLICY_OPUS * 9 / 10, "{largest}");
+    }
+
+    #[test]
+    fn a_cleared_preroll_starts_the_next_transmission_with_its_own_frame() {
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
+        for _ in 0..10 {
+            tx.frame(&silence());
+        }
+        tx.clear_preroll();
+        tx.set_ptt(true);
+        assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
     }
 
     #[test]

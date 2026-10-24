@@ -41,6 +41,8 @@ The options you may need as a player:
 | `--udp-bind <ADDR>` | default-route interfaces | The local network interface and port for direct connections (repeat for up to four). |
 | `--stun-server <HOST:PORT>` | `stun.l.google.com:19302` | The public STUN server used to find your external address (repeat to add more). |
 | `--no-self-update` | off | Do not check for a new release at start (see [Updates](#updates)). |
+| `--no-self-uninstall` | off | Keep the installed companion when the mod is removed (see [Removal with the mod](#removal-with-the-mod)). |
+| `--launch <GAME COMMAND...>` | none | Start the game and run as long as it does (see [Starting the game with the companion](#starting-the-game-with-the-companion)). Must come last. |
 
 The full list, test options included, is printed by `ptt-radio-companion --help`.
 
@@ -65,6 +67,31 @@ It never installs an older or the same version. If anything goes wrong (no inter
 To turn updates off, start the companion with `--no-self-update`, or set the environment variable `PTT_RADIO_NO_SELF_UPDATE=1`. An option to check only once a day is planned.
 
 A companion you built yourself with `cargo build` never updates itself; it prints `self-update: disabled (not a release build)`.
+
+## Starting the game with the companion
+
+With `--launch`, the companion starts the game itself. Everything after `--launch` is the game's command line, so put the companion's own options before it. The companion appends `--enable-lua-udp` with its `--game-port` unless the game's command line already has that flag. It runs while the game runs; when the game exits, it ends the transmission in progress, shuts down and exits with the game's exit status. If the game cannot be started, the companion says so and exits with an error.
+
+In Steam, open the game's *Properties*, and under *Launch options* enter, with your own install folder:
+
+```text
+"<install folder>/ptt-radio-companion" --launch %command%
+```
+
+Steam replaces `%command%` with the game's own command line. An update found at start is installed first; the restarted companion keeps `--launch` and the game's command line.
+
+## Removal with the mod
+
+A companion put in place by the installer sits in the folder `ptt-radio-companion` inside the Factorio user-data folder, beside a file `install.json`. That file records the mods folder the installer found. At every start, after the update check, and with `--launch` again after the game exits, the companion looks into that mods folder. When the folder exists and has `mod-list.json`, but no `ptt-radio` mod is in it (neither a `ptt-radio_<version>.zip` file nor a `ptt-radio` or `ptt-radio_<version>` folder), the companion deletes its own folder, prints one `self-uninstall: ...` line and exits. With `--launch`, the game still starts that one time, without the companion.
+
+It removes nothing when anything is unclear:
+
+- there is no `install.json`, which is the case for a companion you unpacked or built yourself;
+- `install.json` cannot be read or is not the installer's;
+- the mods folder is missing or unreadable, or has no `mod-list.json`: the companion prints a warning instead;
+- the installer was told to use a mods folder other than the default one.
+
+It deletes only its own folder, never the user-data folder or anything else in it. To keep it even without the mod, start it with `--no-self-uninstall` or set `PTT_RADIO_NO_SELF_UNINSTALL=1`. After a removal, delete the Steam launch option as well: it points at a program that is gone.
 
 ## Devices
 
@@ -95,6 +122,18 @@ There are two ways to transmit.
 - **Half-duplex** (per-player mod setting *Mute the radio while I talk*, on by default): while you hold the push-to-talk key, other players' voices are silent, so your speakers cannot feed them back into your microphone. With headphones you can turn it off. It has no effect on the open microphone.
 - **Echo detection.** If your microphone hears your speakers, the game shows you a panel: *Your microphone hears your speakers: put on headphones or turn off the open microphone*, with a button that turns the open microphone off. Other players see a red *echo* mark next to your name. Detection can take tens of seconds when the echo is quiet.
 
+## Testing the radio
+
+The *Test* button in the *Companion* section of the radio settings window checks the whole path through the game:
+
+1. The companion plays a short beep, half a second, on your speakers. The beep is not transmitted.
+2. It records 3 seconds from your microphone: say something. The radio must be allowed to transmit, as for push-to-talk.
+3. It transmits the recording through the game as one transmission. Players who hear you hear it too.
+4. The game sends the recording back to you for this test only, and the companion plays it. Half-duplex does not mute it, because the test never holds the push-to-talk key.
+5. Two seconds after the last frame, the window shows the result: whether the beep played, the loudest level of your microphone, how many frames went out and came back, and how long the first one took.
+
+The result is one of: everything worked; transmission is not permitted; the microphone did not open or stopped delivering sound; nothing came back; busy. The test answers busy while you hold the push-to-talk key or the open microphone is on, and pressing the key during the test ends it as busy.
+
 ## Console messages
 
 | Message | Meaning |
@@ -109,6 +148,9 @@ There are two ways to transmit.
 | `ptt pressed` / `ptt released` | The push-to-talk key went down or up. |
 | `sent START` / `sent STOP` | A transmission began or ended. |
 | `mic opened` / `mic closed (...)` | The real input device opened or was released. |
+| `game started (pid N)` / `game exited (...)` | With `--launch`: the game was started, or it has exited and the companion shuts down. |
+| `self-test N: Ok, tone 1, mic peak -12 dBFS, sent 150 returned 150 frames, first return 80 ms` | A radio test finished; the same result goes to the game window. |
+| `self-uninstall: ...` | The mod is gone and the companion removed its folder, or something was unclear and it removed nothing. |
 | `stats: sent N frames \| received [...] \| ...` | Printed when the companion exits: what it sent and received. |
 
 ## Your system
