@@ -5,6 +5,7 @@
 //!   forwarded START/VOICE/STOP: rest = seq u16 BE + body
 //!   ROSTER: rest = utf-8 lines "index\tname\tr,g,b"
 //!   MIC_STATE: rest = one byte, 0 open mic off, 1 on
+//!   HALF_DUPLEX: rest = one byte, 0 off, 1 mute incoming voices while PTT is held
 
 pub const MAGIC: u8 = 0x52;
 pub const VERSION: u8 = 1;
@@ -15,6 +16,7 @@ pub const VOICE: u8 = 0x03;
 pub const STOP: u8 = 0x04;
 pub const ROSTER: u8 = 0x10;
 pub const MIC_STATE: u8 = 0x11;
+pub const HALF_DUPLEX: u8 = 0x12;
 
 pub fn encode(kind: u8, seq: u16, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + body.len());
@@ -52,6 +54,10 @@ pub enum Incoming<'a> {
         player: u16,
         open: bool,
     },
+    // sent only to the player's own companion, like MIC_STATE
+    HalfDuplex {
+        on: bool,
+    },
 }
 
 /// returns None for anything that is not a well-formed packet of a known kind
@@ -81,6 +87,7 @@ pub fn parse(data: &[u8]) -> Option<Incoming<'_>> {
             player: sender,
             open: *state == 1,
         }),
+        (HALF_DUPLEX, [state @ (0 | 1)]) => Some(Incoming::HalfDuplex { on: *state == 1 }),
         _ => None,
     }
 }
@@ -183,6 +190,19 @@ mod tests {
         // mod v0.1 sent a blind TOGGLE without a state byte; values other than 0/1 are not defined
         assert_eq!(parse(&[0x52, 1, MIC_STATE, 0, 1]), None);
         assert_eq!(parse(&[0x52, 1, MIC_STATE, 0, 1, 2]), None);
+    }
+
+    #[test]
+    fn half_duplex() {
+        assert_eq!(
+            parse(&[0x52, 1, HALF_DUPLEX, 0, 1, 1]),
+            Some(Incoming::HalfDuplex { on: true })
+        );
+        assert_eq!(
+            parse(&[0x52, 1, HALF_DUPLEX, 0, 1, 0]),
+            Some(Incoming::HalfDuplex { on: false })
+        );
+        assert_eq!(parse(&[0x52, 1, HALF_DUPLEX, 0, 1, 2]), None);
     }
 
     #[test]

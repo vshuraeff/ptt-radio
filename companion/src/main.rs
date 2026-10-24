@@ -29,7 +29,7 @@ use ptt_key::PttKey;
 use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
 use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
-use ptt_radio_companion::mix::{self, Mixer, SLICE_SAMPLES};
+use ptt_radio_companion::mix::{self, Mixer, Mute, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, HELLO, Incoming, RosterEntry, START, VOICE};
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
@@ -116,6 +116,8 @@ struct Shared {
     done: AtomicBool,
     ptt: AtomicBool,
     open_mic: AtomicBool,
+    // mute incoming voices while PTT is held (mod setting ptt-radio-half-duplex)
+    half_duplex: AtomicBool,
     roster_seen: AtomicBool,
     mixer: Mutex<Mixer>,
     echo: EchoPath,
@@ -163,6 +165,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         done: AtomicBool::new(false),
         ptt: AtomicBool::new(false),
         open_mic: AtomicBool::new(false),
+        half_duplex: AtomicBool::new(true),
         roster_seen: AtomicBool::new(false),
         mixer: Mutex::new(Mixer::default()),
         echo: EchoPath::default(),
@@ -578,6 +581,11 @@ fn receive(shared: &Shared) -> RxStats {
                     open_mic = Some(open);
                 }
             }
+            Incoming::HalfDuplex { on } => {
+                if shared.half_duplex.swap(on, Relaxed) != on {
+                    println!("half-duplex {}", if on { "on" } else { "off" });
+                }
+            }
             Incoming::Start { sender, seq } => {
                 let s = stats.senders.entry(sender).or_default();
                 s.starts += 1;
@@ -622,6 +630,7 @@ fn playout(
     let mut next = Instant::now();
     let mut recorded = 0;
     let mut out = Vec::new();
+    let (mut mute, mut was_muted) = (Mute::default(), false);
     while !shared.done.load(Relaxed) {
         match &output {
             // the output device's clock paces playout: top the queue up with the next slice
@@ -644,9 +653,19 @@ fn playout(
             let mix = mixer.tick(Instant::now());
             (mix, std::mem::take(&mut mixer.pulled))
         };
-        let frame = mix.as_deref().unwrap_or(&[0.0; SLICE_SAMPLES]);
+        // half-duplex: silent speakers while PTT is held, so the microphone cannot pick the
+        // others up; the mixer keeps pulling, so playback resumes in sync on release
+        let muted = shared.half_duplex.load(Relaxed)
+            && shared.ptt.load(Relaxed)
+            && !shared.open_mic.load(Relaxed);
+        let mut slice = [0.0; SLICE_SAMPLES];
+        if let Some(mix) = &mix {
+            slice.copy_from_slice(mix);
+        }
+        mute.apply(muted, &mut slice);
+        let frame = &slice[..];
         shared.echo.far_end(frame);
-        if let (Some(frame), Some(writer)) = (&mix, wav.as_mut()) {
+        if let (Some(_), Some(writer)) = (&mix, wav.as_mut()) {
             let written = frame.iter().try_for_each(|s| {
                 writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             });
@@ -670,6 +689,10 @@ fn playout(
             let mut queue = samples.lock().unwrap();
             slot = popped.as_ref().map_or(0, |p| p.load(Relaxed)) + queue.len() as u64;
             queue.extend(&out);
+        }
+        if muted != was_muted {
+            shared.trace(format_args!("mute {} {slot}", muted as u8));
+            was_muted = muted;
         }
         for p in pulled {
             if let Some((seq, offset)) = p.shed {

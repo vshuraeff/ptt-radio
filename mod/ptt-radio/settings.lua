@@ -16,6 +16,13 @@ data:extend({
     order = "b",
   },
   {
+    type = "bool-setting",
+    name = "ptt-radio-half-duplex",
+    setting_type = "runtime-per-user",
+    default_value = true,
+    order = "c",
+  },
+  {
     type = "string-setting",
     name = "ptt-radio-scope",
     setting_type = "runtime-global",

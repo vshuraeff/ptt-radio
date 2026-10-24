@@ -350,6 +350,97 @@ fn double_talk_a_and_b_at_once() {
 }
 
 #[test]
+fn half_duplex_a_holds_ptt_while_b_talks() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let session = |on: bool| {
+        Session {
+            name: format!("half-duplex-{}", if on { "on" } else { "off" }),
+            players: vec![
+                Talker::ptt(Vec::new(), 2.5).half_duplex(on),
+                Talker::open_mic(place(0.3, speech(2, 210.0, 5.4), 6.0), false),
+            ],
+            stall: None,
+            seconds: 6.0,
+        }
+        .run()
+    };
+    let (on, off) = (session(true), session(false));
+    let ms = |ms: u64| ms * FS as u64 / 1000;
+    // mean power of A's speaker over device samples [from, to), dBFS
+    let level = |run: &Outcome, from: u64, to: u64| {
+        let speaker = &run.players[0].speaker;
+        let span = &speaker[from as usize..(to as usize).min(speaker.len())];
+        energy_db(span) - 10.0 * (span.len() as f64).log10()
+    };
+    let peak = |run: &Outcome, from: u64, to: u64| {
+        let speaker = &run.players[0].speaker;
+        speaker[from as usize..(to as usize).min(speaker.len())]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()))
+    };
+    let a_on = &on.players[0].trace;
+    let [(muted_at, true), (unmuted_at, false)] = a_on.mute[..] else {
+        panic!("expected one mute and one unmute, got {:?}", a_on.mute)
+    };
+    // the same hold without half-duplex, from A's PTT events on its device timeline
+    let a_off = &off.players[0].trace;
+    let slot = |us: u64| (us - a_off.device_us) * FS as u64 / 1_000_000;
+    let (pressed, released) = (slot(a_off.ptt[0].0), slot(a_off.ptt[1].0));
+    // B's slices A kept decoding while its speakers were silent
+    let pulled = a_on
+        .pulls_from(2)
+        .filter(|p| p.seq.is_some() && p.slot >= muted_at && p.slot < unmuted_at)
+        .count();
+    let held = (ms(300), ms(10));
+    let after = (unmuted_at + ms(20), unmuted_at + ms(1500));
+    print_table(
+        "half-duplex: A holds PTT 2.5 s while B talks",
+        &[
+            row(
+                "A muted (on)",
+                format!("{} .. {} ms", muted_at / ms(1), unmuted_at / ms(1)),
+            ),
+            row(
+                "A's speaker while held, on / off",
+                format!(
+                    "peak {:.1e} / {:.1} dBFS",
+                    peak(&on, muted_at + held.1, unmuted_at),
+                    level(&off, pressed + held.0, released)
+                ),
+            ),
+            row(
+                "A's speaker 1.5 s after release, on / off",
+                format!(
+                    "{:.1} / {:.1} dBFS",
+                    level(&on, after.0, after.1),
+                    level(&off, released + ms(20), released + ms(1500))
+                ),
+            ),
+            row("B's slices A decoded while muted", format!("{pulled}")),
+        ],
+    );
+    assert_eq!(a_on.ptt.len(), 2, "one PTT hold");
+    // muted within the 5 ms ramp of the press, silent until the release
+    assert!(peak(&on, muted_at + held.1, unmuted_at) < 1e-3);
+    // decoding goes on under the mute, so B resumes at once and in sync
+    assert!(
+        pulled > 100,
+        "A stopped decoding B while muted: {pulled} slices"
+    );
+    let (resumed, reference) = (
+        level(&on, after.0, after.1),
+        level(&off, released + ms(20), released + ms(1500)),
+    );
+    assert!(
+        (resumed - reference).abs() < 3.0,
+        "B after the release: {resumed:.1} dBFS with half-duplex vs {reference:.1} without"
+    );
+    // without half-duplex A hears B through the whole hold
+    assert!(a_off.mute.is_empty());
+    assert!(level(&off, pressed + held.0, released) > reference - 6.0);
+}
+
+#[test]
 fn stall_burst_recovers() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let stall = Stall {
@@ -474,6 +565,9 @@ struct Talker {
     auto_ptt: Option<f64>,
     open_mic: bool,
     coupled: bool,
+    /// the mod's half-duplex setting; off unless a scenario is about it, so the others
+    /// measure what a player hears while talking
+    half_duplex: bool,
     /// extra companion flags, e.g. the codec settings
     args: Vec<String>,
 }
@@ -485,6 +579,7 @@ impl Talker {
             auto_ptt: Some(hold_seconds),
             open_mic: false,
             coupled: false,
+            half_duplex: false,
             args: Vec::new(),
         }
     }
@@ -495,6 +590,7 @@ impl Talker {
             auto_ptt: None,
             open_mic: false,
             coupled: false,
+            half_duplex: false,
             args: Vec::new(),
         }
     }
@@ -505,12 +601,18 @@ impl Talker {
             auto_ptt: None,
             open_mic: true,
             coupled,
+            half_duplex: false,
             args: Vec::new(),
         }
     }
 
     fn with_args(mut self, args: &[String]) -> Self {
         self.args = args.to_vec();
+        self
+    }
+
+    fn half_duplex(mut self, on: bool) -> Self {
+        self.half_duplex = on;
         self
     }
 }
@@ -562,6 +664,7 @@ impl Session {
                         companion_port: port,
                         echo: false,
                         open_mic: t.open_mic,
+                        half_duplex: t.half_duplex,
                     };
                     (0, player)
                 })
@@ -716,6 +819,8 @@ struct Trace {
     /// this companion's own encoder: samples per frame, bitrate, complexity, fec
     frame_samples: usize,
     ptt: Vec<(u64, bool)>,
+    /// (device slot, muted): where half-duplex starts and ends on the device timeline
+    mute: Vec<(u64, bool)>,
     tx: HashMap<u16, TxFrame>,
     rx: HashMap<(u16, u16), u64>,
     pulls: Vec<PullEvent>,
@@ -740,6 +845,7 @@ impl Trace {
                 }
                 "codec" => trace.frame_samples = num(2) as usize,
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
+                "mute" => trace.mute.push((num(3), f[2] == "1")),
                 "tx" => {
                     trace.tx.insert(
                         num(2) as u16,

@@ -24,6 +24,10 @@ struct Args {
     /// player index whose open mic is on (sent as MIC_STATE on every HELLO); repeatable
     #[arg(long, value_name = "INDEX")]
     open_mic: Vec<u16>,
+    /// player index whose half-duplex setting is on (sent as HALF_DUPLEX on every HELLO);
+    /// repeatable
+    #[arg(long, value_name = "INDEX")]
+    half_duplex: Vec<u16>,
     /// fixed part of the client -> server -> client delay
     #[arg(long, default_value_t = 72)]
     delay_ms: u64,
@@ -73,6 +77,7 @@ fn main() -> ExitCode {
                     companion_port: companion,
                     echo: args.echo.contains(&index),
                     open_mic: args.open_mic.contains(&index),
+                    half_duplex: args.half_duplex.contains(&index),
                 },
             )
         })

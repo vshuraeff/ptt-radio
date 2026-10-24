@@ -3,8 +3,8 @@
 //! of mod/ptt-radio/control.lua:
 //! - each player has a game port (its --enable-lua-udp port, where its
 //!   companion sends) and a companion port (where its companion listens);
-//! - HELLO is answered with ROSTER (sender 0) and MIC_STATE (the player's own
-//!   index) to that player's companion;
+//! - HELLO is answered with ROSTER (sender 0), MIC_STATE and HALF_DUPLEX (the
+//!   player's own index) to that player's companion;
 //! - START/VOICE/STOP are forwarded to every other player's companion, and to
 //!   the sender's own one when its echo setting is on, with the sender's
 //!   player index in place of the first two bytes of the companion header.
@@ -24,7 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::packet::{self, HELLO, MAGIC, MIC_STATE, ROSTER, START, STOP, VERSION, VOICE};
+use crate::packet::{
+    self, HALF_DUPLEX, HELLO, MAGIC, MIC_STATE, ROSTER, START, STOP, VERSION, VOICE,
+};
 
 pub const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
@@ -35,6 +37,8 @@ pub struct Player {
     pub echo: bool,
     /// what the mod's open-mic button holds; sent as MIC_STATE on every HELLO
     pub open_mic: bool,
+    /// the mod's per-player setting ptt-radio-half-duplex; sent as HALF_DUPLEX on every HELLO
+    pub half_duplex: bool,
 }
 
 pub struct Config {
@@ -263,6 +267,11 @@ fn tick(
                     );
                     let open = players[p.player].open_mic as u8;
                     send(p.player, &packet::encode(MIC_STATE, sender_index, &[open]));
+                    let half = players[p.player].half_duplex as u8;
+                    send(
+                        p.player,
+                        &packet::encode(HALF_DUPLEX, sender_index, &[half]),
+                    );
                 }
                 // like the mod, forward whatever follows the 3-byte header, however short
                 kind @ (START | VOICE | STOP) => {
@@ -330,6 +339,7 @@ mod tests {
             companion_port: socket.local_addr().unwrap().port(),
             echo,
             open_mic,
+            half_duplex: open_mic,
         };
         let config = Config {
             delay: Duration::from_millis(5),
@@ -364,6 +374,10 @@ mod tests {
                 player: 2,
                 open: true
             })
+        );
+        assert_eq!(
+            packet::parse(&recv(&b)),
+            Some(Incoming::HalfDuplex { on: true })
         );
 
         // alice has echo off: only bob hears her; bob has echo on: both hear him

@@ -19,6 +19,7 @@ local VOICE = 0x03
 local STOP = 0x04
 local ROSTER = 0x10
 local MIC_STATE = 0x11
+local HALF_DUPLEX = 0x12
 
 local STALE_TICKS = 30
 -- the companion sends HELLO every 5 s; three missed heartbeats mean it is gone
@@ -115,6 +116,12 @@ local function send_mic_state(player)
   helpers.send_udp(companion_port(player), header(MIC_STATE, player.index) .. string.char(state), player.index)
 end
 
+-- whether the companion mutes incoming voices while this player holds PTT
+local function send_half_duplex(player)
+  local state = player.mod_settings["ptt-radio-half-duplex"].value and 1 or 0
+  helpers.send_udp(companion_port(player), header(HALF_DUPLEX, player.index) .. string.char(state), player.index)
+end
+
 local function set_open_mic(player, open)
   storage.open_mic[player.index] = open or nil
   player.set_shortcut_toggled(SHORTCUT, open)
@@ -137,6 +144,7 @@ local function companion_seen(player, tick)
   end
   send_roster(player)
   send_mic_state(player)
+  send_half_duplex(player)
 end
 
 local function forget_companion(player_index)
@@ -258,5 +266,10 @@ end)
 script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
   if event.setting == "ptt-radio-scope" then
     render_all_badges()
+  elseif event.setting == "ptt-radio-half-duplex" and event.player_index then
+    local player = game.get_player(event.player_index)
+    if storage.companions[player.index] then
+      send_half_duplex(player)
+    end
   end
 end)

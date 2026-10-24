@@ -246,6 +246,38 @@ impl Mixer {
     }
 }
 
+// half-duplex mute ramp: 5 ms, short enough to be a cut, long enough not to click
+const MUTE_RAMP: usize = OPUS_RATE as usize / 200;
+
+/// output gain for half-duplex: ramps to 0 while muted and back to 1 after
+pub struct Mute {
+    gain: f32,
+}
+
+impl Default for Mute {
+    fn default() -> Self {
+        Self { gain: 1.0 }
+    }
+}
+
+impl Mute {
+    pub fn apply(&mut self, muted: bool, slice: &mut [f32]) {
+        let target = if muted { 0.0 } else { 1.0 };
+        if self.gain == target && target == 1.0 {
+            return;
+        }
+        let step = 1.0 / MUTE_RAMP as f32;
+        for s in slice {
+            self.gain = if muted {
+                (self.gain - step).max(0.0)
+            } else {
+                (self.gain + step).min(1.0)
+            };
+            *s *= self.gain;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +373,24 @@ mod tests {
             ]
         );
         assert_eq!(mixer.stats.decoded, 6);
+    }
+
+    #[test]
+    fn mute_ramps_down_and_back_without_steps() {
+        let mut mute = Mute::default();
+        let mut slice = [1.0; SLICE_SAMPLES];
+        mute.apply(false, &mut slice);
+        assert_eq!(slice, [1.0; SLICE_SAMPLES]);
+        mute.apply(true, &mut slice);
+        // 5 ms down, then silence for the rest of the 10 ms slice
+        assert!(slice.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] < 0.01));
+        assert!(slice[MUTE_RAMP..].iter().all(|s| *s == 0.0));
+        let mut slice = [1.0; SLICE_SAMPLES];
+        mute.apply(true, &mut slice);
+        assert_eq!(slice, [0.0; SLICE_SAMPLES]);
+        let mut slice = [1.0; SLICE_SAMPLES];
+        mute.apply(false, &mut slice);
+        assert!(slice.windows(2).all(|w| w[1] >= w[0] && w[1] - w[0] < 0.01));
+        assert!(slice[MUTE_RAMP..].iter().all(|s| *s == 1.0));
     }
 }
