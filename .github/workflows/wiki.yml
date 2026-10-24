@@ -1,0 +1,53 @@
+# mirrors wiki/ into the repository's github wiki (<repo>.wiki.git).
+#
+# one-time setup: github creates the wiki repository only after the first page
+# is saved in the web ui; enabling the wiki in the settings is not enough. open
+# the wiki tab, create any page once, then run this workflow. every page is
+# replaced by the contents of wiki/ on the next run.
+name: wiki
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "wiki/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Clone the wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          if ! git clone --depth 1 "$url" "$RUNNER_TEMP/wiki"; then
+            echo "::error title=Wiki not initialised::${GITHUB_REPOSITORY}.wiki.git does not exist yet. Open the repository's Wiki tab, create any page once, then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Mirror wiki/ and push on a diff
+        run: |
+          rsync -a --delete --exclude .git wiki/ "$RUNNER_TEMP/wiki/"
+          cd "$RUNNER_TEMP/wiki"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "wiki already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "sync wiki from ${GITHUB_SHA}"
+          git push
