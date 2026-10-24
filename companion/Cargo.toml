@@ -16,6 +16,11 @@ hound = "3.5"
 opusic-c = "1.6.1"
 sonora = "=0.2.0"
 
+# tests/multiparty_lab.rs only: the stock canceller it compares, and its stft
+[dev-dependencies]
+rustfft = "6.4"
+sonora = "=0.2.0"
+
 # the macOS event loop the global hotkey needs (see src/ptt_key.rs)
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
