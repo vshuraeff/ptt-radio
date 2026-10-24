@@ -6,6 +6,8 @@
 //!   ROSTER: rest = utf-8 lines "index\tname\tr,g,b"
 //!   MIC_STATE: rest = one byte, 0 open mic off, 1 on
 //!   HALF_DUPLEX: rest = one byte, 0 off, 1 mute incoming voices while PTT is held
+//!   SELF_TEST: exactly 7 bytes, header + test_id u16 BE (mod -> own companion)
+//!   SELF_TEST_RESULT: exactly 16 bytes, companion -> game, see `SelfTestResult`
 
 pub const MAGIC: u8 = 0x52;
 pub const VERSION: u8 = 1;
@@ -18,6 +20,11 @@ pub const ECHO_STATE: u8 = 0x05;
 pub const ROSTER: u8 = 0x10;
 pub const MIC_STATE: u8 = 0x11;
 pub const HALF_DUPLEX: u8 = 0x12;
+pub const SELF_TEST: u8 = 0x16;
+pub const SELF_TEST_RESULT: u8 = 0x18;
+
+const SELF_TEST_LEN: usize = 7;
+const SELF_TEST_RESULT_LEN: usize = 16;
 
 pub fn encode(kind: u8, seq: u16, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + body.len());
@@ -91,6 +98,98 @@ pub fn parse(data: &[u8]) -> Option<Incoming<'_>> {
         (HALF_DUPLEX, [state @ (0 | 1)]) => Some(Incoming::HalfDuplex { on: *state == 1 }),
         _ => None,
     }
+}
+
+/// returns the test id of a SELF_TEST packet, None for any other shape or length
+pub fn parse_self_test(data: &[u8]) -> Option<u16> {
+    match data {
+        [MAGIC, VERSION, SELF_TEST, 0, 0, hi, lo] if data.len() == SELF_TEST_LEN => {
+            Some(u16::from_be_bytes([*hi, *lo]))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Ok = 0,
+    TxNotPermitted = 1,
+    MicOpenFailed = 2,
+    NoFramesReturned = 3,
+    Busy = 4,
+}
+
+impl Outcome {
+    fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Ok),
+            1 => Some(Self::TxNotPermitted),
+            2 => Some(Self::MicOpenFailed),
+            3 => Some(Self::NoFramesReturned),
+            4 => Some(Self::Busy),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfTestResult {
+    pub test_id: u16,
+    pub outcome: Outcome,
+    // 1 when the local test tone was played
+    pub tone: u8,
+    // -127..=0, -128 means no capture
+    pub mic_peak_dbfs: i8,
+    pub frames_sent: u16,
+    pub frames_returned: u16,
+    pub first_return_ms: u16,
+}
+
+pub fn encode_self_test_result(result: &SelfTestResult) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SELF_TEST_RESULT_LEN);
+    out.extend_from_slice(&[MAGIC, VERSION, SELF_TEST_RESULT, 0, 0]);
+    out.extend_from_slice(&result.test_id.to_be_bytes());
+    out.push(result.outcome as u8);
+    out.push(result.tone);
+    out.extend_from_slice(&result.mic_peak_dbfs.to_be_bytes());
+    out.extend_from_slice(&result.frames_sent.to_be_bytes());
+    out.extend_from_slice(&result.frames_returned.to_be_bytes());
+    out.extend_from_slice(&result.first_return_ms.to_be_bytes());
+    out
+}
+
+/// returns None unless `data` is exactly one well-formed SELF_TEST_RESULT
+pub fn decode_self_test_result(data: &[u8]) -> Option<SelfTestResult> {
+    let [
+        MAGIC,
+        VERSION,
+        SELF_TEST_RESULT,
+        _,
+        _,
+        id_hi,
+        id_lo,
+        outcome,
+        tone,
+        peak,
+        sent_hi,
+        sent_lo,
+        ret_hi,
+        ret_lo,
+        ms_hi,
+        ms_lo,
+    ] = data
+    else {
+        return None;
+    };
+    Some(SelfTestResult {
+        test_id: u16::from_be_bytes([*id_hi, *id_lo]),
+        outcome: Outcome::from_byte(*outcome)?,
+        tone: *tone,
+        mic_peak_dbfs: i8::from_be_bytes([*peak]),
+        frames_sent: u16::from_be_bytes([*sent_hi, *sent_lo]),
+        frames_returned: u16::from_be_bytes([*ret_hi, *ret_lo]),
+        first_return_ms: u16::from_be_bytes([*ms_hi, *ms_lo]),
+    })
 }
 
 fn parse_roster(text: &str) -> Vec<RosterEntry> {
@@ -204,6 +303,102 @@ mod tests {
             Some(Incoming::HalfDuplex { on: false })
         );
         assert_eq!(parse(&[0x52, 1, HALF_DUPLEX, 0, 1, 2]), None);
+    }
+
+    #[test]
+    fn self_test_exact_length() {
+        assert_eq!(
+            parse_self_test(&[0x52, 1, SELF_TEST, 0, 0, 0x12, 0x34]),
+            Some(0x1234)
+        );
+        assert_eq!(
+            parse_self_test(&[0x52, 1, SELF_TEST, 0, 0, 0xff, 0xff]),
+            Some(65535)
+        );
+        assert_eq!(parse_self_test(&[0x52, 1, SELF_TEST, 0, 0, 0x12]), None);
+        assert_eq!(
+            parse_self_test(&[0x52, 1, SELF_TEST, 0, 0, 0x12, 0x34, 0]),
+            None
+        );
+        assert_eq!(parse_self_test(&[]), None);
+    }
+
+    #[test]
+    fn self_test_rejects_wrong_header() {
+        assert_eq!(parse_self_test(&[0x51, 1, SELF_TEST, 0, 0, 0, 1]), None);
+        assert_eq!(parse_self_test(&[0x52, 2, SELF_TEST, 0, 0, 0, 1]), None);
+        assert_eq!(
+            parse_self_test(&[0x52, 1, SELF_TEST_RESULT, 0, 0, 0, 1]),
+            None
+        );
+        // the reserved field must be zero
+        assert_eq!(parse_self_test(&[0x52, 1, SELF_TEST, 0, 1, 0, 1]), None);
+        // the generic parser does not know the kind
+        assert_eq!(parse(&[0x52, 1, SELF_TEST, 0, 0, 0, 1]), None);
+    }
+
+    fn sample_result() -> SelfTestResult {
+        SelfTestResult {
+            test_id: 0xabcd,
+            outcome: Outcome::Ok,
+            tone: 1,
+            mic_peak_dbfs: -20,
+            frames_sent: 150,
+            frames_returned: 148,
+            first_return_ms: 90,
+        }
+    }
+
+    #[test]
+    fn self_test_result_layout() {
+        let bytes = encode_self_test_result(&sample_result());
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(
+            bytes,
+            vec![
+                0x52, 1, 0x18, 0, 0, 0xab, 0xcd, 0, 1, 0xec, 0, 150, 0, 148, 0, 90
+            ]
+        );
+    }
+
+    #[test]
+    fn self_test_result_round_trip() {
+        for (outcome, peak) in [
+            (Outcome::Ok, 0),
+            (Outcome::TxNotPermitted, -1),
+            (Outcome::MicOpenFailed, -127),
+            (Outcome::NoFramesReturned, -128),
+            (Outcome::Busy, -128),
+        ] {
+            let result = SelfTestResult {
+                outcome,
+                mic_peak_dbfs: peak,
+                ..sample_result()
+            };
+            assert_eq!(
+                decode_self_test_result(&encode_self_test_result(&result)),
+                Some(result)
+            );
+        }
+        let bytes = encode_self_test_result(&SelfTestResult {
+            mic_peak_dbfs: -128,
+            ..sample_result()
+        });
+        assert_eq!(bytes[9], 0x80);
+    }
+
+    #[test]
+    fn self_test_result_rejects_malformed() {
+        let good = encode_self_test_result(&sample_result());
+        assert_eq!(decode_self_test_result(&good[..15]), None);
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(decode_self_test_result(&long), None);
+        for (at, value) in [(0, 0x51), (1, 2), (2, SELF_TEST), (7, 5)] {
+            let mut bad = good.clone();
+            bad[at] = value;
+            assert_eq!(decode_self_test_result(&bad), None, "byte {at}");
+        }
     }
 
     #[test]
