@@ -38,3 +38,7 @@ rustfft = "6.4"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDate", "NSRunLoop", "NSString"] }
+
+# the win32 message pump the global hotkey needs (see src/ptt_key.rs); the version global-hotkey uses
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
