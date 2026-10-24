@@ -611,7 +611,7 @@ fn all_confirmation_acks_lost_then_abort_requires_fresh_snapshot_context() {
     let (mut bb, bk) = announce(vec![Suite::ChaChaPoly], (1 << 40) + 1);
     for announce in [&mut aa, &mut bb] {
         announce.ice.restart_generation = 2;
-        announce.ice.password = ["fresh-", "test-credential"].concat();
+        announce.ice.password = "r".repeat(21);
     }
     let mut fresh_a = Session::new(10, &aa, ak, 20, &bb).unwrap();
     let mut fresh_b = Session::new(20, &bb, bk, 10, &aa).unwrap();
