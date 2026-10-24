@@ -1092,6 +1092,41 @@ mod tests {
     }
 
     #[test]
+    fn first_hub_announce_is_not_postponed_by_ticks_before_any_peer() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(
+            vec!["127.0.0.1:41001".parse().unwrap()],
+            RuntimeConfig {
+                hub: Some("127.0.0.1:45000".parse().unwrap()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let hub_announces = |runtime: &mut Runtime| {
+            std::iter::from_fn(|| runtime.poll())
+                .filter(|o| match o {
+                    Output::Game(bytes) => matches!(
+                        signaling::decode_game(bytes, false),
+                        Ok((0, Signal::Announce(_)))
+                    ),
+                    _ => false,
+                })
+                .count()
+        };
+        runtime.tick(now, false).unwrap();
+        assert_eq!(hub_announces(&mut runtime), 0);
+        let later = now + Duration::from_secs(1);
+        runtime.roster(vec![1, 2], later).unwrap();
+        runtime.identify(1, later).unwrap();
+        runtime.tick(later, false).unwrap();
+        assert_eq!(hub_announces(&mut runtime), 1);
+        runtime.tick(later + Duration::from_secs(1), false).unwrap();
+        assert_eq!(hub_announces(&mut runtime), 0);
+        runtime.tick(later + Duration::from_secs(5), false).unwrap();
+        assert_eq!(hub_announces(&mut runtime), 1);
+    }
+
+    #[test]
     fn game_only_ignores_relay_grants_and_emits_no_udp() {
         let now = Instant::now();
         let mut runtime = Runtime::new(
@@ -2488,10 +2523,11 @@ impl Runtime {
             }
         }
         self.player_relays(now);
-        if self.next_hub_announce.is_none_or(|at| now >= at) {
-            if let Some(description) = self.peers.values().next().map(|p| p.local.clone()) {
-                self.signal(0, &Signal::Announce(description));
-            }
+        // the refresh period starts at the first announcement, not at a tick with no peers yet
+        if self.next_hub_announce.is_none_or(|at| now >= at)
+            && let Some(description) = self.peers.values().next().map(|p| p.local.clone())
+        {
+            self.signal(0, &Signal::Announce(description));
             self.next_hub_announce = Some(now + Duration::from_secs(5));
         }
         failure.map_or(Ok(()), Err)
