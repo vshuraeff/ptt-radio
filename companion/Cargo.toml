@@ -9,7 +9,11 @@ publish = false
 clap = { version = "4", features = ["derive"] }
 cpal = "0.18"
 ctrlc = { version = "3", features = ["termination"] }
+# relay grant secrets and BIND challenges; the version snow already uses
+getrandom = "=0.3.4"
 global-hotkey = "0.9"
+# BIND proofs (HMAC-SHA-256 keyed by the grant secret), same RustCrypto line as sha2
+hmac = "=0.12.1"
 hound = "3.5"
 # default feature "bundled": builds the vendored libopus 1.6.1 with cmake and links it statically,
 # so no system libopus is needed on any platform
@@ -17,6 +21,10 @@ opusic-c = "1.6.1"
 sonora = "=0.2.0"
 sha2 = "=0.10.9"
 snow = { version = "=0.10.0", default-features = false, features = ["std", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+
+[[bin]]
+name = "ptt-radio-hub"
+path = "src/bin/ptt-radio-hub.rs"
 
 # offline comparison only; no neural runtime in the production companion
 [dev-dependencies]
