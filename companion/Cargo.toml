@@ -22,6 +22,19 @@ opusic-c = "1.6.1"
 sonora = "=0.2.0"
 sha2 = "=0.10.9"
 snow = { version = "=0.10.0", default-features = false, features = ["std", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+# self-update (src/self_update.rs): GitHub releases over rustls, the release archives, the atomic swap
+flate2 = { version = "1.1.10", optional = true }
+self-replace = { version = "1.5.0", optional = true }
+semver = { version = "1.0.28", optional = true }
+serde_json = { version = "1.0.154", optional = true }
+tar = { version = "0.4.46", default-features = false, optional = true }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"], optional = true }
+zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2"], optional = true }
+
+[features]
+default = ["self-update"]
+# the companion updates itself from the latest GitHub release at startup; the hub never needs it
+self-update = ["dep:flate2", "dep:self-replace", "dep:semver", "dep:serde_json", "dep:tar", "dep:ureq", "dep:zip"]
 
 [[bin]]
 name = "ptt-radio-hub"
