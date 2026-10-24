@@ -46,6 +46,70 @@ jobs:
           path: dist/ptt-radio_${{ env.VERSION }}.zip
           if-no-files-found: error
 
+  # independent of GitHub publication: a portal failure must not block the release job.
+  mod-portal:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, mod]
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: check for the portal secret
+        id: portal
+        env:
+          FACTORIO_MOD_PORTAL_KEY: ${{ secrets.FACTORIO_MOD_PORTAL_KEY }}
+        run: |
+          if [ -n "$FACTORIO_MOD_PORTAL_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::FACTORIO_MOD_PORTAL_KEY is not set: mod portal upload skipped"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.portal.outputs.enabled == 'true'
+        with:
+          name: mod
+          path: assets
+      - name: upload the existing mod release
+        if: steps.portal.outputs.enabled == 'true'
+        env:
+          FACTORIO_MOD_PORTAL_KEY: ${{ secrets.FACTORIO_MOD_PORTAL_KEY }}
+        run: |
+          umask 077
+          portal_dir=$(mktemp -d "$RUNNER_TEMP/mod-portal.XXXXXX")
+          trap 'rm -rf "$portal_dir"' EXIT
+          printf 'Authorization: Bearer %s\n' "$FACTORIO_MOD_PORTAL_KEY" > "$portal_dir/auth"
+          if ! status=$(curl --silent --fail --proto '=https' --connect-timeout 20 --max-time 120 \
+            --header "@$portal_dir/auth" --form 'mod=ptt-radio' \
+            --output "$portal_dir/init.json" --write-out '%{http_code}' \
+            https://mods.factorio.com/api/v2/mods/releases/init_upload) || [[ "$status" != 2?? ]]; then
+            echo "::error::mod portal initialization failed (HTTP or transport error)"
+            exit 1
+          fi
+          if ! upload_url=$(jq -ers '
+            select(length == 1) | .[0] |
+            select(type == "object" and (has("error") | not)) | .upload_url |
+            select(type == "string" and startswith("https://") and
+              (test("[[:space:][:cntrl:]]") | not))
+            ' "$portal_dir/init.json" 2>/dev/null); then
+            echo "::error::mod portal initialization returned an error or invalid upload URL"
+            exit 1
+          fi
+          # the returned upload URL authorizes this request; do not forward the bearer key.
+          if ! status=$(curl --silent --fail --proto '=https' --connect-timeout 20 --max-time 120 \
+            --form "file=@assets/ptt-radio_$VERSION.zip" \
+            --output "$portal_dir/upload.json" --write-out '%{http_code}' --url "$upload_url") || [[ "$status" != 2?? ]]; then
+            echo "::error::mod portal upload failed (HTTP or transport error)"
+            exit 1
+          fi
+          if ! jq -es 'length == 1 and (.[0] | type == "object" and (has("error") | not) and .success == true)' \
+            "$portal_dir/upload.json" >/dev/null 2>&1; then
+            echo "::error::mod portal upload returned an error or did not confirm success"
+            exit 1
+          fi
+          echo "::notice::mod portal release upload succeeded"
+
   # built inside ubuntu 22.04 so the binary needs only glibc 2.35 and runs on ubuntu 22.04 and debian 12.
   # a container rather than cargo-zigbuild: the bundled libopus builds with the distro's own cmake and gcc.
   # x11rb (global-hotkey) is pure rust, so alsa is the only system library.

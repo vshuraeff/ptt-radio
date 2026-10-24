@@ -1,6 +1,6 @@
 # Releasing ptt-radio
 
-A release is one tag, `v<version>`. Pushing it runs `.github/workflows/release.yml`, which builds every asset and publishes the GitHub Release at <https://github.com/vshuraeff/ptt-radio/releases>. Nothing is uploaded by hand.
+A release is one tag, `v<version>`. Pushing it runs `.github/workflows/release.yml`, which builds every asset and publishes the GitHub Release at <https://github.com/vshuraeff/ptt-radio/releases>. With the portal secret configured, it also uploads the mod to the Factorio mod portal.
 
 ## What a release contains
 
@@ -51,9 +51,17 @@ The same run also pushes the hub image `ghcr.io/vshuraeff/ptt-radio-hub` with th
 
 6. Watch the `release` run in the Actions tab. Compilation runs in parallel with `tools/check-version.sh v0.4.1`; the final publication waits for that check and every asset. A mismatched tag cannot publish a release. The hub workflow also checks the version before building or pushing its image.
 
-To retry a run that failed before publishing, fix the cause, delete the tag locally and on GitHub (`git push origin :refs/tags/v0.4.1`), and tag again. Once a release is published, companions may already have updated to it, so fix forward with a new version instead (see Self-update).
+If neither GitHub nor the mod portal has published the version, fix the cause, delete the tag locally and on GitHub (`git push origin :refs/tags/v0.4.1`), and tag again. Once either service has published it, preserve the version and tag: retry only the failed job where safe, or fix forward with a new version. Do not rerun a successful portal upload. Once GitHub has published, companions may already have updated to it (see Self-update).
 
-The mod portal upload is a separate manual step: upload `ptt-radio_<ver>.zip` from the release at <https://mods.factorio.com>.
+## Factorio mod portal
+
+The first publication of `ptt-radio` is manual and requires the owner's explicit instruction. The workflow only adds releases to an existing mod; it never calls `init_publish`. Before the mod exists, an upload fails with the portal's `UnknownMod` error.
+
+After that first publication, set the repository Actions secret `FACTORIO_MOD_PORTAL_KEY` to a Factorio API key with the `ModPortal: Upload Mods` usage, created at <https://factorio.com/profile>. Adding the secret enables portal uploads on future `v*` tag pushes. With the secret absent or empty, the portal job succeeds with a skip notice. Branch pushes and pull requests do not trigger it.
+
+The `mod-portal` job waits for the version check and mod packaging, then downloads the same `mod` artifact used by the GitHub Release. The version check verifies `mod/ptt-radio/info.json` against the tag. Following the [mod upload API](https://wiki.factorio.com/Mod_upload_API), the job calls `init_upload` with `mod=ptt-radio`, then posts `ptt-radio_<ver>.zip` to the returned HTTPS upload URL. HTTP, transport, JSON and portal API errors fail the job, as does an upload response without `success: true`.
+
+Portal upload runs independently of the companion and hub builds. GitHub Release publication does not depend on `mod-portal`, so a portal failure does not block it. Check both jobs before considering a release delivered to both services; if GitHub publication succeeded, avoid rerunning the entire workflow just to retry a failed portal job.
 
 ## Self-update
 
