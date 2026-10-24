@@ -27,7 +27,7 @@ impl Mode {
             _ if scenario == "double-talk" => 6.0,
             // these windows still see startup jitter-buffer margin with less preparation.
             Self::Direct if scenario == "echo" => 6.0,
-            Self::Hub | Self::Player if scenario == "stall" => 6.0,
+            Self::Hub | Self::Player if matches!(scenario, "stall" | "latency") => 6.0,
             // traces select both directions within 1.5s; retain settling before speech.
             Self::Direct | Self::Hub => 2.0,
             // player relay settles near 2.7s; echo also checks the 10s hello refresh.
