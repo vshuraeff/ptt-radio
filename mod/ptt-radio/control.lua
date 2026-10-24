@@ -28,6 +28,9 @@ local HUD_STATUS = 0x0A
 local START3, VOICE3, STOP3 = 0x0B, 0x0C, 0x0D
 local SIGNAL_IN = 0x13
 local POLICY = 0x15
+local SELF_TEST = 0x16
+local SELF_TEST_RESULT = 0x18
+local SELF_TEST_RESULT_LEN = 16
 local MAX_SIGNAL_BODY = 1200
 local MAX_OPUS = 1164
 local MAX_POLICY_OPUS = MAX_OPUS - 8
@@ -65,6 +68,32 @@ end
 local function read_u16(payload, offset)
   local hi, lo = string.byte(payload, offset, offset + 1)
   return hi * 256 + lo
+end
+
+-- SELF_TEST for the requesting player's own companion: header with a zero reserved field + test_id u16
+local function encode_self_test(test_id)
+  return header(SELF_TEST, 0) .. u16(test_id)
+end
+
+-- exactly 16 bytes; the header's reserved field is ignored, the reporter is event.player_index
+local function parse_self_test_result(payload)
+  if #payload ~= SELF_TEST_RESULT_LEN then return nil end
+  if payload:byte(1) ~= MAGIC or payload:byte(2) ~= VERSION or payload:byte(3) ~= SELF_TEST_RESULT then
+    return nil
+  end
+  local outcome = payload:byte(8)
+  if outcome > 4 then return nil end
+  local peak = payload:byte(10)
+  if peak >= 128 then peak = peak - 256 end
+  return {
+    test_id = read_u16(payload, 6),
+    outcome = outcome,
+    tone = payload:byte(9),
+    mic_peak_dbfs = peak,
+    frames_sent = read_u16(payload, 11),
+    frames_returned = read_u16(payload, 13),
+    first_return_ms = read_u16(payload, 15),
+  }
 end
 
 local function companion_port(player)
@@ -706,3 +735,9 @@ on_event(defines.events.on_runtime_mod_setting_changed, function(event)
     end
   end
 end)
+
+-- the self-test codec helpers, returned so the unit tests can call them
+return {
+  encode_self_test = encode_self_test,
+  parse_self_test_result = parse_self_test_result,
+}
