@@ -124,6 +124,10 @@ pub enum Signal {
         session: u32,
         hub_generation: u64,
     },
+    /// asks the lower-index peer to replace this generation; duplicates reuse its attempt.
+    RekeyRequest {
+        session_generation: u64,
+    },
 }
 
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), CodecError> {
@@ -337,6 +341,10 @@ pub fn encode(signal: &Signal) -> Result<Vec<u8>, CodecError> {
             out.extend_from_slice(&session.to_be_bytes());
             out.extend_from_slice(&hub_generation.to_be_bytes());
         }
+        Signal::RekeyRequest { session_generation } => {
+            out.push(10);
+            out.extend_from_slice(&session_generation.to_be_bytes());
+        }
     }
     bounded(out)
 }
@@ -429,6 +437,9 @@ pub fn decode(data: &[u8]) -> Result<Signal, CodecError> {
             relay: r.u16()?,
             session: r.u32()?,
             hub_generation: r.u64()?,
+        },
+        10 => Signal::RekeyRequest {
+            session_generation: r.u64()?,
         },
         _ => return Err(CodecError::UnknownType),
     };

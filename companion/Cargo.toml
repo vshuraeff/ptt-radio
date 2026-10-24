@@ -15,6 +15,8 @@ hound = "3.5"
 # so no system libopus is needed on any platform
 opusic-c = "1.6.1"
 sonora = "=0.2.0"
+sha2 = "=0.10.9"
+snow = { version = "=0.10.0", default-features = false, features = ["std", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
 
 # offline comparison only; no neural runtime in the production companion
 [dev-dependencies]

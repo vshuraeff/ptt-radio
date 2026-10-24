@@ -352,6 +352,9 @@ fn signaling_roundtrips_every_kind_and_all_path_variants() {
             session: 2,
             hub_generation: 3,
         },
+        Signal::RekeyRequest {
+            session_generation: 0x0102030405060708,
+        },
     ];
     for path in [
         Path::Game,
