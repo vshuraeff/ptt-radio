@@ -1,4 +1,6 @@
 -- ALT + V is unbound in vanilla 2.1 (ALT + T, the v0.1 default, opens the technology screen)
+-- ALT + SHIFT + V is a separate binding, unbound too; ALT + C is vanilla (give-copper-wire),
+-- so the preset cycle ships unassigned and the player binds it in the controls
 data:extend({
   {
     type = "custom-input",
@@ -6,6 +8,20 @@ data:extend({
     key_sequence = "ALT + V",
     consuming = "none",
     order = "a",
+  },
+  {
+    type = "custom-input",
+    name = "ptt-radio-settings-open",
+    key_sequence = "ALT + SHIFT + V",
+    consuming = "none",
+    order = "b",
+  },
+  {
+    type = "custom-input",
+    name = "ptt-radio-settings-cycle",
+    key_sequence = "",
+    consuming = "none",
+    order = "c",
   },
   {
     type = "shortcut",
@@ -18,5 +34,17 @@ data:extend({
     small_icon = "__ptt-radio__/graphics/ptt-radio-x24.png",
     small_icon_size = 24,
     order = "z[ptt-radio]",
+  },
+  {
+    type = "shortcut",
+    name = "ptt-radio-settings",
+    action = "lua",
+    toggleable = false,
+    associated_control_input = "ptt-radio-settings-open",
+    icon = "__ptt-radio__/graphics/ptt-radio-x56.png",
+    icon_size = 56,
+    small_icon = "__ptt-radio__/graphics/ptt-radio-x24.png",
+    small_icon_size = 24,
+    order = "z[ptt-radio]-b",
   },
 })
