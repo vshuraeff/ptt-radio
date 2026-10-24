@@ -63,7 +63,9 @@ main() {
     stage=$(mktemp -d "$factorio_dir/.ptt-radio-install.XXXXXX")
     backup=
     cleanup() {
-        if [ -n "$backup" ]; then
+        # the backup path is set before the move, so an interrupt between the move and the
+        # assignment cannot lose it; a move that never happened leaves no backup to restore
+        if [ -n "$backup" ] && [ -e "$backup" ]; then
             if [ ! -e "$install_dir" ] && mv "$backup" "$install_dir"; then
                 backup=
             else
@@ -111,8 +113,8 @@ main() {
         END { printf "\"" }' >> "$stage/new/install.json"
     printf ',"installed_by":"ptt-radio installer"}\n' >> "$stage/new/install.json"
     if [ -d "$install_dir" ]; then
-        mv "$install_dir" "$stage/previous"
         backup=$stage/previous
+        mv "$install_dir" "$backup"
     fi
     mv "$stage/new" "$install_dir"
     backup=

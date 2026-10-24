@@ -70,7 +70,7 @@ A companion you built yourself with `cargo build` never updates itself; it print
 
 ## Starting the game with the companion
 
-With `--launch`, the companion starts the game itself. Everything after `--launch` is the game's command line, so put the companion's own options before it. The companion appends `--enable-lua-udp` with its `--game-port` unless the game's command line already has that flag. It runs while the game runs; when the game exits, it ends the transmission in progress, shuts down and exits with the game's exit status. If the game cannot be started, the companion says so and exits with an error.
+With `--launch`, the companion starts the game itself. Everything after `--launch` is the game's command line, so put the companion's own options before it. The companion appends `--enable-lua-udp` with its `--game-port` unless the game's command line already has that flag. It runs while the game runs; when the game exits, it ends the transmission in progress, shuts down and exits with the game's exit status. If the game cannot be started, the companion says so and exits with an error. If the companion itself cannot start, for example because its port is already taken by another companion, it prints the error and starts the game without itself.
 
 In Steam, open the game's *Properties*, and under *Launch options* enter, with your own install folder:
 
@@ -82,7 +82,9 @@ Steam replaces `%command%` with the game's own command line. An update found at 
 
 ## Removal with the mod
 
-A companion put in place by the installer sits in the folder `ptt-radio-companion` inside the Factorio user-data folder, beside a file `install.json`. That file records the mods folder the installer found. At every start, after the update check, and with `--launch` again after the game exits, the companion looks into that mods folder. When the folder exists and has `mod-list.json`, but no `ptt-radio` mod is in it (neither a `ptt-radio_<version>.zip` file nor a `ptt-radio` or `ptt-radio_<version>` folder), the companion deletes its own folder, prints one `self-uninstall: ...` line and exits. With `--launch`, the game still starts that one time, without the companion.
+A companion put in place by the installer sits in the folder `ptt-radio-companion` inside the Factorio user-data folder, beside a file `install.json`. That file records the mods folder the installer found. At every start, after the update check, and with `--launch` again after the game exits, the companion looks into that mods folder for the `ptt-radio` mod: a `ptt-radio_<version>.zip` file or a `ptt-radio` or `ptt-radio_<version>` folder.
+
+The companion has to see the mod installed once before it can remove itself. The first check that finds the mod writes an empty file `mod-seen` beside `install.json`. Until then a missing mod means it is not installed yet, for example because the game will download it when you join a server, and the companion stays. Once `mod-seen` exists, a check that finds the mods folder with its `mod-list.json` but no `ptt-radio` mod deletes the companion's folder, prints one `self-uninstall: ...` line and exits. With `--launch`, the game still starts that one time, without the companion. Reinstalling the companion with the installer starts the folder over, without `mod-seen`.
 
 It removes nothing when anything is unclear:
 

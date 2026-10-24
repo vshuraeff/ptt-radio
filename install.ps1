@@ -79,12 +79,15 @@ try {
     $marker = @{ version = 1; mods_dir = $ModsDir; installed_by = 'ptt-radio installer' } | ConvertTo-Json -Compress
     [IO.File]::WriteAllText((Join-Path $newDir 'install.json'), $marker, (New-Object Text.UTF8Encoding($false)))
     if (Test-Path -LiteralPath $installDir) {
-        Move-Item -LiteralPath $installDir -Destination (Join-Path $stage 'previous')
+        # set before the move, so an interrupt between the two cannot lose the backup
         $backup = Join-Path $stage 'previous'
+        Move-Item -LiteralPath $installDir -Destination $backup
     }
     Move-Item -LiteralPath $newDir -Destination $installDir
     $backup = $null
 } finally {
+    # a move that never happened leaves no backup to restore
+    if ($backup -and -not (Test-Path -LiteralPath $backup)) { $backup = $null }
     if ($backup -and -not (Test-Path -LiteralPath $installDir)) {
         try {
             Move-Item -LiteralPath $backup -Destination $installDir

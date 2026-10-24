@@ -1007,6 +1007,57 @@ fn launch_mode_runs_the_game_and_exits_with_its_status_after_a_clean_shutdown() 
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn launch_mode_starts_the_game_alone_when_the_companion_port_is_taken() {
+    let dir = directory("launch-alone");
+    fs::create_dir_all(&dir).unwrap();
+    // held for the whole test: the companion's own bind is its first setup step
+    let taken = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let game_port = game.local_addr().unwrap().port().to_string();
+    let argv = dir.join("argv");
+    let script = format!("printf '%s\\n' \"$@\" > '{}'; exit 3", argv.display());
+    let log = fs::File::create(dir.join("companion.log")).unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_ptt-radio-companion"))
+            .arg("--port")
+            .arg(taken.local_addr().unwrap().port().to_string())
+            .args(["--game-port", &game_port])
+            .args(["--ptt-key", "none", "--aec", "off", "--tone", "660"])
+            .args(["--game-only", "--exit-after", "20", "--speaker-wav"])
+            .arg(dir.join("speaker.wav"))
+            .args(["--launch", "/bin/sh", "-c", &script, "game"])
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let began = Instant::now();
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{}",
+            dir.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let log = fs::read_to_string(dir.join("companion.log")).unwrap();
+    assert_eq!(status.code(), Some(3), "{log}");
+    assert!(
+        log.contains("cannot bind") && log.contains("without the companion"),
+        "{log}"
+    );
+    assert!(!log.contains("game started"), "{log}");
+    assert_eq!(
+        fs::read_to_string(&argv).unwrap(),
+        format!("--enable-lua-udp\n{game_port}\n")
+    );
+}
+
 fn self_monitor(revision: u64, tx: bool) -> Vec<u8> {
     signaling::encode_policy(&Policy {
         audience: Audience {

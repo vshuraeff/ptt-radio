@@ -34,8 +34,7 @@ pub fn spawn(argv: &[OsString], game_port: u16) -> Result<Child, String> {
     })
 }
 
-/// the game without the companion, for a companion that has just removed itself
-#[cfg(feature = "self-update")]
+/// the game without the companion: after a self-removal, or when its setup failed
 pub fn run_alone(argv: &[OsString], game_port: u16) -> ExitCode {
     match spawn(argv, game_port).and_then(|mut child| child.wait().map_err(|e| e.to_string())) {
         Ok(status) => exit_code(status),

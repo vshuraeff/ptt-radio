@@ -42,7 +42,7 @@ Each companion talks only to its own local game over loopback Lua UDP; the game 
 
 | Binary | Source | Role |
 | --- | --- | --- |
-| `ptt-radio-companion` | `src/main.rs` | the player's program: devices, PTT key, threads, self-update |
+| `ptt-radio-companion` | `src/main.rs` | the player's program: devices, PTT key, threads, self-update, self-uninstall (`src/self_uninstall.rs`), `--launch` (`src/launch.rs`), the echo self-test (`src/self_test.rs`) |
 | `ptt-radio-hub` | `src/bin/ptt-radio-hub.rs` | the relay beside the server; game side in `src/transport/hub.rs` |
 | `relay` | `src/bin/relay.rs`, `src/relay.rs` | stand-in for Factorio and the mod in end-to-end tests |
 
@@ -142,16 +142,16 @@ Receive, on the receive and playout threads:
 
 | Thread | Owns or does |
 | --- | --- |
-| main | self-update check before anything else; registers `PttKey` and pumps its OS events every 10 ms (macOS `NSApplication` queue, Windows message queue); owns the cpal input stream (`Microphone`) and the cpal output stream, because cpal streams are not `Send`; sends HELLO and `ECHO_STATE` every 5 s; shutdown and joins |
-| transmit | `Source::next_frame`, `EchoPath::near_end`, `Transmitter`, `Runtime::transmit` |
-| receive | polls the UDP sockets (up to 256 datagrams per pass), `Runtime::udp`, `Runtime::tick`, the game socket, ROSTER, `MIC_STATE` and `HALF_DUPLEX`, `HUD_STATUS` batches |
-| playout | paced by the output queue (or the clock without a device); mixes, mutes, feeds `EchoPath::far_end`, appends to the output queue |
+| main | self-update and self-uninstall checks before anything else; with `--launch`, spawns the game once the devices are set up and waits for it; registers `PttKey` and pumps its OS events every 10 ms (macOS `NSApplication` queue, Windows message queue); owns the cpal input stream (`Microphone`) and the cpal output stream, because cpal streams are not `Send`; sends HELLO and `ECHO_STATE` every 5 s; starts self-test runs, ends them on time and sends `SELF_TEST_RESULT`; shutdown and joins |
+| transmit | `Source::next_frame`, `EchoPath::near_end`, `Transmitter`, `Runtime::transmit`; records a self-test and sends the recording as one talkspurt |
+| receive | polls the UDP sockets (up to 256 datagrams per pass), `Runtime::udp`, `Runtime::tick`, the game socket, ROSTER, `MIC_STATE` and `HALF_DUPLEX`, `HUD_STATUS` batches, `SELF_TEST` requests (a busy one is answered at once) and the test's returned frames |
+| playout | paced by the output queue (or the clock without a device); mixes, mutes, feeds `EchoPath::far_end`, appends to the output queue; adds the self-test tone ahead of the echo reference |
 | resolver | one worker for the STUN name lookup; may block until exit and is never joined |
 | others | cpal callback threads touch only the sample queues; the virtual device runs one thread in test mode; global-hotkey has its own thread on X11; the Ctrl-C handler only sets a flag |
 
-Shared state in `Shared`: atomics for `ptt`, `open_mic`, `half_duplex`, `mic_close`, `done` and the output reset epoch; `Mutex<(Runtime, Network)>`; `Mutex<Mixer>`; `EchoPath` with its own internal lock; the output sample queue and `Mutex<OutputHistory>`, which records which speaker contributed to queued output so a revocation can silence it in place. `Microphone` shares `Arc<Mutex<MicCapture>>` with the transmit thread.
+Shared state in `Shared`: atomics for `ptt`, `open_mic`, `half_duplex`, `mic_close`, `done` and the output reset epoch; `Mutex<(Runtime, Network)>`; `Mutex<Mixer>`; `EchoPath` with its own internal lock; the output sample queue and `Mutex<OutputHistory>`, which records which speaker contributed to queued output so a revocation can silence it in place; `Mutex<SelfTest>`. `Microphone` shares `Arc<Mutex<MicCapture>>` with the transmit thread.
 
-Locks are taken in one order: `MicCapture`, then `Runtime`, then `Mixer`, then the output sample queue, then `OutputHistory`. The trace file, the sent-frame map and the canceller lock are leaves. `pull_playout` holds the `Runtime` lock from the mixer pull through the append to the output queue, so a slice pulled before a POLICY purge cannot be appended after it.
+Locks are taken in one order: `MicCapture`, then `Runtime`, then `Mixer`, then the output sample queue, then `OutputHistory`. The trace file, the sent-frame map, the canceller lock and `SelfTest` are leaves. `pull_playout` holds the `Runtime` lock from the mixer pull through the append to the output queue, so a slice pulled before a POLICY purge cannot be appended after it.
 
 ## Microphone lifecycle
 
@@ -176,6 +176,37 @@ Releasing PTT does not close the microphone; it stays open for pre-roll and echo
 
 Every outcome prints one `self-update:` line, and every failure keeps the running binary. Release procedure and the "never delete a release" rule: [RELEASING.md](RELEASING.md#self-update).
 
+## Self-uninstall and `--launch`
+
+`self_uninstall.rs` runs right after the self-update check, and with `--launch` once more after the game exits.
+
+- **When it acts.** It acts only on the layout the installers write: the executable in `<user-data>/ptt-radio-companion/` beside an `install.json` of version 1 whose `mods_dir` is `<user-data>/mods`. A missing marker means a manual or development install and is never touched. Any other doubt leaves every file in place with one warning.
+- **Seen first.** A check that finds the mod creates an empty `mod-seen` beside the marker (`create_new`, so it never follows a link or rewrites the file; a failed write is one warning). A missing mod without `mod-seen` as a plain file means not installed yet and is kept silently.
+- **What it removes.** When `mod-seen` exists, `mod-list.json` exists in `mods_dir` and no `ptt-radio` entry is left there, it re-checks the marker, deletes the running executable through `self-replace`, and removes only the marker directory, `mod-seen` with it.
+- **Opt-out.** `--no-self-uninstall` or `PTT_RADIO_NO_SELF_UNINSTALL`.
+
+`launch.rs` makes the companion the parent of the game, so the Steam launch option `"<companion>" --launch %command%` brings both up together.
+
+- **Command line.** The game's command line gets `--enable-lua-udp <game-port>` appended unless it already carries that flag.
+- **Startup order.** The game starts only after the companion's devices are set up. If the startup check has just removed the install, the game still starts once, without the companion. The same holds when `run` fails before the spawn (the UDP bind, `Network::bind`, the output device): `launch::run_alone` starts the game without the companion. After the spawn has been tried, an error never starts the game again.
+- **Shutdown.** When the game exits, the companion shuts down as usual and returns the game's exit status. Ctrl-C stops the companion, which does not kill the game itself.
+
+## Echo self-test
+
+`self_test.rs` is the companion side of the mod's Test button, and the packets are `SELF_TEST` and `SELF_TEST_RESULT` in DESIGN.md. On a request it does the following:
+
+1. It plays a 0.5 s tone locally.
+2. It records 3 s through the normal capture gate.
+3. It sends the recording as one talkspurt on the game path.
+4. It plays the copy the game returns, which works because the mod grants a temporary self-monitor in POLICY for the test.
+5. It answers with the counts and the outcome.
+
+Conditions on a run:
+
+- It never presses PTT, so half-duplex does not mute the returned copy.
+- PTT or open mic during a run ends it as busy.
+- The recording is bound to the capture fence of its first frame, that is the `capture_reset` counter and the capture generation. A denied frame or a closed fence drops the recording unsent and ends the run as "transmission not permitted".
+
 ## Cargo features
 
 `default = ["audio", "self-update"]`.
@@ -187,7 +218,7 @@ Every outcome prints one `self-update:` line, and every failure keeps the runnin
 | `ptt-radio-hub` | none | `--no-default-features`, static musl, in `docker/hub.Dockerfile` |
 
 - `audio` pulls cpal, global-hotkey, hound, `is` (ICE), opusic-c (bundled libopus built with cmake and linked statically), sonora, snow, and the macOS `objc2` and Windows `windows-sys` crates for the hotkey event pump. Without it the library compiles only `packet` and `transport` without `transport::lab`, which is all the hub needs.
-- `self-update` pulls flate2, self-replace, semver, serde_json, tar, ureq and zip, and compiles `self_update.rs` and the `--no-self-update` flag into the companion binary.
+- `self-update` pulls flate2, self-replace, semver, serde_json, tar, ureq and zip, and compiles `self_update.rs`, `self_uninstall.rs` and the `--no-self-update` and `--no-self-uninstall` flags into the companion binary.
 
 ## Build, CI and release
 
@@ -229,7 +260,7 @@ A `v*` tag starts `release.yml`:
 | Suite | Where | What it covers | Runs in |
 | --- | --- | --- | --- |
 | Lua: `control`, `channels`, `admin`, `settings_gui` | `mod/tests/*_test.lua` | the real handlers and modules against a small Factorio API fake | CI `lua`, gate |
-| Rust unit tests | `src/**` (`--lib --bins`) | codecs, reorder, jitter, mixer, runtime, policy, self-update, and in `main.rs` the microphone gate and the output purge | CI `test`, gate |
+| Rust unit tests | `src/**` (`--lib --bins`) | codecs, reorder, jitter, mixer, runtime, policy, self-update, self-uninstall, `--launch` parsing, the self-test state machine, and in `main.rs` the microphone gate and the output purge | CI `test`, gate |
 | `bridge_repr` | `tests/` | the emulator's one-representation rule for v1/v2 listeners | CI, gate |
 | `connectivity`, `netlab` | `tests/`, `tests/netlab/` | ICE pairs, discovery and probes; the NAT and link router core | CI, gate |
 | `crypto_sessions` | `tests/` | Noise pairs, key confirmation, rekey, replay | CI, gate |
@@ -239,7 +270,7 @@ A `v*` tag starts `release.yml`:
 | `multiparty_lab` | `tests/` | offline closed-loop echo lab for several players; by default only its metric controls run, the lab itself is `--ignored` and needs `PTT_LAB_*` WAV inputs | CI, gate; the lab by hand |
 | `aec_gate` | `tests/`, `tests/aec_gate/` | offline gated-AEC lab; by default only the metric control runs, the labs are `--ignored` and need WAV inputs | gate (release, real-time lock); the labs by hand |
 | `scenarios` | `tests/scenarios.rs` | real companion processes with virtual audio against the `relay` emulator and the NAT lab: latency, echo, double talk, stalls, route cuts; `quality_sweep` is `--ignored` | gate only, real-time |
-| `policy_playout` | `tests/policy_playout.rs` | real companion processes: revocation, open-mic mute, retune during double talk, channel-group playback; all four tests are `--ignored` | CI compiles only; gate runs them with `--ignored`, real-time |
+| `policy_playout` | `tests/policy_playout.rs` | real companion processes: revocation, open-mic mute, retune during double talk, channel-group playback, the echo self-test, all five `--ignored`; and `--launch` with a stub game (Unix only, not ignored) | the `--launch` test in CI on Linux; gate runs the ignored ones with `--ignored`, real-time |
 
 `tools/gate.sh [--twice] [log dir]` runs every step even after a failure and writes one log per step plus `summary.txt`. The real-time steps (`scenarios`, `aec_gate`, the ignored `policy_playout` tests) hold an `flock` on a shared lock file (`PTT_REALTIME_LOCK`, wait `PTT_REALTIME_WAIT`), because two measurements on one machine disturb each other. A failed real-time test is rerun once by exact name and reported as flaky when the rerun passes. The gate needs `cargo`, `flock`, `lua` and `luac` on `PATH`. How the end-to-end stand and network lab work: [Сквозной стенд без игры](DESIGN.md#сквозной-стенд-без-игры) and [Network lab](DESIGN.md#network-lab).
 

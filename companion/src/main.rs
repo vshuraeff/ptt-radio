@@ -6,6 +6,9 @@
 //! selected route: direct, hub or player-relay UDP, or the game as fallback),
 //! receive (UDP sockets and game -> runtime ticks, signaling and media -> jitter
 //! queues), playout (10 ms ticks: mix -> output device and/or wav).
+//! the in-game echo test (self_test.rs) spans all four: receive files the
+//! request, main starts and times it out, transmit records and sends, playout
+//! plays its tone.
 //! everything OS-specific is in ptt_key.rs; audio goes through cpal, or
 //! through the virtual device (src/virtual_audio.rs) for tests.
 
@@ -276,24 +279,35 @@ fn main() -> ExitCode {
         };
     }
     #[cfg(feature = "self-update")]
-    let (launched, no_self_uninstall) = (!args.launch.is_empty(), args.no_self_uninstall);
-    match run(args) {
+    let no_self_uninstall = args.no_self_uninstall;
+    let (game_argv, game_port) = (args.launch.clone(), args.game_port);
+    let mut game_attempted = false;
+    match run(args, &mut game_attempted) {
         Ok(code) => {
             // the game has exited: the mod may have been removed from its own mod manager
             #[cfg(feature = "self-update")]
-            if launched {
+            if !game_argv.is_empty() {
                 self_uninstall::check(no_self_uninstall);
             }
             code
         }
         Err(err) => {
             eprintln!("error: {err}");
-            ExitCode::FAILURE
+            // a setup failure must not cost the player the game; once spawn was tried,
+            // a second start would be a second instance or a retry of a broken command
+            if game_argv.is_empty() || game_attempted {
+                ExitCode::FAILURE
+            } else {
+                eprintln!("--launch: starting the game without the companion");
+                launch::run_alone(&game_argv, game_port)
+            }
         }
     }
 }
 
-fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
+/// `game_attempted` is set right before the --launch spawn, so an error after it
+/// never starts the game again
+fn run(args: Args, game_attempted: &mut bool) -> Result<ExitCode, Box<dyn Error>> {
     let socket = UdpSocket::bind(("127.0.0.1", args.port)).map_err(|err| {
         format!(
             "cannot bind 127.0.0.1:{}: {err} (another companion or radio.py running?)",
@@ -511,6 +525,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     let mut game = if args.launch.is_empty() {
         None
     } else {
+        *game_attempted = true;
         let child = launch::spawn(&args.launch, args.game_port)?;
         println!("game started (pid {})", child.id());
         Some(child)

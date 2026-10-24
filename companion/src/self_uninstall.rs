@@ -6,11 +6,13 @@
 //! `<user-data>/ptt-radio-companion/` beside an `install.json` of version 1 whose
 //! `mods_dir` is `<user-data>/mods`. a missing marker means a manual or
 //! development install and is never touched; any other doubt leaves every file
-//! in place with one warning. the removal takes the marker directory and nothing
-//! above it. opt-out: --no-self-uninstall or PTT_RADIO_NO_SELF_UNINSTALL=1.
+//! in place with one warning. a check that finds the mod writes `mod-seen` beside
+//! the marker, and only a mod missing after that counts as removed: before it, the
+//! mod is simply not installed yet. the removal takes the marker directory and
+//! nothing above it. opt-out: --no-self-uninstall or PTT_RADIO_NO_SELF_UNINSTALL=1.
 
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -21,12 +23,14 @@ const MARKER: &str = "install.json";
 const INSTALLED_BY: &str = "ptt-radio installer";
 const MOD_LIST: &str = "mod-list.json";
 const MOD: &str = "ptt-radio";
+const SEEN: &str = "mod-seen";
 const OPT_OUT_ENV: &str = "PTT_RADIO_NO_SELF_UNINSTALL";
 const MARKER_LIMIT: u64 = 64 << 10;
 
 #[derive(Debug, PartialEq)]
 enum Verdict {
-    /// not an installer layout, removal configured off, or the mod is installed
+    /// not an installer layout, removal configured off, the mod is installed, or it
+    /// was never seen installed
     Keep,
     /// an installer layout with something in doubt: nothing is removed
     Warn(String),
@@ -104,23 +108,34 @@ fn decide(dir: &Path) -> Verdict {
     if mods_real != default {
         return Verdict::Keep;
     }
-    match fs::symlink_metadata(mods_real.join(MOD_LIST)) {
-        Ok(meta) if meta.is_file() => {}
-        _ => {
-            return Verdict::Warn(format!(
-                "no {MOD_LIST} in {}, not a Factorio mods directory",
-                mods.display()
-            ));
-        }
+    if !is_plain_file(&mods_real.join(MOD_LIST)) {
+        return Verdict::Warn(format!(
+            "no {MOD_LIST} in {}, not a Factorio mods directory",
+            mods.display()
+        ));
     }
+    let seen = dir.join(SEEN);
     match mod_present(&mods_real) {
-        Ok(true) => Verdict::Keep,
-        Ok(false) => Verdict::Remove(format!(
+        // create_new never follows a link and leaves an existing entry as it is
+        Ok(true) => match OpenOptions::new().write(true).create_new(true).open(&seen) {
+            Err(err) if err.kind() != io::ErrorKind::AlreadyExists => {
+                Verdict::Warn(format!("cannot write {}: {err}", seen.display()))
+            }
+            _ => Verdict::Keep,
+        },
+        Ok(false) if is_plain_file(&seen) => Verdict::Remove(format!(
             "the ptt-radio mod is no longer in {}",
             mods.display()
         )),
+        // never seen installed: not installed yet rather than removed
+        Ok(false) => Verdict::Keep,
         Err(err) => Verdict::Warn(format!("cannot list {}: {err}", mods.display())),
     }
+}
+
+/// a plain file at `path` itself, not through a link
+fn is_plain_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// `mods_dir` of a version 1 marker written by the installer, an absolute path
@@ -168,7 +183,7 @@ fn mod_present(mods: &Path) -> io::Result<bool> {
 /// deletes the running executable (scheduled on windows, outside `dir`), then `dir`
 fn remove(dir: &Path, delete_exe: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<()> {
     // the marker is checked again right before anything is deleted
-    if !fs::symlink_metadata(dir.join(MARKER)).is_ok_and(|meta| meta.is_file()) {
+    if !is_plain_file(&dir.join(MARKER)) {
         return Err(io::Error::other("install.json disappeared"));
     }
     delete_exe(dir)?;
@@ -287,6 +302,62 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_install_without_the_mod_is_kept_until_the_mod_was_seen() {
+        let layout = Layout::new("fresh");
+        assert_eq!(layout.verdict(), Verdict::Keep);
+        assert!(layout.dir.join(EXE).is_file());
+        assert!(!layout.dir.join(SEEN).exists());
+    }
+
+    #[test]
+    fn the_mod_present_writes_mod_seen_once() {
+        let layout = Layout::new("seen");
+        fs::write(layout.mods.join("ptt-radio_0.4.0.zip"), b"zip").unwrap();
+        assert_eq!(layout.verdict(), Verdict::Keep);
+        let seen = layout.dir.join(SEEN);
+        assert!(is_plain_file(&seen));
+        assert_eq!(fs::read(&seen).unwrap(), b"");
+        fs::write(&seen, b"kept").unwrap();
+        assert_eq!(layout.verdict(), Verdict::Keep);
+        assert_eq!(fs::read(&seen).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn mod_seen_that_is_not_a_plain_file_never_counts() {
+        let layout = Layout::new("seen-not-file");
+        let seen = layout.dir.join(SEEN);
+        fs::create_dir(&seen).unwrap();
+        assert_eq!(layout.verdict(), Verdict::Keep);
+        fs::remove_dir(&seen).unwrap();
+        #[cfg(unix)]
+        {
+            let target = layout.root.join("seen-target");
+            std::os::unix::fs::symlink(&target, &seen).unwrap();
+            fs::create_dir(layout.mods.join("ptt-radio")).unwrap();
+            assert_eq!(layout.verdict(), Verdict::Keep);
+            assert!(!target.exists(), "the link was followed");
+            fs::remove_dir(layout.mods.join("ptt-radio")).unwrap();
+            fs::write(&target, b"").unwrap();
+            assert_eq!(layout.verdict(), Verdict::Keep);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_install_dir_with_the_mod_present_only_warns() {
+        use std::os::unix::fs::PermissionsExt;
+        let layout = Layout::new("seen-unwritable");
+        fs::write(layout.mods.join("ptt-radio_0.4.0.zip"), b"zip").unwrap();
+        fs::set_permissions(&layout.dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let verdict = layout.verdict();
+        let written = layout.dir.join(SEEN).exists();
+        fs::set_permissions(&layout.dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // root ignores the mode and writes the file anyway
+        assert!(warns(verdict) || written, "unwritable dir");
+        assert!(layout.dir.join(EXE).is_file());
+    }
+
+    #[test]
     fn the_mod_as_a_zip_or_a_directory_keeps_the_install() {
         let layout = Layout::new("present");
         let zip = layout.mods.join("ptt-radio_0.4.0.zip");
@@ -324,9 +395,13 @@ mod tests {
     }
 
     #[test]
-    fn the_mod_absent_removes_only_the_install_dir() {
+    fn the_mod_absent_after_it_was_seen_removes_only_the_install_dir() {
         let layout = Layout::new("absent");
         fs::write(layout.mods.join("other-mod_1.0.0.zip"), b"zip").unwrap();
+        let zip = layout.mods.join("ptt-radio_0.4.0.zip");
+        fs::write(&zip, b"zip").unwrap();
+        assert_eq!(layout.verdict(), Verdict::Keep);
+        fs::remove_file(&zip).unwrap();
         let dir = layout.dir.canonicalize().unwrap();
         let Verdict::Remove(reason) = decide(&dir) else {
             panic!("the mod is absent");
