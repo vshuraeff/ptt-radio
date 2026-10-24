@@ -152,6 +152,128 @@ fn lost_noise1_noise2_metadata_confirmation_and_ack_recover_without_media() {
 }
 
 #[test]
+fn lost_confirmation_pong_then_any_valid_kind_activates_pending_key() {
+    for suite in [Suite::Aes256Gcm, Suite::ChaChaPoly] {
+        for kind in [Kind::Start, Kind::Voice, Kind::Stop, Kind::Ping, Kind::Pong] {
+            let now = Instant::now();
+            let (mut a, mut b) = pair(suite);
+            let first = a.begin(1, ReceiverHandle(100), now).unwrap();
+            let second = b
+                .on_signal(10, &first.signals[0], ReceiverHandle(101), now)
+                .unwrap();
+            let confirmation = a
+                .on_signal(20, &second.signals[0], ReceiverHandle(0), now)
+                .unwrap();
+            let Signal::KeyConfirmation { token, .. } = confirmation.signals[0] else {
+                panic!("confirmation metadata")
+            };
+            assert!(
+                b.receive(&confirmation.datagrams[0], now)
+                    .unwrap()
+                    .actions
+                    .activated
+            );
+            // every confirmation PONG is lost; this unrelated packet proves possession.
+            let probe = (token ^ 1).to_be_bytes();
+            let body = match kind {
+                Kind::Voice => &[1, 2, 3][..],
+                Kind::Ping | Kind::Pong => &probe,
+                Kind::Start | Kind::Stop => &[],
+            };
+            let packet = b
+                .encrypt(Inner {
+                    kind,
+                    sequence: 37,
+                    talkspurt: 23,
+                    body,
+                })
+                .unwrap();
+            let mut bad_tag = packet.clone();
+            *bad_tag.last_mut().unwrap() ^= 1;
+            assert!(matches!(a.receive(&bad_tag, now), Err(Error::Crypto)));
+            let mut bad_counter = packet.clone();
+            bad_counter[6..10].copy_from_slice(&u32::MAX.to_be_bytes());
+            assert!(matches!(a.receive(&bad_counter, now), Err(Error::Crypto)));
+            let mut bad_kind = packet.clone();
+            bad_kind[0] = if kind == Kind::Start {
+                Kind::Voice
+            } else {
+                Kind::Start
+            } as u8;
+            assert!(matches!(a.receive(&bad_kind, now), Err(Error::Codec(_))));
+            assert_eq!(a.active_epoch(), None);
+
+            let received = a.receive(&packet, now).unwrap();
+            assert!(received.actions.activated, "{suite:?} {kind:?}");
+            assert_eq!(received.packet.kind, kind);
+            assert_eq!(received.packet.sequence, 37);
+            assert_eq!(received.packet.talkspurt, 23);
+            assert_eq!(received.packet.body, body);
+            assert_eq!(received.packet.context.sender.player, 20);
+            assert_eq!(received.packet.context.sender.generation, (1 << 40) + 1);
+            assert_eq!(received.packet.context.receiver.player, 10);
+            assert_eq!(received.packet.context.key_epoch, 1);
+            assert_eq!(
+                received.actions.datagrams.len(),
+                usize::from(kind == Kind::Ping)
+            );
+            if kind == Kind::Ping {
+                let reply = b.receive(&received.actions.datagrams[0], now).unwrap();
+                assert_eq!(reply.packet.kind, Kind::Pong);
+                assert_eq!(reply.packet.body, probe);
+                assert!(reply.actions.datagrams.is_empty());
+            }
+            assert!(a.retry().unwrap().signals.is_empty());
+            assert!(a.retry().unwrap().datagrams.is_empty());
+            assert!(matches!(a.receive(&packet, now), Err(Error::Replay)));
+        }
+    }
+}
+
+#[test]
+fn media_after_lost_rekey_pong_activates_and_retains_old_key_window() {
+    for suite in [Suite::Aes256Gcm, Suite::ChaChaPoly] {
+        let now = Instant::now();
+        let (mut a, mut b) = pair(suite);
+        connect(&mut a, &mut b, 1, 100, now);
+        let seen = voice(&mut b, 1);
+        let delayed = voice(&mut b, 2);
+        let expired = voice(&mut b, 3);
+        let identity = a.receive(&seen, now).unwrap().packet.context.sender;
+        let first = a.begin(2, ReceiverHandle(200), now).unwrap();
+        let second = b
+            .on_signal(10, &first.signals[0], ReceiverHandle(201), now)
+            .unwrap();
+        let confirmation = a
+            .on_signal(20, &second.signals[0], ReceiverHandle(0), now)
+            .unwrap();
+        b.receive(&confirmation.datagrams[0], now).unwrap();
+        assert!(matches!(a.receive(&seen, now), Err(Error::Replay)));
+        assert_eq!(a.active_epoch(), Some(1));
+        let media = voice(&mut b, 4);
+        let received = a.receive(&media, now).unwrap();
+        assert!(received.actions.activated);
+        assert_eq!(received.packet.context.sender, identity);
+        assert_eq!(received.packet.context.key_epoch, 2);
+        assert_eq!(received.packet.sequence, 4);
+        assert_eq!(a.active_epoch(), Some(2));
+        assert!(a.retry().unwrap().signals.is_empty());
+        assert!(a.retry().unwrap().datagrams.is_empty());
+        assert!(matches!(a.receive(&media, now), Err(Error::Replay)));
+        assert!(matches!(a.receive(&seen, now), Err(Error::Replay)));
+        let old = a
+            .receive(&delayed, now + Duration::from_millis(4999))
+            .unwrap();
+        assert_eq!(old.packet.context.key_epoch, 1);
+        assert_eq!(old.packet.context.sender, identity);
+        assert!(matches!(
+            a.receive(&expired, now + Duration::from_secs(5)),
+            Err(Error::WrongReceiver)
+        ));
+    }
+}
+
+#[test]
 fn failed_auth_counter_type_receiver_and_phase_do_not_advance_window() {
     let now = Instant::now();
     let (mut a, mut b) = pair(Suite::ChaChaPoly);
