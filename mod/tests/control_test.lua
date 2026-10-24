@@ -267,12 +267,12 @@ local function only(index, data)
   local rows = to(index)
   assert(#rows == 1 and rows[1] == data, "listener " .. index .. " got " .. #rows)
 end
-for _, body in ipairs({ "", "0.4.0", "0.4.0v2", "0.4.0 v2 ", "0.4.0 V2", "v2" }) do
+for _, body in ipairs({ "", "0.4.0", "0.4.0v2", "0.4.0 V2" }) do
   emit(1, packet(1, 0, body))
   assert(storage.v2[1] == nil, body)
 end
 -- the token is read from the body, not the header
-emit(1, packet(1, 32, "v2"))
+emit(1, packet(1, 32, "0.4.0"))
 assert(storage.v2[1] == nil)
 emit(1, packet(1, 0, " v2"))
 assert(storage.v2[1] == true)
@@ -521,4 +521,239 @@ storage.radio_policy.muted[2] = true
 script.configure({})
 assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
 
-print("control.lua: routing, audience, identity, plaque, hud, bounds and 0.2.0/0.3.0 migration passed")
+local function link_record(sender, generation, talkspurt, level, route, delay_class)
+  return u16(sender) .. generation .. u16(talkspurt) .. string.char(level, route, delay_class)
+end
+local function status(...)
+  local records = { ... }
+  return packet(0x0A, 0, string.char(1, #records) .. table.concat(records))
+end
+local function byte_at(data, at, value) return data:sub(1, at - 1) .. string.char(value) .. data:sub(at + 1) end
+local function level(viewer, sender)
+  local links = storage.hud.links[viewer]
+  return links and links[sender] and links[sender].level
+end
+local vector_gen = string.char(1, 2, 3, 4, 5, 6, 7, 8)
+local good = link_record(2, vector_gen, 7, 3, 1, 1)
+local shared_vector = string.char(0x52, 1, 0x0A, 0, 0, 1, 1, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 7, 3, 1, 1)
+assert(status(good) == shared_vector)
+
+-- exact whitespace-delimited capability tokens, independent of order and future tokens
+for _, case in ipairs({
+  { "tester hud1 v2 pol1", true, true }, { "tester pol1 v2 hud1", true, true },
+  { "tester\tv2\nhud1", true, true }, { "tester v2", true, false },
+  { "tester hud1", false, true }, { "tester xv2 v20 hud10 xhud1", false, false },
+  { "", false, false },
+}) do
+  setup()
+  emit(1, packet(1, 0, case[1]))
+  assert((storage.v2[1] ~= nil) == case[2] and (storage.hud1[1] ~= nil) == case[3])
+end
+
+-- no capability means unknown; the shared vector repaints only its actual reporter
+setup()
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+assert(level(1, 2) == nil)
+emit(1, packet(1, 0, "tester v2"), 3)
+emit(1, shared_vector, 4)
+assert(level(1, 2) == nil and tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+emit(1, packet(1, 0, "tester hud1 v2 pol1"), 5)
+local own_root, other_root = hud_root(1), hud_root(3)
+local own_bars, other_bars = tail(1, 2).bars, tail(3, 2).bars
+emit(1, shared_vector, 6)
+assert(level(1, 2) == 3 and level(3, 2) == nil)
+emit(0, shared_vector, 6)
+emit(4, shared_vector, 6)
+assert(level(1, 2) == 3 and level(3, 2) == nil)
+assert(hud_root(1) == own_root and hud_root(3) == other_root and tail(1, 2).bars == own_bars)
+assert(own_bars.children[3].value == 1 and own_bars.children[1].style.color.g == 0.85)
+assert(other_bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+assert(own_bars.tooltip[2][1] == "ptt-radio.hud-route-1" and own_bars.tooltip[3][1] == "ptt-radio.hud-delay-1")
+-- the reserved header field cannot select another reporter
+emit(1, packet(0x0A, 3, string.char(1, 1) .. good), 7)
+assert(level(1, 2) == 3 and level(3, 2) == nil)
+for route = 0, 3 do
+  for delay_class = 0, 3 do
+    local measured = (route + delay_class) % 4
+    emit(1, status(link_record(2, vector_gen, 7, measured, route, delay_class)), 8)
+    assert(level(1, 2) == measured)
+    assert(own_bars.tooltip[2][1] == "ptt-radio.hud-route-" .. route)
+    assert(own_bars.tooltip[3][1] == "ptt-radio.hud-delay-" .. delay_class)
+    if measured == 0 then
+      assert(own_bars.tooltip[1] == "ptt-radio.hud-link-unknown-details")
+      for _, segment in ipairs(own_bars.children) do assert(segment.style.color.r == 0.45) end
+    end
+  end
+end
+
+-- a later malformed record rejects the entire packet before the first can repaint
+emit(1, status(link_record(2, vector_gen, 7, 2, 0, 0)), 9)
+local before = storage.hud.links[1][2]
+for _, bad in ipairs({
+  "", "R", shared_vector:sub(1, 6), shared_vector:sub(1, -2), shared_vector .. "x",
+  byte_at(shared_vector, 1, 0x51), byte_at(shared_vector, 2, 2), byte_at(shared_vector, 6, 2),
+  byte_at(shared_vector, 7, 2), byte_at(shared_vector, 20, 4), byte_at(shared_vector, 21, 4), byte_at(shared_vector, 22, 4),
+  packet(0x0A, 0, string.char(1, 33) .. string.rep(good, 33)),
+  status(good, link_record(2, vector_gen, 7, 4, 0, 0)),
+  status(good, link_record(2, vector_gen, 7, 1, 4, 0)),
+  status(good, link_record(2, vector_gen, 7, 1, 0, 4)),
+}) do
+  emit(1, bad, 10)
+  assert(storage.hud.links[1][2] == before and level(1, 2) == 2)
+end
+emit(1, status(), 11)
+assert(storage.hud.links[1][2] == before)
+local maximum = packet(0x0A, 0, string.char(1, 32) .. string.rep(good, 32))
+assert(#maximum == 487)
+emit(1, maximum, 12)
+assert(level(1, 2) == 3)
+
+-- mismatched records are ignored individually; only active current identities qualify
+emit(3, packet(2), 13)
+emit(1, status(link_record(1, vector_gen, 7, 1, 0, 0), link_record(2, gen, 7, 1, 0, 0),
+  link_record(3, vector_gen, 7, 3, 0, 0), link_record(2, vector_gen, 6, 1, 0, 0), link_record(2, vector_gen, 7, 2, 2, 0)), 13)
+assert(level(1, 1) == nil and level(1, 2) == 2 and level(1, 3) == nil)
+local current = storage.hud.links[1][2]
+emit(2, v2(9, vector_gen, 6), 14)
+assert(storage.hud.links[1][2] == current)
+emit(2, v2(7, vector_gen, 8), 15)
+assert(level(1, 2) == nil)
+emit(1, shared_vector, 16)
+assert(level(1, 2) == nil)
+emit(1, status(link_record(2, vector_gen, 8, 3, 3, 0)), 17)
+local current_row, current_link = hud_root(1).ptt_radio_hud_2, storage.hud.links[1][2]
+emit(2, v2(7, vector_gen, 8), 18)
+assert(hud_root(1).ptt_radio_hud_2 == current_row and storage.hud.links[1][2] == current_link)
+emit(2, v2(7, gen, 1), 19)
+assert(level(1, 2) == nil)
+emit(1, status(link_record(2, vector_gen, 8, 3, 0, 0)), 20)
+assert(level(1, 2) == nil)
+emit(1, status(link_record(2, gen, 1, 2, 2, 0)), 21)
+emit(2, v2(9, vector_gen, 8), 22)
+assert(level(1, 2) == 2)
+emit(2, v2(9, gen, 1), 23)
+assert(level(1, 2) == nil and stack(1) == "3")
+emit(1, status(link_record(2, gen, 1, 3, 0, 0)), 24)
+assert(level(1, 2) == nil and stack(1) == "3")
+
+-- a repeat hello keeps identity/ui; capability loss and disconnect clear only that receiver
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(3, packet(1, 0, "tester v2 hud1 pol1"))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+emit(3, status(link_record(2, vector_gen, 7, 1, 0, 0)), 3)
+local own, other = storage.hud.links[1][2], storage.hud.links[3][2]
+local row = hud_root(1).ptt_radio_hud_2
+emit(1, packet(1, 0, "tester-next pol1 v2 hud1"), 4)
+assert(storage.hud.links[1][2] == own and hud_root(1).ptt_radio_hud_2 == row)
+emit(1, packet(1, 0, "tester v2 pol1"), 5)
+assert(level(1, 2) == nil and storage.hud.links[3][2] == other)
+emit(1, shared_vector, 6)
+assert(level(1, 2) == nil)
+emit(1, packet(1, 0, "tester hud1 v2"), 7)
+emit(1, shared_vector, 8)
+players[1].connected = false
+emit(1, status(link_record(2, vector_gen, 7, 1, 0, 0)), 9)
+assert(level(1, 2) == 3)
+handlers.on_player_left_game({ player_index = 1 })
+assert(storage.hud1[1] == nil and level(1, 2) == nil and storage.hud.links[3][2] == other)
+
+-- companion timeout clears reporter capability and its cached measurements
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+emit(2, v2(8, vector_gen, 7, "opus"), 960)
+nth[60]({ tick = 960 })
+assert(storage.hud1[1] == nil and storage.companions[1] == nil and level(1, 2) == nil)
+assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+emit(1, shared_vector, 961)
+assert(level(1, 2) == nil)
+
+-- eligibility comes from the injected predicate, including future radio-off/denial state
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(3, packet(1, 0, "tester hud1 v2"))
+emit(2, v2(7, vector_gen, 7), 1)
+players[3].force.index = 2
+settings.global["ptt-radio-scope"].value = "force"
+handlers.on_player_changed_force({ player_index = 3 })
+emit(3, shared_vector, 2)
+emit(1, shared_vector, 2)
+assert(level(3, 2) == nil and level(1, 2) == 3 and hud_root(3) == nil)
+local hud_links = require("hud")
+local visible = hud_links.visible
+hud_links.visible = function(sender, viewer) return viewer ~= 1 and visible(sender, viewer) end
+handlers.on_player_changed_force({ player_index = 1 })
+emit(1, shared_vector, 3)
+assert(level(1, 2) == nil and hud_root(1) == nil)
+hud_links.visible = visible
+handlers.on_player_changed_force({ player_index = 1 })
+assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+
+-- five-second expiry is exact, independent per receiver, and refreshed by a four-second heartbeat
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(3, packet(1, 0, "tester hud1 v2"))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 10)
+emit(3, shared_vector, 20)
+local first_bars, third_bars = tail(1, 2).bars, tail(3, 2).bars
+game.tick = 309; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == 3 and level(3, 2) == 3)
+game.tick = 310; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == nil and level(3, 2) == 3 and tail(1, 2).bars == first_bars)
+assert(first_bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+game.tick = 320; handlers.on_tick({ tick = game.tick })
+assert(level(3, 2) == nil and tail(3, 2).bars == third_bars)
+emit(1, shared_vector, 330)
+game.tick = 569; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == 3)
+emit(1, shared_vector, 570)
+game.tick = 630; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == 3)
+game.tick = 869; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == 3)
+game.tick = 870; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == nil)
+
+-- echo still replaces the bars; hidden measurements expire before the bars return
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(2, packet(1))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+emit(2, packet(5, 0, "\1"), 3)
+assert(tail(1, 2).bars == nil)
+emit(1, status(link_record(2, vector_gen, 7, 2, 1, 0)), 4)
+assert(level(1, 2) == 2 and tail(1, 2).bars == nil)
+game.tick = 304; handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == nil and tail(1, 2).bars == nil)
+emit(2, packet(5, 0, "\0"), 305)
+assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+
+-- the existing lost-stop timeout also clears quality and a stale report cannot reopen a row
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+game.tick = 32; nth[15]({ tick = game.tick })
+assert(level(1, 2) == nil and hud_root(1) == nil)
+emit(1, shared_vector, 33)
+assert(level(1, 2) == nil and hud_root(1) == nil)
+
+-- configuration preserves dated reports, while an undated old cached link expires immediately
+setup()
+emit(1, packet(1, 0, "tester hud1 v2"))
+emit(2, v2(7, vector_gen, 7), 1)
+emit(1, shared_vector, 2)
+script.configure({})
+assert(level(1, 2) == 3 and storage.hud1[1])
+storage.hud.next_expiry, storage.hud.links[1][2].tick = nil, nil
+script.configure({})
+handlers.on_tick({ tick = game.tick })
+assert(level(1, 2) == nil and tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+
+print("control.lua: routing, audience, identity, hud quality, bounds, expiry and migration passed")
