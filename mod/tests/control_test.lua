@@ -334,4 +334,13 @@ clear()
 emit(1, packet(1))
 expect_audience(1, "", "")
 
-print("control.lua: routing, audience, identity, plaque and bounds passed")
+-- a 0.2.0 save holds only the old tables; the version bump runs on_configuration_changed
+setup()
+storage = { speakers = {}, companions = {}, open_mic = {} }
+script.configure({})
+emit(1, packet(1))
+expect_audience(1, "2,3", "0,2,3")
+handlers.on_player_joined_game({ player_index = 2 })
+assert(storage.v2 and storage.echo_sources and storage.talks and #storage.audience_revision == 8)
+
+print("control.lua: routing, audience, identity, plaque, bounds and 0.2.0 migration passed")

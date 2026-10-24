@@ -5,9 +5,11 @@
 //! challenge expiry. secrets and challenges come from the OS CSPRNG.
 //!
 //! the hub runs it as player 0 (transport/hub.rs, src/bin/ptt-radio-hub.rs). a companion
-//! acting as player relay for pairs that chose it runs the same `Relay` with its own
-//! player index and `fresh_generation()`, `offer`s grants for those pairs, feeds game
-//! SIGNAL to `on_signal`, and hands the datagrams `claims` accepts on its socket to `handle`.
+//! acting as player relay for two peers it has live direct routes to runs the same `Relay`
+//! with its own player index and its announced stream generation, which each endpoint
+//! checks against the ANNOUNCE it selected for that relay. it `issue`s and `renew`s the
+//! grants itself and sends them as RelayGrant SIGNAL (runtime.rs), feeds game SIGNAL to
+//! `on_signal`, and hands the datagrams `claims` accepts on its socket to `handle`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -201,7 +203,7 @@ fn random<const N: usize>() -> Option<[u8; N]> {
     Some(out)
 }
 
-fn grant_frames(grant: RelayGrant) -> Vec<Outgoing> {
+pub(crate) fn grant_frames(grant: RelayGrant) -> Vec<Outgoing> {
     let to = [grant.sender, grant.recipient];
     let signal = Signal::RelayGrant(grant);
     to.into_iter()

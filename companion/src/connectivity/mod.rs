@@ -402,6 +402,12 @@ impl PairConnectivity {
         }
     }
 
+    /// a pair rebuilt for a remote that may still hold an earlier pair's snapshot
+    /// starts at that pair's floor, before its first description is published.
+    pub fn start_at_restart_generation(&mut self, floor: u32) {
+        self.restart_generation = self.restart_generation.max(floor);
+    }
+
     pub fn local_candidates(&self) -> Vec<String> {
         self.agent
             .local_candidates()

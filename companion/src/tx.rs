@@ -9,11 +9,10 @@ use opusic_c::{Application, Bitrate, Channels, Encoder, InbandFec, SampleRate};
 
 use crate::audio::OPUS_RATE;
 use crate::packet::{self, START, STOP, VOICE};
+use crate::transport::wire::MAX_OPUS;
 
 /// audio captured before the press, the frame in progress included
 const PREROLL_MS: usize = 120;
-// opus never produces more than 1275 bytes per frame
-const MAX_PACKET: usize = 1275;
 
 /// encoder settings (--frame-ms, --bitrate, --complexity, --fec). a receiver needs none
 /// of them: opus packets carry their own duration
@@ -135,7 +134,9 @@ impl Transmitter {
     }
 
     fn voice(&mut self, pcm: &[f32]) -> Vec<u8> {
-        let mut buf = [0u8; MAX_PACKET];
+        // libopus fits each packet into the buffer it is given, so every frame fits every
+        // route, the relay's included; opus alone would allow 1275 bytes
+        let mut buf = [0u8; MAX_OPUS];
         let len = self
             .encoder
             .encode_float_to_slice(pcm, &mut buf)
@@ -235,6 +236,50 @@ mod tests {
         assert_eq!(kinds(&tx.frame(&silence())), [VOICE, STOP, STOP]);
         tx.set_open_mic(false);
         assert!(tx.frame(&silence()).is_empty());
+    }
+
+    #[test]
+    fn the_highest_bitrate_on_noise_still_fits_the_transport_cap() {
+        use crate::transport::StreamId;
+        use crate::transport::wire::{self, GameMedia, Kind};
+        let codec = Codec {
+            bitrate: 512_000,
+            complexity: 10,
+            ..Codec::default()
+        };
+        let mut tx = Transmitter::new(codec).unwrap();
+        tx.set_ptt(true);
+        let mut state = 1u32;
+        let mut largest = 0;
+        for _ in 0..50 {
+            let pcm: Vec<f32> = (0..codec.frame_samples())
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+                })
+                .collect();
+            for p in tx.frame(&pcm).iter().filter(|p| p[2] == VOICE) {
+                let opus = &p[5..];
+                largest = largest.max(opus.len());
+                let media = GameMedia {
+                    stream: StreamId {
+                        player: 1,
+                        generation: 1,
+                    },
+                    kind: Kind::Voice,
+                    sequence: 1,
+                    talkspurt: 1,
+                    opus,
+                };
+                assert!(
+                    wire::encode_game(media, false).is_ok(),
+                    "{} bytes",
+                    opus.len()
+                );
+            }
+        }
+        // the encoder runs at the cap, so a larger buffer would have overrun it
+        assert!(largest > MAX_OPUS * 9 / 10, "{largest}");
     }
 
     #[test]

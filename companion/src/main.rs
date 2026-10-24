@@ -2,8 +2,10 @@
 //! for signaling, compatibility and fallback. see ../DESIGN.md.
 //!
 //! threads: main (OS events for the PTT key, HELLO heartbeat, auto-ptt),
-//! transmit (capture or tone -> opus -> game), receive (game -> jitter queues),
-//! playout (10 ms ticks: mix -> output device and/or wav).
+//! transmit (capture or tone -> opus -> runtime, which sends each frame on the
+//! selected route: direct, hub or player-relay UDP, or the game as fallback),
+//! receive (UDP sockets and game -> runtime ticks, signaling and media -> jitter
+//! queues), playout (10 ms ticks: mix -> output device and/or wav).
 //! everything OS-specific is in ptt_key.rs; audio goes through cpal, or
 //! through the virtual device (src/virtual_audio.rs) for tests.
 
@@ -58,7 +60,8 @@ struct Args {
     /// UDP port this companion listens on (mod setting ptt-radio-companion-port)
     #[arg(long, default_value_t = 34555)]
     port: u16,
-    /// Opus bitrate in bit/s
+    /// Opus bitrate in bit/s; the encoder keeps every packet within the transport's
+    /// 1164-byte Opus cap, about 465 kbit/s at 20 ms frames
     #[arg(long, default_value_t = 16_000, value_parser = clap::value_parser!(u32).range(500..=512_000))]
     bitrate: u32,
     /// acoustic echo cancellation, selected only after an echo path is detected
@@ -70,7 +73,8 @@ struct Args {
     /// Opus encoder complexity, 0 (cheapest) ..= 10
     #[arg(long, default_value_t = 9, value_parser = clap::value_parser!(u8).range(0..=10))]
     complexity: u8,
-    /// Opus in-band FEC (costs bits; only a lost packet uses it, and the game loses none)
+    /// Opus in-band FEC (costs bits; only a lost packet uses it: UDP routes can lose
+    /// packets, the game fallback loses none)
     #[arg(long)]
     fec: bool,
     /// global push-to-talk key in global-hotkey syntax, e.g. F8, F13, shift+F8; "none" registers no key

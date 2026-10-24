@@ -32,7 +32,6 @@ path = "src/bin/ptt-radio-hub.rs"
 cpu-time = "1.0"
 dtln-runtime-lab = { path = "experiments/dtln-runtime" }
 rustfft = "6.4"
-sonora = "=0.2.0"
 
 # the macOS event loop the global hotkey needs (see src/ptt_key.rs)
 [target.'cfg(target_os = "macos")'.dependencies]

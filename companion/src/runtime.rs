@@ -11,7 +11,7 @@ use crate::connectivity::{
 };
 use crate::crypto::{self, Session, StaticKeypair};
 use crate::packet;
-use crate::transport::relay::{BindClient, CHALLENGE_MS, Limits, Relay, Reply};
+use crate::transport::relay::{BindClient, CHALLENGE_MS, Limits, Relay, Reply, grant_frames};
 use crate::transport::signaling::{self, Announce, Audience, RelayGrant, Signal, Suite};
 use crate::transport::wire::{self, Bind, Datagram, GameMedia, Inner, Kind, ReceiverHandle};
 use crate::transport::{Path, StreamId};
@@ -1403,6 +1403,59 @@ mod tests {
                 .any(|o| matches!(o,Output::Game(bytes) if bytes[2]==wire::GAME_START))
         );
     }
+
+    #[test]
+    fn review_regression_pair_recreated_after_roster_removal_reconverges_on_udp() {
+        // the mod sends ROSTER only to connected players: the side that rebuilds the pair
+        // is the one still in the game, and the player who left keeps its old snapshot
+        for (rebuilder, stale_first) in [(0, false), (0, true), (1, false), (1, true)] {
+            let holder = 1 - rebuilder;
+            let rebuilder_player = rebuilder as u16 + 1;
+            let mut pair = Pair::new();
+            pair.advance(2500);
+            assert_eq!(pair.active(holder), Path::Direct);
+            pair.peers[rebuilder]
+                .roster(vec![rebuilder_player], pair.now)
+                .unwrap();
+            pair.advance(3000);
+            assert_eq!(pair.active(holder), Path::Game);
+            pair.peers[rebuilder].roster(vec![1, 2], pair.now).unwrap();
+            if stale_first {
+                // the holder's republished pre-removal snapshot overtakes the new pair's
+                let stale = signaling::encode_game(
+                    &Signal::Announce(pair.peers[holder].peers[&rebuilder_player].local.clone()),
+                    holder as u16 + 1,
+                    true,
+                )
+                .unwrap();
+                pair.peers[rebuilder].game(&stale, pair.now).unwrap();
+            }
+            pair.advance(5000);
+            let case = format!("rebuilder {rebuilder} stale_first {stale_first}");
+            for i in 0..2 {
+                let peer = &pair.peers[i].peers[&(2 - i as u16)];
+                assert!(
+                    peer.session
+                        .as_ref()
+                        .is_some_and(|s| s.active_epoch().is_some()),
+                    "{case}: {:?}",
+                    pair.traces
+                );
+                assert_ne!(pair.active(i), Path::Game, "{case}");
+            }
+            pair.datagrams.clear();
+            pair.media.clear();
+            pair.peers[holder].transmit(&packet::encode(packet::VOICE, 9, &[7]), pair.now);
+            pair.flush();
+            assert!(pair.datagrams.iter().any(|(i, d)| *i == holder && matches!(wire::decode_datagram(d), Ok(Datagram::Encrypted { header, .. }) if header.kind == Kind::Voice)), "{case}");
+            assert!(
+                pair.media
+                    .iter()
+                    .any(|(i, m)| *i == rebuilder && m.sequence == 9 && m.kind == Kind::Voice),
+                "{case}"
+            );
+        }
+    }
 }
 
 pub struct Media {
@@ -1549,6 +1602,10 @@ struct Peer {
     retry_until: Option<Instant>,
     next_retry: Instant,
     waiting_reset: bool,
+    /// no handshake message has verified against this pair's snapshots yet. a newer
+    /// remote snapshot then answers our own announce, so it does not restart ours:
+    /// restarting would answer an answer, and both sides would restart without end.
+    unconfirmed: bool,
     deferred_rekey: bool,
     bindings: BTreeMap<(u16, u32), Binding>,
     choice: Choice,
@@ -1570,6 +1627,10 @@ pub struct Runtime {
     audience_blocked: bool,
     relay: Option<Relay>,
     offers: BTreeMap<(u16, u16), (u32, u64, u64)>,
+    /// above every restart generation a removed pair announced. the mod sends ROSTER
+    /// only to connected players, so a player who left keeps our old snapshot; a
+    /// rebuilt pair starting here is a restart to it, not a mutation it drops.
+    restart_floor: u32,
     next_handle: u32,
     out: VecDeque<Output>,
     talkspurt: u16,
@@ -1601,6 +1662,7 @@ impl Runtime {
             audience_blocked: false,
             relay: None,
             offers: BTreeMap::new(),
+            restart_floor: 0,
             next_handle: 0,
             out: VecDeque::new(),
             talkspurt: 0,
@@ -1697,7 +1759,11 @@ impl Runtime {
             .filter(|p| !self.roster.contains(p))
             .collect();
         for player in removed {
-            self.peers.remove(&player);
+            if let Some(peer) = self.peers.remove(&player) {
+                self.restart_floor = self
+                    .restart_floor
+                    .max(peer.local.ice.restart_generation.saturating_add(1));
+            }
         }
         for remote in self.roster.clone() {
             if remote == local || remote == 0 || self.peers.contains_key(&remote) {
@@ -1729,6 +1795,7 @@ impl Runtime {
                 now,
             )?;
             ice.probes_mut().register(Path::Game, now);
+            ice.start_at_restart_generation(self.restart_floor);
             let description = self.description(&ice);
             self.signal(remote, &Signal::Announce(description.clone()));
             self.peers.insert(
@@ -1742,6 +1809,7 @@ impl Runtime {
                     retry_until: None,
                     next_retry: now,
                     waiting_reset: false,
+                    unconfirmed: true,
                     deferred_rekey: false,
                     bindings: BTreeMap::new(),
                     choice: Choice::default(),
@@ -1931,7 +1999,7 @@ impl Runtime {
                     }
                     peer.retired.push_back(old.stream_generation);
                 }
-                if !peer.waiting_reset {
+                if !peer.waiting_reset && !peer.unconfirmed {
                     peer.ice.restart(now)?;
                     peer.local = self.description(&peer.ice);
                 }
@@ -1984,7 +2052,11 @@ impl Runtime {
             let handle = self.handle()?;
             if let Some(session) = &mut peer.session {
                 match session.on_signal(sender, signal, handle, now) {
-                    Ok(actions) => self.crypto_actions(sender, peer, actions, None, now),
+                    Ok(actions) => {
+                        // a KK message only verifies when both sides hold the same snapshots
+                        peer.unconfirmed = false;
+                        self.crypto_actions(sender, peer, actions, None, now)
+                    }
                     Err(crypto::Error::PhaseInUse) => {
                         peer.next_retry = now + RETRY;
                         peer.deferred_rekey = true;
@@ -2776,29 +2848,23 @@ impl Runtime {
                     relay.issue(a, b, now_ms)
                 };
                 if let Ok(grant) = grant {
-                    for to in [a, b] {
-                        if let Some(frame) = crate::transport::relay::Outgoing::signal(
-                            to,
-                            &Signal::RelayGrant(grant.clone()),
-                        ) {
-                            self.out.push_back(Output::Game(frame.frame));
-                        }
-                    }
                     self.offers.insert((a, b), (grant.session, ag, bg));
+                    self.out.extend(
+                        grant_frames(grant)
+                            .into_iter()
+                            .map(|f| Output::Game(f.frame)),
+                    );
                 }
             }
         }
         if publish {
             for (session, _, _) in self.offers.values() {
                 if let Some(grant) = relay.live(now_ms).find(|g| g.session == *session) {
-                    for to in [grant.sender, grant.recipient] {
-                        if let Some(frame) = crate::transport::relay::Outgoing::signal(
-                            to,
-                            &Signal::RelayGrant(grant.clone()),
-                        ) {
-                            self.out.push_back(Output::Game(frame.frame));
-                        }
-                    }
+                    self.out.extend(
+                        grant_frames(grant.clone())
+                            .into_iter()
+                            .map(|f| Output::Game(f.frame)),
+                    );
                 }
             }
         }
