@@ -7,7 +7,10 @@
 //!   player's own index) to that player's companion;
 //! - START/VOICE/STOP are forwarded to every other player's companion, and to
 //!   the sender's own one when its echo setting is on, with the sender's
-//!   player index in place of the first two bytes of the companion header.
+//!   player index in place of the first two bytes of the companion header;
+//! - so are the v2 kinds START2/VOICE2/STOP2 (transport::wire, 0x07-0x09):
+//!   the same header rewrite puts the index before seq, generation and
+//!   talkspurt, as the future mod does. today's mod ignores these kinds.
 //!
 //! transport model, after the measurements in udp-probe/README.md: every packet
 //! takes `delay` plus a uniform random part of `jitter`, is delivered on the
@@ -27,6 +30,7 @@ use std::time::{Duration, Instant};
 use crate::packet::{
     self, ECHO_STATE, HALF_DUPLEX, HELLO, MAGIC, MIC_STATE, ROSTER, START, STOP, VERSION, VOICE,
 };
+use crate::transport::wire::{GAME_START, GAME_STOP, GAME_VOICE};
 
 pub const TICK: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
@@ -288,7 +292,7 @@ fn tick(
                     );
                 }
                 // like the mod, forward whatever follows the 3-byte header, however short
-                kind @ (START | VOICE | STOP) => {
+                kind @ (START | VOICE | STOP | GAME_START | GAME_VOICE | GAME_STOP) => {
                     let out = packet::encode(kind, sender_index, &p.payload[3..]);
                     for (listener, player) in players.iter().enumerate() {
                         if listener != p.player || player.echo {
@@ -319,6 +323,8 @@ const COLORS: [(u8, u8, u8); 4] = [(255, 0, 10), (40, 120, 255), (60, 200, 60), 
 mod tests {
     use super::*;
     use crate::packet::Incoming;
+    use crate::transport::StreamId;
+    use crate::transport::wire::{self, GameMedia, Kind};
 
     fn companion() -> UdpSocket {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -408,6 +414,29 @@ mod tests {
         b.send_to(&packet::encode(VOICE, 9, &[3]), game(2)).unwrap();
         assert_eq!(packet::parse(&recv(&b)), Some(voice(2, 9, &[3])));
         assert_eq!(packet::parse(&recv(&a)), Some(voice(2, 9, &[3])));
+        // v2: the game puts the sender's index before seq, generation and talkspurt
+        let v2 = |player, kind, opus| GameMedia {
+            kind,
+            stream: StreamId {
+                player,
+                generation: 0x0102_0304_0506_0708,
+            },
+            sequence: 10,
+            talkspurt: 3,
+            opus,
+        };
+        for (kind, opus) in [
+            (Kind::Start, &[][..]),
+            (Kind::Voice, &[4, 0]),
+            (Kind::Stop, &[]),
+        ] {
+            a.send_to(
+                &wire::encode_game(v2(0, kind, opus), false).unwrap(),
+                game(1),
+            )
+            .unwrap();
+            assert_eq!(wire::decode_game(&recv(&b)), Ok(v2(1, kind, opus)));
+        }
 
         let report = relay.stop();
         assert_eq!(report.hellos, 1);
@@ -431,7 +460,13 @@ mod tests {
                 .iter()
                 .map(|d| (d.sender, d.kind, d.seq))
                 .collect::<Vec<_>>(),
-            [(1, VOICE, 7), (2, VOICE, 9)]
+            [
+                (1, VOICE, 7),
+                (2, VOICE, 9),
+                (1, GAME_START, 10),
+                (1, GAME_VOICE, 10),
+                (1, GAME_STOP, 10)
+            ]
         );
         assert!(report.deliveries[0].delivered_us >= report.deliveries[0].received_us + 5_000);
     }
