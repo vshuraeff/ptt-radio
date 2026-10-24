@@ -647,8 +647,8 @@ impl Session {
         self.active.as_mut().ok_or(Error::NotReady)?.send(inner)
     }
 
-    /// accepts only an already unwrapped encrypted datagram. replay is committed
-    /// after both authentication and complete inner/confirmation validation.
+    /// accepts only an already unwrapped encrypted datagram. any authenticated,
+    /// inner-valid packet confirms a pending key; replay commits after validation.
     pub fn receive(&mut self, bytes: &[u8], now: Instant) -> Result<Reception, Error> {
         self.expire(now);
         let Datagram::Encrypted { header, ciphertext } = wire::decode_datagram(bytes)? else {
@@ -687,20 +687,6 @@ impl Session {
             key.noise
                 .read_message(context.nonce(header.counter), ciphertext, &mut plaintext)?;
         let inner = wire::decode_inner(&plaintext[..length], header.kind)?;
-        if pending {
-            let expected = if self.local.player < self.remote.player {
-                Kind::Pong
-            } else {
-                Kind::Ping
-            };
-            if inner.kind != expected
-                || inner.sequence != 0
-                || inner.talkspurt != 0
-                || inner.body != key.token.to_be_bytes()
-            {
-                return Err(Error::InvalidConfirmation);
-            }
-        }
         if !key.replay.commit_authenticated(header.counter) {
             return Err(Error::Replay);
         }
@@ -808,42 +794,28 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_invalid_inner_and_confirmation_do_not_commit_or_activate() {
+    fn authenticated_invalid_inner_does_not_commit_or_activate() {
         let now = Instant::now();
         let (mut a, mut b) = pair();
         let ping = pending(&mut a, &mut b, now);
         let key = a.pending.as_ref().unwrap();
-        let mut wrong = key.token.to_be_bytes();
-        wrong[0] ^= 1;
-        let invalid = wire::encode_inner(Inner {
-            kind: Kind::Ping,
-            sequence: 0,
-            talkspurt: 0,
-            body: &wrong,
-        })
-        .unwrap();
+        let invalid = [Kind::Ping as u8, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7];
         assert!(matches!(
             b.receive(&forged(key, &invalid, Kind::Ping, 0), now),
-            Err(Error::InvalidConfirmation)
+            Err(Error::Codec(CodecError::Invalid))
         ));
-        let premature = wire::encode_inner(start()).unwrap();
+        let invalid_start = [Kind::Start as u8, 0, 1, 0, 1, 9];
         assert!(matches!(
-            b.receive(&forged(key, &premature, Kind::Start, 0), now),
-            Err(Error::InvalidConfirmation)
+            b.receive(&forged(key, &invalid_start, Kind::Start, 0), now),
+            Err(Error::Codec(CodecError::Invalid))
         ));
         assert_eq!(b.active_epoch(), None);
         let pong = b.receive(&ping.datagrams[0], now).unwrap();
         let key = b.active.as_ref().unwrap();
-        let wrong_ack = wire::encode_inner(Inner {
-            kind: Kind::Pong,
-            sequence: 1,
-            talkspurt: 0,
-            body: &key.token.to_be_bytes(),
-        })
-        .unwrap();
+        let invalid_pong = [Kind::Pong as u8, 0, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         assert!(matches!(
-            a.receive(&forged(key, &wrong_ack, Kind::Pong, 0), now),
-            Err(Error::InvalidConfirmation)
+            a.receive(&forged(key, &invalid_pong, Kind::Pong, 0), now),
+            Err(Error::Codec(CodecError::Invalid))
         ));
         a.receive(&pong.actions.datagrams[0], now).unwrap();
         let key = a.active.as_ref().unwrap();
@@ -859,6 +831,24 @@ mod tests {
             Err(Error::Codec(CodecError::Invalid))
         ));
         b.receive(&a.encrypt(start()).unwrap(), now).unwrap();
+    }
+
+    #[test]
+    fn authenticated_start_can_activate_responder_before_confirmation_ping() {
+        let now = Instant::now();
+        let (mut a, mut b) = pair();
+        let delayed_ping = pending(&mut a, &mut b, now);
+        let media = a.pending.as_mut().unwrap().send(start()).unwrap();
+        let received = b.receive(&media, now).unwrap();
+        assert!(received.actions.activated);
+        assert_eq!(received.packet.kind, Kind::Start);
+        assert!(received.actions.datagrams.is_empty());
+        assert!(matches!(b.receive(&media, now), Err(Error::Replay)));
+        let response = b.encrypt(start()).unwrap();
+        assert!(a.receive(&response, now).unwrap().actions.activated);
+        let confirmation = b.receive(&delayed_ping.datagrams[0], now).unwrap();
+        assert!(!confirmation.actions.activated);
+        assert_eq!(confirmation.actions.datagrams.len(), 1);
     }
 
     #[test]
