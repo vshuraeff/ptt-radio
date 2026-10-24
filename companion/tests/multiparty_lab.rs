@@ -394,8 +394,29 @@ fn scenarios() -> [Scenario; 2] {
 
 /// one-way delay from one player's capture to another's receive queue output
 fn path(from: &Seat, to: &Seat) -> usize {
-    (ms(from.ping_ms) + GAME + ms(to.ping_ms)).div_ceil(TICK) * TICK + RECEIVE
+    PATH_MODEL.with(|model| match model.get() {
+        PathModel::Game => {
+            (ms(from.ping_ms) + GAME + ms(to.ping_ms)).div_ceil(TICK) * TICK + RECEIVE
+        }
+        PathModel::Direct => {
+            ms(match (from.name, to.name) {
+                ("A", "B") | ("B", "A") => 15,
+                ("A", "C") | ("C", "A") => 35,
+                _ => 25,
+            }) + RECEIVE
+        }
+        PathModel::Hub => ms(from.ping_ms + to.ping_ms) + RECEIVE,
+    })
 }
+
+#[derive(Clone, Copy)]
+enum PathModel {
+    Game,
+    Direct,
+    Hub,
+}
+
+thread_local! { static PATH_MODEL: std::cell::Cell<PathModel> = const { std::cell::Cell::new(PathModel::Game) }; }
 
 fn room_ir() -> Vec<f32> {
     let mut ir = vec![0.0f32; ms(50)];
@@ -1209,6 +1230,16 @@ fn write(path: &Path, samples: &[f32]) {
 #[test]
 #[ignore = "long offline multi-party echo lab; run explicitly in release"]
 fn multiparty_lab() {
+    let model = std::env::var("PTT_LAB_PATH").unwrap_or_else(|_| "game".into());
+    PATH_MODEL.set(match model.as_str() {
+        "game" => PathModel::Game,
+        "direct" => PathModel::Direct,
+        "hub" => PathModel::Hub,
+        _ => panic!("PTT_LAB_PATH must be game, direct or hub"),
+    });
+    println!(
+        "path model: {model}; direct A-B/A-C/B-C = 15/35/25 ms one way; hub uses each seat's two legs; receive queue unchanged"
+    );
     let voice = |var: &str| {
         let path = std::env::var(var).unwrap_or_else(|_| panic!("set {var}"));
         normalise(read_wav(Path::new(&path)).unwrap())
