@@ -128,6 +128,10 @@ pub enum Signal {
     RekeyRequest {
         session_generation: u64,
     },
+    GameProbe {
+        probe: u64,
+        reply: bool,
+    },
 }
 
 fn write_bytes(out: &mut Vec<u8>, bytes: &[u8], max: usize) -> Result<(), CodecError> {
@@ -345,6 +349,11 @@ pub fn encode(signal: &Signal) -> Result<Vec<u8>, CodecError> {
             out.push(10);
             out.extend_from_slice(&session_generation.to_be_bytes());
         }
+        Signal::GameProbe { probe, reply } => {
+            out.push(11);
+            out.extend_from_slice(&probe.to_be_bytes());
+            out.push(u8::from(*reply));
+        }
     }
     bounded(out)
 }
@@ -440,6 +449,14 @@ pub fn decode(data: &[u8]) -> Result<Signal, CodecError> {
         },
         10 => Signal::RekeyRequest {
             session_generation: r.u64()?,
+        },
+        11 => Signal::GameProbe {
+            probe: r.u64()?,
+            reply: match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(CodecError::Invalid),
+            },
         },
         _ => return Err(CodecError::UnknownType),
     };
