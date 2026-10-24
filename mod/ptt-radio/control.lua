@@ -10,6 +10,8 @@
 -- all state is driven by game.tick: ticks stop during saves and pauses, so a
 -- timeout cannot fire on a delivery stall.
 
+local channels = require("channels")
+
 local MAGIC = 0x52
 local VERSION = 1
 
@@ -363,6 +365,7 @@ local function init_storage()
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
   storage.audience_revision = storage.audience_revision or string.rep(string.char(0), 8)
+  channels.init()
 end
 
 script.on_init(init_storage)

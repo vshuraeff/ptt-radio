@@ -1,4 +1,6 @@
 local handlers, nth, sent, sounds, players
+local control = arg[1] or "ptt-radio/mod/ptt-radio/control.lua"
+package.path = string.gsub(control, "control%.lua$", "?.lua") .. ";" .. package.path
 local function element(root, name)
   local item = { style = {}, valid = true, name = name }
   item.add = function(spec)
@@ -44,7 +46,7 @@ local function setup()
     }
   end
   game.connected_players = { players[3], players[1], players[2] }
-  dofile(arg[1] or "ptt-radio/mod/ptt-radio/control.lua")
+  dofile(control)
   script.init()
 end
 
@@ -342,5 +344,16 @@ emit(1, packet(1))
 expect_audience(1, "2,3", "0,2,3")
 handlers.on_player_joined_game({ player_index = 2 })
 assert(storage.v2 and storage.echo_sources and storage.talks and #storage.audience_revision == 8)
+assert(storage.radio and storage.radio_policy.deny)
 
-print("control.lua: routing, audience, identity, plaque, bounds and 0.2.0 migration passed")
+-- a 0.3.0 save has no radio tables; existing radio state survives a second configure
+setup()
+storage = { speakers = {}, companions = {}, v2 = {}, open_mic = {}, echo_sources = {}, talks = {}, audience_revision = string.rep("\0", 8) }
+script.configure({})
+assert(storage.radio and storage.radio_policy.muted and storage.radio_policy.publishers)
+storage.radio[1] = { tx = "item/iron-plate", rx = {}, presets = {} }
+storage.radio_policy.muted[2] = true
+script.configure({})
+assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
+
+print("control.lua: routing, audience, identity, plaque, bounds and 0.2.0/0.3.0 migration passed")
