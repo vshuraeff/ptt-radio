@@ -1,0 +1,93 @@
+name: Hub
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix
+        required: true
+        default: 0.4.0
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: x86_64
+          - platform: linux/arm64
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: tools/check-version.sh "v$VERSION"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build static hub
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/hub.Dockerfile
+          target: binary
+          platforms: ${{ matrix.platform }}
+          outputs: type=local,dest=dist
+      - name: Package hub
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cp LICENSE dist/LICENSE
+          tar -czf "ptt-radio-hub-$VERSION-linux-$ARCH.tar.gz" -C dist ptt-radio-hub LICENSE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hub-linux-${{ matrix.arch }}
+          path: ptt-radio-hub-${{ inputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: binaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/vshuraeff/ptt-radio-hub
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/vshuraeff/ptt-radio
+            org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.version=${{ inputs.version }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/hub.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: VERSION=${{ inputs.version }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}

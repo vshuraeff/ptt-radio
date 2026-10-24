@@ -2,21 +2,35 @@
 //! harness: the game relay emulator (src/bin/relay.rs) and the end-to-end
 //! scenarios (tests/scenarios.rs). see ../DESIGN.md.
 
+#[cfg(feature = "audio")]
 pub mod audio;
+#[cfg(feature = "audio")]
 pub mod connectivity;
+#[cfg(feature = "audio")]
 pub mod crypto;
+#[cfg(feature = "audio")]
 pub mod echo;
+#[cfg(feature = "audio")]
 pub mod jitter;
+#[cfg(feature = "audio")]
 pub mod mix;
 pub mod packet;
+#[cfg(feature = "audio")]
 pub mod policy;
+#[cfg(feature = "audio")]
 pub mod quality;
+#[cfg(feature = "audio")]
 pub mod relay;
+#[cfg(feature = "audio")]
 pub mod reorder;
+#[cfg(feature = "audio")]
 pub mod runtime;
+#[cfg(feature = "audio")]
 pub mod runtime_io;
 pub mod transport;
+#[cfg(feature = "audio")]
 pub mod tx;
+#[cfg(feature = "audio")]
 pub mod virtual_audio;
 
 use std::time::{SystemTime, UNIX_EPOCH};

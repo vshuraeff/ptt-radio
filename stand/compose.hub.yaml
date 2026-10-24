@@ -9,8 +9,8 @@ services:
 
   hub:
     build:
-      context: ../companion
-      dockerfile: ../stand/Dockerfile.hub
+      context: ..
+      dockerfile: docker/hub.Dockerfile
     container_name: ptt-radio-hub
     network_mode: "service:factorio"
     depends_on:
