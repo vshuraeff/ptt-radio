@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["audio"]
-audio = ["dep:cpal", "dep:global-hotkey", "dep:hound", "dep:is", "dep:opusic-c", "dep:sonora", "dep:snow", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+audio = ["dep:cpal", "dep:global-hotkey", "dep:hound", "dep:is", "dep:opusic-c", "dep:sonora", "dep:snow", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:windows-sys"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -52,3 +52,7 @@ rustfft = "6.4"
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSApplication", "NSEvent", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSDate", "NSRunLoop", "NSString"] }
+
+# the win32 message pump the global hotkey needs (see src/ptt_key.rs); the version global-hotkey uses
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

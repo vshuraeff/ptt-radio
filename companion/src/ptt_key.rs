@@ -4,7 +4,7 @@
 //! (RegisterHotKey) and Linux X11. each OS needs its events dispatched on the
 //! thread that created the manager, which `poll` does on the main thread:
 //! - macOS: the NSApplication event queue (implemented)
-//! - Windows: a win32 message loop (not yet: the fallback below only sleeps)
+//! - Windows: the thread's win32 message queue, which carries WM_HOTKEY (implemented)
 //! - Linux: X11 is served by global-hotkey's own thread; Wayland needs the
 //!   GlobalShortcuts portal instead (not yet)
 //!
@@ -95,10 +95,39 @@ impl EventPump {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
 struct EventPump;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+impl EventPump {
+    fn new() -> Self {
+        EventPump
+    }
+
+    // global-hotkey receives WM_HOTKEY in a hidden window owned by the thread that created
+    // the manager, so that thread has to dispatch its message queue
+    fn wait(&self, timeout: Duration) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            TranslateMessage,
+        };
+        let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        // SAFETY: no handles are waited on; MSG is plain data the calls fill in
+        unsafe {
+            MsgWaitForMultipleObjects(0, std::ptr::null(), 0, ms, QS_ALLINPUT);
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+struct EventPump;
+
+#[cfg(not(any(target_os = "macos", windows)))]
 impl EventPump {
     fn new() -> Self {
         EventPump
