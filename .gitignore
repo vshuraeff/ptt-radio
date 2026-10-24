@@ -1,0 +1,6 @@
+.DS_Store
+/companion/target/
+**/saves/
+*.log
+/logs/
+/client-mods/mod-settings.dat

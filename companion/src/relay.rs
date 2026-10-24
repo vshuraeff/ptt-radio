@@ -14,7 +14,8 @@
 //! - opaque SIGNAL follows the roster independently of force-scoped media;
 //!   optional player 0 registers its server-only companion port with HELLO.
 //!
-//! transport model, after the measurements in udp-probe/README.md: every packet
+//! transport model from a local macos client and linux vm server measurement
+//! (client-server-client p50 ~85 ms, p95 ~95 ms): every packet
 //! takes `delay` plus a uniform random part of `jitter`, is delivered on the
 //! next 60 Hz game tick, never overtakes an earlier packet and is never lost.
 //! a stall (autosave, pause) stops the ticks; what queued up meanwhile is

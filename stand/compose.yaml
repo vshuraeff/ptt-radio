@@ -1,7 +1,10 @@
-# headless 2.1.23 server with the ptt-radio mod; reuses the udp-probe server image
+# headless 2.1.23 server with the ptt-radio mod
 services:
   factorio:
-    build: ../../udp-probe/server
+    build:
+      context: ./server
+      platforms:
+        - linux/amd64
     container_name: ptt-radio-factorio
     ports:
       - "34197:34197/udp"
