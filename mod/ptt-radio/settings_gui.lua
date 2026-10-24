@@ -35,14 +35,15 @@ local PRESET_BUTTONS = {
 }
 
 -- injected by control.lua: the audience-changed callback and the optional admin section
-local on_changed, render_admin
+local on_changed, render_admin, start_self_test
 
-function settings_gui.configure(changed, admin_section)
-  on_changed, render_admin = changed, admin_section
+function settings_gui.configure(changed, admin_section, test)
+  on_changed, render_admin, start_self_test = changed, admin_section, test
 end
 
 function settings_gui.init()
   storage.settings_gui = storage.settings_gui or { message = {} }
+  storage.settings_gui.translations = storage.settings_gui.translations or {}
 end
 
 local function text(key, ...)
@@ -101,8 +102,8 @@ local function heading(parent, key)
   parent.add({ type = "label", caption = text(key), style = "bold_label" })
 end
 
-local function note(parent, caption_text, color, tooltip)
-  local label = parent.add({ type = "label", caption = caption_text, tooltip = tooltip })
+local function note(parent, caption_text, color, tooltip, name)
+  local label = parent.add({ type = "label", name = name, caption = caption_text, tooltip = tooltip })
   label.style.single_line = false
   label.style.maximal_width = BODY_WIDTH
   if color then label.style.font_color = color end
@@ -243,19 +244,69 @@ local function known_section(body, player, s, known)
   end
 end
 
+local function companion_status(player)
+  local index = player.index
+  if not (storage.companions and storage.companions[index]) then return text("companion-offline") end
+  local version = storage.companion_versions and storage.companion_versions[index]
+  if not version then return text("companion-connected-unknown") end
+  local mod_version = script.active_mods["ptt-radio"]
+  local comparison = helpers.compare_versions(version, mod_version)
+  return text("companion-connected", version, mod_version,
+    text(comparison < 0 and "companion-older" or comparison > 0 and "companion-newer" or "companion-matching"))
+end
+
+local function test_status(player)
+  return storage.companion_test_status and storage.companion_test_status[player.index] or text("test-idle")
+end
+
+local function companion_section(body, player)
+  local section = body.add({ type = "flow", name = PREFIX .. "companion", direction = "vertical" })
+  heading(section, "companion-title")
+  note(section, text("companion-why"))
+  note(section, text("companion-trust"), GREY)
+  note(section, companion_status(player), nil, nil, PREFIX .. "companion-status")
+  note(section, text("companion-copy"), GREY)
+  for _, key in ipairs({ "install-macos", "install-linux", "install-windows", "steam-macos", "steam-linux", "steam-windows", "repository", "wiki" }) do
+    note(section, text("companion-" .. key))
+    local box = section.add({ type = "text-box", name = PREFIX .. key })
+    box.read_only, box.selectable, box.word_wrap = true, true, true
+    box.style.width = BODY_WIDTH
+    box.style.height = 64
+    -- text-box.text takes a string, so resolve the locale through the player's client.
+    local id = player.request_translation(text("companion-" .. key .. "-text"))
+    storage.settings_gui.translations[player.index][id] = box
+  end
+  note(section, text("test-hint"), GREY)
+  control(section, { type = "button", caption = text("test-button") }, "self-test")
+  note(section, test_status(player), nil, nil, PREFIX .. "test-status")
+end
+
+-- heartbeats and test results update only their labels, preserving edits elsewhere.
+function settings_gui.refresh_companion(player)
+  local frame = player.gui.screen[WINDOW]
+  local pane = frame and frame[PREFIX .. "pane"]
+  local body = pane and pane[PREFIX .. "body"]
+  local section = body and body[PREFIX .. "companion"]
+  if section then
+    section[PREFIX .. "companion-status"].caption = companion_status(player)
+    section[PREFIX .. "test-status"].caption = test_status(player)
+  end
+end
+
 local function build(player, focus)
   local screen = player.gui.screen
   local old = screen[WINDOW]
   local location = old and old.location
   local was_opened = old ~= nil and player.opened == old
   if old then old.destroy() end
+  storage.settings_gui.translations[player.index] = {}
   local frame = screen.add({ type = "frame", name = WINDOW, direction = "vertical" })
   if location then frame.location = location else frame.auto_center = true end
   titlebar(frame)
-  local pane = frame.add({ type = "scroll-pane" })
+  local pane = frame.add({ type = "scroll-pane", name = PREFIX .. "pane" })
   pane.style.maximal_height = MAX_HEIGHT
   pane.style.minimal_width = BODY_WIDTH
-  local body = pane.add({ type = "flow", direction = "vertical" })
+  local body = pane.add({ type = "flow", name = PREFIX .. "body", direction = "vertical" })
   local s, known = channels.state(player.index), channels.known(player.index)
   local message = storage.settings_gui.message[player.index]
   if message then note(body, message, RED).name = STATUS end
@@ -263,6 +314,7 @@ local function build(player, focus)
     and not (storage.pol1 and storage.pol1[player.index]) then
     note(body, text("upgrade-required"), RED)
   end
+  companion_section(body, player)
   off_section(body, s)
   tx_section(body, player, s)
   rx_section(body, player, s, known)
@@ -283,6 +335,7 @@ end
 
 function settings_gui.close(player)
   storage.settings_gui.message[player.index] = nil
+  storage.settings_gui.translations[player.index] = nil
   local frame = player.gui.screen[WINDOW]
   if frame then frame.destroy() end
 end
@@ -371,6 +424,10 @@ local function dispatcher(handlers)
     local element = event.element
     if not (element and element.valid and string.sub(element.name or "", 1, #PREFIX) == PREFIX) then return false end
     local tags = element.tags or {}
+    if handlers == CLICK and tags.action == "self-test" then
+      if start_self_test then start_self_test(game.get_player(event.player_index)) end
+      return true
+    end
     local handler = handlers[tags.action]
     if handler then
       local player = game.get_player(event.player_index)
@@ -383,6 +440,14 @@ end
 settings_gui.on_gui_click = dispatcher(CLICK)
 settings_gui.on_gui_elem_changed = dispatcher(ELEM)
 settings_gui.on_gui_checked_state_changed = dispatcher(CHECKED)
+
+function settings_gui.on_string_translated(event)
+  local pending = storage.settings_gui.translations[event.player_index]
+  local box = pending and pending[event.id]
+  if not box then return end
+  pending[event.id] = nil
+  if box.valid and event.translated then box.text = event.result end
+end
 
 function settings_gui.on_gui_closed(event)
   local element = event.element

@@ -39,6 +39,8 @@ local MAX_RETIRED_GENERATIONS = 16
 local STALE_TICKS = 30
 -- the companion sends HELLO every 5 s; three missed heartbeats mean it is gone
 local COMPANION_TIMEOUT_TICKS = 15 * 60
+local SELF_TEST_TICKS = 15 * 60
+local COMPANION_NOTICE_TICKS = 10 * 60
 -- the gui.left speaker frame of 0.3.0 and earlier, removed on configuration change
 local OLD_BADGE = "ptt_radio_badge"
 local SHORTCUT = "ptt-radio-open-mic"
@@ -215,7 +217,8 @@ local function policy_snapshot()
     local ready = media_ready(index)
     local row = { send_to = {}, receive_from = {}, receive = {}, hears = {}, tx = ready and channels.tx_permitted(index), channel = channels.tx(index) }
     local player = index ~= 0 and game.get_player(index) or nil
-    row.self = row.tx and player ~= nil and player.mod_settings["ptt-radio-echo"].value
+    row.self = row.tx and player ~= nil and (player.mod_settings["ptt-radio-echo"].value
+      or storage.self_tests[index] ~= nil)
       and channels.eligible(index, index) or false
     local hud_members = {}
     for _, other in ipairs(indices) do
@@ -299,7 +302,31 @@ admin.configure(function()
   audience_changed()
   for _, player in pairs(game.connected_players) do settings_gui.refresh(player) end
 end)
-settings_gui.configure(audience_changed, admin.render)
+local function finish_self_test(index, status)
+  storage.self_tests[index] = nil
+  storage.companion_test_status[index] = status
+  audience_changed()
+  local player = game.get_player(index)
+  if player then settings_gui.refresh_companion(player) end
+end
+
+local function start_self_test(player)
+  local index = player.index
+  if storage.self_tests[index] then
+    storage.companion_test_status[index] = { "ptt-radio-settings.test-running" }
+  elseif not media_ready(index) then
+    storage.companion_test_status[index] = { "ptt-radio-settings.test-unavailable" }
+  else
+    storage.self_test_sequence = (storage.self_test_sequence + 1) % 65536
+    storage.self_tests[index] = { id = storage.self_test_sequence, deadline = game.tick + SELF_TEST_TICKS }
+    storage.companion_test_status[index] = { "ptt-radio-settings.test-pending" }
+    audience_changed()
+    send_to_companion(index, encode_self_test(storage.self_test_sequence))
+  end
+  settings_gui.refresh_companion(player)
+end
+
+settings_gui.configure(audience_changed, admin.render, start_self_test)
 
 local function forward_signal(sender_index, payload)
   if #payload < 5 or #payload - 5 > MAX_SIGNAL_BODY then return end
@@ -338,6 +365,7 @@ end
 local function toggle_open_mic(player)
   if not storage.companions[player.index] then
     player.print({ "ptt-radio.no-companion" })
+    settings_gui.open(player)
     return
   end
   set_open_mic(player, not storage.open_mic[player.index])
@@ -346,6 +374,7 @@ end
 local function companion_seen(player, tick)
   local was_online = storage.companions[player.index] ~= nil
   storage.companions[player.index] = tick
+  storage.companion_notices[player.index] = nil
   if not was_online then
     player.print({ "ptt-radio.companion-online" })
   end
@@ -360,15 +389,27 @@ local function forget_companion(player_index)
   storage.hud1[player_index] = nil
   storage.pol1[player_index] = nil
   storage.open_mic[player_index] = nil
+  storage.companion_versions[player_index] = nil
+  if storage.self_tests[player_index] then
+    storage.self_tests[player_index] = nil
+    storage.companion_test_status[player_index] = { "ptt-radio-settings.test-disconnected" }
+  end
   set_echo(player_index, false)
   storage.talks[player_index] = nil
   storage.speakers[player_index] = nil
   hud.stop(player_index)
   local player = player_index ~= 0 and game.get_player(player_index) or nil
-  if player then hud.clear_links(player) end
+  if player then
+    hud.clear_links(player)
+    settings_gui.refresh_companion(player)
+  end
 end
 
 local function hello_capabilities(player, payload)
+  local version = string.match(string.sub(payload, 6), "^ptt%-radio%-companion (%S+)")
+  local major, minor, patch = string.match(version or "", "^(%d+)%.(%d+)%.(%d+)$")
+  if not major or tonumber(major) > 65535 or tonumber(minor) > 65535 or tonumber(patch) > 65535 then version = nil end
+  storage.companion_versions[player.index] = version
   local v2, hud1, pol1
   for token in string.gmatch(string.sub(payload, 6), "%S+") do
     if token == "v2" then v2 = true end
@@ -514,6 +555,11 @@ local function init_storage()
   storage.hud1 = storage.hud1 or {}
   storage.pol1 = storage.pol1 or {}
   storage.open_mic = storage.open_mic or {}
+  storage.companion_versions = storage.companion_versions or {}
+  storage.companion_notices = storage.companion_notices or {}
+  storage.self_tests = storage.self_tests or {}
+  storage.self_test_sequence = storage.self_test_sequence or 0
+  storage.companion_test_status = storage.companion_test_status or {}
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
   storage.audience_revision = storage.audience_revision or string.rep(string.char(0), 8)
@@ -525,6 +571,9 @@ local function init_storage()
   storage.physical_surfaces = storage.physical_surfaces or {}
   for _, player in pairs(game.connected_players) do
     storage.physical_surfaces[player.index] = player.physical_surface.index
+    if not storage.companions[player.index] then
+      storage.companion_notices[player.index] = game.tick + COMPANION_NOTICE_TICKS
+    end
   end
   hud.init()
   channels.init()
@@ -554,6 +603,21 @@ end)
 on_event(defines.events.on_tick, function(event)
   helpers.recv_udp()
   hud.expire(event.tick)
+  for index, pending in pairs(storage.self_tests) do
+    if event.tick >= pending.deadline then
+      finish_self_test(index, { "ptt-radio-settings.test-timeout" })
+    end
+  end
+  for index, deadline in pairs(storage.companion_notices) do
+    if event.tick >= deadline then
+      storage.companion_notices[index] = nil
+      local player = game.get_player(index)
+      if player and player.connected and not storage.companions[index] then
+        player.print({ "ptt-radio-settings.companion-notice" })
+        settings_gui.open(player)
+      end
+    end
+  end
 end)
 
 on_event(defines.events.on_udp_packet_received, function(event)
@@ -580,9 +644,24 @@ on_event(defines.events.on_udp_packet_received, function(event)
     elseif sender_index ~= 0 then
       local player = game.get_player(sender_index)
       local changed = hello_capabilities(player, payload) or not storage.companions[player.index]
+      if not storage.pol1[player.index] and storage.self_tests[player.index] then
+        storage.self_tests[player.index] = nil
+        storage.companion_test_status[player.index] = { "ptt-radio-settings.test-disconnected" }
+      end
       companion_seen(player, event.tick)
       if not ((changed or not storage.policy_snapshot) and audience_changed()) then send_audience(player.index) end
       if changed then settings_gui.refresh(player) end
+      settings_gui.refresh_companion(player)
+    end
+  elseif kind == SELF_TEST_RESULT then
+    local pending = storage.self_tests[sender_index]
+    local result = pending and parse_self_test_result(payload)
+    if result and result.test_id == pending.id and event.tick < pending.deadline then
+      finish_self_test(sender_index, { "ptt-radio-settings.test-result",
+        { "ptt-radio-settings.test-outcome-" .. result.outcome },
+        { result.tone == 1 and "ptt-radio-settings.test-tone-yes" or "ptt-radio-settings.test-tone-no" },
+        result.mic_peak_dbfs == -128 and { "ptt-radio-settings.test-no-capture" } or result.mic_peak_dbfs,
+        result.frames_sent, result.frames_returned, result.first_return_ms })
     end
   elseif kind == HUD_STATUS then
     receive_hud_status(sender_index, payload)
@@ -657,6 +736,8 @@ end)
 
 on_event(defines.events.on_player_joined_game, function(event)
   local player = game.get_player(event.player_index)
+  forget_companion(player.index)
+  storage.companion_notices[player.index] = game.tick + COMPANION_NOTICE_TICKS
   player.set_shortcut_toggled(SHORTCUT, storage.open_mic[player.index] ~= nil)
   hud.render(player)
   render_echo_panel(player)
@@ -681,12 +762,14 @@ on_event(defines.events.on_gui_elem_changed, function(event)
 end)
 on_event(defines.events.on_gui_checked_state_changed, settings_gui.on_gui_checked_state_changed)
 on_event(defines.events.on_gui_closed, settings_gui.on_gui_closed)
+on_event(defines.events.on_string_translated, settings_gui.on_string_translated)
 
 on_event(defines.events.on_player_left_game, function(event)
   if storage.speakers[event.player_index] then
     set_speaking(event.player_index, false)
   end
   forget_companion(event.player_index)
+  storage.companion_notices[event.player_index] = nil
   game.get_player(event.player_index).set_shortcut_toggled(SHORTCUT, false)
   send_roster_to_all()
   audience_changed()

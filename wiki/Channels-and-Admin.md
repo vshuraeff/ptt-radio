@@ -18,7 +18,7 @@ The map setting *Who hears the radio* stays the outer limit: with *Own force onl
 
 Open it with `ALT + SHIFT + V` or the radio-and-cog button on the shortcut bar. The radio button next to it toggles the open microphone. Close the window with `Esc`, the same key again, or the button in its title bar.
 
-From top to bottom:
+The **Companion** section comes first, followed by these radio controls from top to bottom:
 
 1. **Radio off.** Turns the radio off completely: you receive nothing, the administrator channel and server messages included, and you cannot transmit. Administrator locks do not affect this switch.
 2. **Transmit channel (TX).** Pick a signal, or press *ANY* or *Here*. An empty signal, a parameter, *each*, *anything* or *everything* is refused: the window says why and keeps your previous channel. To create a new channel, pick a signal nobody uses yet. If an administrator muted you, the section says *Transmission is forbidden by the administrator.*
@@ -27,6 +27,16 @@ From top to bottom:
 5. **Known channels.** Each channel with its icon, the number of listeners, and an *admin* mark on the admin channel. Click one to transmit on it.
 
 When the server's rules forbid something, the control is greyed out and its hover text names the rule.
+
+### Companion setup and test
+
+The Companion section explains why voice needs a separate app and provides selectable, read-only installer commands for macOS, Linux and Windows, Steam launch examples, and the source repository and wiki URLs. Copy a command into your system terminal to install the app. For Steam, use the exact launch option printed by the installer, especially if you chose a custom install directory. The window also notes the GPL-3.0 source licence and release checksums.
+
+Status shows whether the companion is connected and compares the version in its greeting with the mod version. An older or unrecognised companion may need updating. If no greeting arrives within 10 seconds of joining, the window opens once for that session with a short chat reminder. The open-microphone shortcut also opens it when no companion is connected.
+
+**Test microphone and game loopback** plays a local tone, records three seconds from your microphone, sends the recording through the game, and plays back the returned audio. Your channel listeners can hear the recording; the usual transmission rules still apply. The result reports the tone, microphone peak in dBFS, frames sent and returned, and time to the first returned frame, or explains a permission, microphone, missing-return or busy failure.
+
+The test temporarily enables your own audio return for at most 15 seconds of game time. The permission ends on a result, timeout or disconnect. It never changes your **Echo my own voice** setting, and a second click while a test is pending does not start another one. Save and pause stop the game clock, so resume the game to finish a pending test.
 
 ### Keys
 

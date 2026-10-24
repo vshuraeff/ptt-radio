@@ -1,6 +1,6 @@
 local control_path = arg[1] or "mod/ptt-radio/control.lua"
 package.path = control_path:gsub("[^/]*$", "?.lua") .. ";" .. package.path
-local handlers, nth, sent, sounds, players, codec
+local handlers, nth, sent, sounds, players, codec, version_checks
 local function element(parent, spec)
   local item = { valid = true, children = {}, parent = parent, style = {} }
   for key, value in pairs(spec or {}) do item[key] = value end
@@ -28,7 +28,7 @@ local function emit(sender, payload, tick)
 end
 local function hello(index, body) emit(index, packet(1, 0, body or "tester hud1 pol1 v2")) end
 local function setup(count, cold, saved)
-  handlers, nth, sent, sounds, players = {}, {}, {}, {}, {}
+  handlers, nth, sent, sounds, players, version_checks = {}, {}, {}, {}, {}, {}
   storage = saved or {}
   settings = { global = { ["ptt-radio-scope"] = { value = "all" } } }
   prototypes = {
@@ -38,6 +38,7 @@ local function setup(count, cold, saved)
   }
   defines = { events = setmetatable({}, { __index = function(_, key) return key end }) }
   script = {
+    active_mods = { ["ptt-radio"] = "0.4.0" },
     on_event = function(events, handler)
       for _, event in ipairs(type(events) == "table" and events or { events }) do handlers[event] = handler end
     end,
@@ -46,7 +47,11 @@ local function setup(count, cold, saved)
     on_configuration_changed = function(handler) script.configure = handler end,
   }
   commands = { add_command = function(name, _, handler) commands[name] = handler end }
-  helpers = { recv_udp = function() end, send_udp = function(port, data, target)
+  helpers = { compare_versions = function(first, second)
+    version_checks[#version_checks + 1] = { first, second }
+    assert(second == "0.4.0")
+    return assert(({ ["0.3.9"] = -1, ["0.4.0"] = 0, ["0.10.0"] = 1 })[first])
+  end, recv_udp = function() end, send_udp = function(port, data, target)
     sent[#sent + 1] = { port = port, data = data, target = target }
   end }
   game = { tick = 0, players = players, connected_players = {}, print = function() end,
@@ -59,9 +64,13 @@ local function setup(count, cold, saved)
       gui = { screen = element({ children = {} }), left = element({ children = {} }) },
       mod_settings = { ["ptt-radio-companion-port"] = { value = 34555 + index },
         ["ptt-radio-echo"] = { value = false }, ["ptt-radio-half-duplex"] = { value = true } },
-      printed = {}, set_shortcut_toggled = function() end,
+      printed = {}, translations = {}, set_shortcut_toggled = function() end,
     }
     player.print = function(message) player.printed[#player.printed + 1] = message end
+    player.request_translation = function(text)
+      player.translations[#player.translations + 1] = text
+      return #player.translations
+    end
     player.play_sound = function(spec) sounds[#sounds + 1] = { index = index, path = spec.path } end
     players[index] = player
     table.insert(game.connected_players, 1, player)
@@ -613,6 +622,204 @@ do
   -- the reserved header field is ignored
   assert(codec.parse_self_test_result(result():sub(1, 3) .. "\0\7" .. result():sub(6)), "reserved field")
 end
+
+-- installation help opens at the join deadline, once per session, unless HELLO arrives.
+local WINDOW = "ptt-radio-settings-window"
+local function tick(at)
+  game.tick = at
+  handlers.on_tick({ tick = at })
+end
+setup(2, true)
+game.tick = 100
+handlers.on_player_joined_game({ player_index = 1 })
+hello(2)
+tick(699)
+assert(not players[1].gui.screen[WINDOW] and not players[2].gui.screen[WINDOW])
+tick(700)
+assert(players[1].gui.screen[WINDOW] and players[1].opened == players[1].gui.screen[WINDOW])
+assert(players[1].printed[1][1] == "ptt-radio-settings.companion-notice")
+assert(not players[2].gui.screen[WINDOW])
+gui(1, "close"); tick(900)
+assert(not players[1].gui.screen[WINDOW] and #players[1].printed == 1)
+handlers["ptt-radio-toggle-mic"]({ player_index = 1 })
+assert(players[1].gui.screen[WINDOW] and not storage.open_mic[1])
+gui(1, "close")
+players[1].connected = false
+handlers.on_player_left_game({ player_index = 1 })
+players[1].connected = true
+handlers.on_player_joined_game({ player_index = 1 })
+tick(1499); assert(not players[1].gui.screen[WINDOW])
+tick(1500); assert(players[1].gui.screen[WINDOW])
+setup(1, true)
+tick(599); assert(not players[1].gui.screen[WINDOW])
+hello(1); tick(600); assert(not players[1].gui.screen[WINDOW])
+
+-- the parsed HELLO version reaches the engine comparison helper; heartbeats keep drafts.
+setup(1)
+handlers["ptt-radio-settings-open"]({ player_index = 1 })
+window = players[1].gui.screen[WINDOW]
+assert(find(window, "ptt-radio-settings-companion-status").caption[1] == "ptt-radio-settings.companion-connected-unknown")
+target = find(window, "ptt-radio-admin-target")
+target.text = "unfinished admin draft"
+for _, case in ipairs({ { "0.3.9", "older" }, { "0.4.0", "matching" }, { "0.10.0", "newer" } }) do
+  hello(1, "ptt-radio-companion " .. case[1] .. " hud1 pol1 v2")
+  local caption = find(window, "ptt-radio-settings-companion-status").caption
+  assert(caption[1] == "ptt-radio-settings.companion-connected" and caption[2] == case[1] and caption[3] == "0.4.0")
+  assert(caption[4][1] == "ptt-radio-settings.companion-" .. case[2])
+  assert(version_checks[#version_checks][1] == case[1])
+  assert(players[1].gui.screen[WINDOW] == window and target.text == "unfinished admin draft")
+end
+for _, invalid in ipairs({ "tester 0.4.0", "ptt-radio-companion invalid", "ptt-radio-companion 0.4.0oops", "ptt-radio-companion 999999999999999999999.0.0" }) do
+  local count = #version_checks
+  hello(1, invalid .. " hud1 pol1 v2")
+  assert(not storage.companion_versions[1] and #version_checks == count)
+  assert(find(window, "ptt-radio-settings-companion-status").caption[1] == "ptt-radio-settings.companion-connected-unknown")
+end
+for _, key in ipairs({ "install-macos", "install-linux", "install-windows", "steam-macos", "steam-linux", "steam-windows", "repository", "wiki" }) do
+  local box = find(window, "ptt-radio-settings-" .. key)
+  assert(box.type == "text-box" and box.read_only and box.selectable and box.enabled ~= false)
+  local id
+  for request, element in pairs(storage.settings_gui.translations[1]) do if element == box then id = request end end
+  assert(id and players[1].translations[id][1] == "ptt-radio-settings.companion-" .. key .. "-text")
+  handlers.on_string_translated({ player_index = 2, id = id, translated = true, result = "wrong player" })
+  assert(not box.text)
+  handlers.on_string_translated({ player_index = 1, id = id, translated = true, result = "copyable " .. key })
+  assert(box.text == "copyable " .. key and not storage.settings_gui.translations[1][id])
+end
+local old_id = #players[1].translations
+gui(1, "close")
+handlers.on_string_translated({ player_index = 1, id = old_id, translated = true, result = "late" })
+handlers["ptt-radio-settings-open"]({ player_index = 1 })
+window = players[1].gui.screen[WINDOW]
+local box = find(window, "ptt-radio-settings-install-macos")
+handlers.on_string_translated({ player_index = 1, id = old_id - 7, translated = true, result = "stale" })
+assert(not box.text)
+game.tick = 901; nth[60]({ tick = 901 })
+assert(find(window, "ptt-radio-settings-companion-status").caption[1] == "ptt-radio-settings.companion-offline")
+
+local function test_result(id, outcome)
+  return packet(0x18, 65535, u16(id) .. string.char(outcome or 0, 1, 236) .. u16(150) .. u16(148) .. u16(90))
+end
+-- only the requester gets SELF_TEST; the grant and revoke use ordinary POLICY epochs.
+setup(2)
+local before = storage.audience_revision
+handlers["ptt-radio-settings-open"]({ player_index = 1 })
+window = players[1].gui.screen[WINDOW]
+target = find(window, "ptt-radio-admin-target")
+target.text = "pending test draft"
+gui(1, "self-test")
+local pending = assert(storage.self_tests[1])
+assert(find(window, "ptt-radio-settings-test-status").caption[1] == "ptt-radio-settings.test-pending")
+assert(players[1].gui.screen[WINDOW] == window and target.text == "pending test draft")
+assert(pending.deadline == 900 and not storage.self_tests[2])
+assert(storage.audience_revision ~= before)
+expect(1, "2", "2", 3); expect(2, "1", "1", 1)
+assert(to(1, 0x16)[1] == packet(0x16, 0, u16(pending.id)) and #to(1, 0x16) == 1 and #to(2, 0x16) == 0)
+assert(sent[#sent].data == to(1, 0x16)[1] and sent[#sent].target == 1 and sent[#sent].port == 34556)
+local granted = storage.audience_revision
+clear(); gui(1, "self-test")
+assert(#sent == 0 and storage.self_tests[1] == pending and storage.audience_revision == granted)
+assert(storage.companion_test_status[1][1] == "ptt-radio-settings.test-running")
+emit(2, test_result(pending.id)); emit(0, test_result(pending.id))
+emit(1, test_result((pending.id + 1) % 65536))
+emit(1, test_result(pending.id):sub(1, 15)); emit(1, test_result(pending.id) .. "\0")
+assert(storage.self_tests[1] == pending and storage.audience_revision == granted and #sent == 0)
+emit(1, media(0x0B)); emit(1, media(0x0C, nil, nil, nil, "test voice"))
+assert(#to(1, 0x0C) == 1)
+clear(); emit(1, test_result(pending.id))
+assert(not storage.self_tests[1] and storage.audience_revision ~= granted)
+expect(1, "2", "2", 1)
+local result = storage.companion_test_status[1]
+assert(find(window, "ptt-radio-settings-test-status").caption == result)
+assert(result[1] == "ptt-radio-settings.test-result" and result[2][1] == "ptt-radio-settings.test-outcome-0")
+assert(result[3][1] == "ptt-radio-settings.test-tone-yes" and result[4] == -20 and result[5] == 150 and result[6] == 148 and result[7] == 90)
+clear(); emit(1, media(0x0C, granted, nil, nil, "late test voice"))
+assert(#to(1, 0x0C) == 0, "previous revision cannot retain self-monitor")
+emit(1, test_result(pending.id)); assert(storage.companion_test_status[1] == result)
+
+-- simultaneous tests stay isolated, and every result outcome revokes the temporary grant.
+for outcome = 0, 4 do
+  setup(2)
+  gui(1, "self-test"); gui(2, "self-test")
+  local one, two = storage.self_tests[1], storage.self_tests[2]
+  assert(one.id ~= two.id)
+  emit(2, test_result(one.id)); assert(storage.self_tests[1] == one and storage.self_tests[2] == two)
+  emit(1, test_result(one.id, outcome))
+  assert(not storage.self_tests[1] and storage.self_tests[2] == two)
+  assert(not storage.policy_snapshot[1].self and storage.policy_snapshot[2].self)
+  assert(storage.companion_test_status[1][2][1] == "ptt-radio-settings.test-outcome-" .. outcome)
+  emit(2, test_result(two.id, outcome)); assert(not storage.policy_snapshot[2].self)
+end
+setup(1)
+gui(1, "self-test")
+emit(1, packet(0x18, 0, u16(storage.self_tests[1].id) .. string.char(2, 0, 128) .. u16(0) .. u16(0) .. u16(0)))
+assert(storage.companion_test_status[1][3][1] == "ptt-radio-settings.test-tone-no")
+assert(storage.companion_test_status[1][4][1] == "ptt-radio-settings.test-no-capture")
+
+-- timeout is tick-based and exact; the persistent echo preference is never overwritten.
+setup(1)
+gui(1, "self-test"); pending = storage.self_tests[1]
+tick(899); assert(storage.self_tests[1] == pending and storage.policy_snapshot[1].self)
+tick(900); assert(not storage.self_tests[1] and not storage.policy_snapshot[1].self)
+assert(storage.companion_test_status[1][1] == "ptt-radio-settings.test-timeout")
+emit(1, test_result(pending.id)); assert(storage.companion_test_status[1][1] == "ptt-radio-settings.test-timeout")
+for _, echo in ipairs({ false, true }) do
+  setup(1)
+  players[1].mod_settings["ptt-radio-echo"].value = echo
+  handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-echo", player_index = 1 })
+  gui(1, "self-test"); pending = storage.self_tests[1]
+  emit(1, test_result(pending.id))
+  assert(storage.policy_snapshot[1].self == echo and players[1].mod_settings["ptt-radio-echo"].value == echo)
+end
+for _, completion in ipairs({ "result", "timeout" }) do
+  setup(1)
+  game.tick = 100
+  gui(1, "self-test")
+  pending = storage.self_tests[1]
+  local saved, epoch = storage, storage.audience_revision
+  setup(1, true, saved)
+  assert(storage.self_tests[1] == pending and storage.policy_snapshot[1].self and storage.audience_revision == epoch)
+  tick(999); assert(storage.self_tests[1] == pending)
+  if completion == "result" then emit(1, test_result(pending.id)) else tick(1000) end
+  assert(not storage.self_tests[1] and not storage.policy_snapshot[1].self and storage.audience_revision ~= epoch)
+  gui(1, "self-test")
+  local next_test = storage.self_tests[1]
+  assert(next_test.id ~= pending.id)
+  emit(1, test_result(pending.id)); assert(storage.self_tests[1] == next_test)
+end
+setup(1)
+off(1, true); gui(1, "self-test")
+assert(storage.self_tests[1] and not storage.policy_snapshot[1].tx and not storage.policy_snapshot[1].self)
+emit(1, test_result(storage.self_tests[1].id, 1)); assert(not storage.self_tests[1])
+setup(1)
+storage.radio_policy.muted[1] = true
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" })
+gui(1, "self-test"); assert(not storage.policy_snapshot[1].self and not storage.policy_snapshot[1].tx)
+
+-- disconnect, capability loss and rejoin clear the grant; stale IDs cannot end a new test.
+for _, reason in ipairs({ "timeout", "left", "capability", "rejoin" }) do
+  setup(2)
+  gui(1, "self-test"); pending = storage.self_tests[1]
+  if reason == "timeout" then
+    game.tick = 901; nth[60]({ tick = 901 })
+  elseif reason == "left" then
+    players[1].connected = false
+    table.remove(game.connected_players, 2)
+    handlers.on_player_left_game({ player_index = 1 })
+  elseif reason == "capability" then hello(1, "old hud1 v2")
+  else handlers.on_player_joined_game({ player_index = 1 }) end
+  assert(not storage.self_tests[1] and not (storage.policy_snapshot[1] and storage.policy_snapshot[1].self))
+  players[1].connected = true
+  hello(1)
+  clear(); gui(1, "self-test")
+  local next_test = assert(storage.self_tests[1])
+  assert(next_test.id ~= pending.id)
+  emit(1, test_result(pending.id)); assert(storage.self_tests[1] == next_test)
+end
+setup(1, true)
+gui(1, "self-test"); assert(not storage.self_tests[1] and #to(1, 0x16) == 0)
+hello(1, "old hud1 v2"); clear()
+gui(1, "self-test"); assert(not storage.self_tests[1] and #sent == 0)
 
 -- exported bytes are generated by the real producer after real settings handlers.
 if arg[2] == "--groups" then

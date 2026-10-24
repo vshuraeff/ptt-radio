@@ -65,9 +65,13 @@ local function setup()
         ["ptt-radio-half-duplex"] = { value = true },
         ["ptt-radio-echo"] = { value = false },
       },
-      printed = {}, set_shortcut_toggled = function() end, play_sound = function() end,
+      printed = {}, translations = {}, set_shortcut_toggled = function() end, play_sound = function() end,
     }
     player.print = function(message) player.printed[#player.printed + 1] = message end
+    player.request_translation = function(text)
+      player.translations[#player.translations + 1] = text
+      return #player.translations
+    end
     players[index] = player
     game.connected_players[index] = player
   end
@@ -103,12 +107,14 @@ end
 local function audit(node)
   scan(node.caption)
   scan(node.tooltip)
+  scan(node.text)
   for _, child in ipairs(node.children) do audit(child) end
 end
 local function audit_all()
   for _, player in ipairs(players) do
     audit(player.gui.screen)
     for _, line in ipairs(player.printed) do scan(line) end
+    for _, request in ipairs(player.translations) do scan(request) end
   end
 end
 
@@ -450,6 +456,10 @@ for _, lang in ipairs({ "en", "ru" }) do
     assert(keys["ptt-radio-settings.refused-" .. reason], lang .. " lacks refused-" .. reason)
   end
   for _, lock in ipairs({ "tx", "rx", "all" }) do assert(keys["ptt-radio-settings.lock-" .. lock]) end
+  for _, suffix in ipairs({ "idle", "pending", "running", "unavailable", "timeout", "disconnected", "result", "tone-yes", "tone-no", "no-capture" }) do
+    assert(keys["ptt-radio-settings.test-" .. suffix], lang .. " lacks test-" .. suffix)
+  end
+  for outcome = 0, 4 do assert(keys["ptt-radio-settings.test-outcome-" .. outcome]) end
   assert(keys["shortcut-name.ptt-radio-settings"] and keys["controls.ptt-radio-settings-open"] and keys["controls.ptt-radio-settings-cycle"], lang)
 end
 local function slurp(path)
@@ -501,9 +511,10 @@ handlers.on_lua_shortcut({ prototype_name = "ptt-radio-settings", player_index =
 assert(win())
 handlers.on_lua_shortcut({ prototype_name = "ptt-radio-settings", player_index = 1 })
 assert(win() == nil)
--- the mic shortcut keeps working and opens nothing
+-- the mic shortcut opens installation help when no companion is present
 handlers.on_lua_shortcut({ prototype_name = "ptt-radio-open-mic", player_index = 1 })
-assert(win() == nil and players[1].printed[#players[1].printed][1] == "ptt-radio.no-companion")
+assert(win() and players[1].printed[#players[1].printed][1] == "ptt-radio.no-companion")
+handlers.on_gui_closed({ element = win(), player_index = 1 })
 handlers.on_lua_shortcut({ prototype_name = "something-else", player_index = 1 })
 assert(win() == nil)
 -- a gui click is consumed by the settings window, and an audience change follows a mutation
