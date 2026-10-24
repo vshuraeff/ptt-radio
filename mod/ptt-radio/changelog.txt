@@ -1,0 +1,27 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.4.0
+Date: 2026-10-24
+  Major Features:
+    - First public release. Push-to-talk voice radio for multiplayer: the ptt-radio companion records
+      the microphone, and the voice travels through the multiplayer game or over direct UDP.
+    - Every player who wants to talk or listen runs the ptt-radio companion and launches the game with
+      --enable-lua-udp <port>. The mod is required on the server and on every client.
+  Features:
+    - Push-to-talk on F8 in the companion, and an open microphone toggled by a shortcut button or ALT + V.
+    - Speaker HUD at the left edge of the screen: who is talking, in their player colour, with the
+      transmit channel icon and three link quality bars.
+    - Radar-style radio channels: one transmit channel per player, extra listening channels, the shared
+      ANY channel and HERE for the current surface, and up to 8 presets.
+    - Radio settings window, opened by its shortcut button or ALT + SHIFT + V, with a switch that turns the
+      radio off completely.
+    - Admin channel policy in the settings window and through /radio-admin: admin channel, channel bans and
+      pins, per-player mutes, denials, locks and confinement. The policy is kept in the save.
+    - Optional relay hub beside the game server for companions that cannot reach each other directly.
+    - Echo warning when a player's microphone picks up their speakers, with a button that turns off the
+      open microphone.
+    - Half-duplex by default: other voices go quiet while you hold the radio key. Turn it off with headphones.
+    - Map setting for who hears the radio: everyone, or only your own force.
+  Info:
+    - Channels separate listeners only among honest clients. The server and a modified client can hear
+      every channel.
+    - Setup guide and troubleshooting: https://github.com/vshuraeff/ptt-radio/wiki

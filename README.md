@@ -1,235 +1,116 @@
-# ptt-radio
+# PTT Radio
 
-Push-to-talk рация для мультиплеера Factorio 2.1.23: голос идёт через сам мультиплеер игры (Lua UDP API), стопка «кто говорит» у левого края экрана с именами в цвете игрока видна всем. Дизайн и обоснования: [DESIGN.md](DESIGN.md), замеры транспорта: [../udp-probe/README.md](../udp-probe/README.md).
+<img src="mod/ptt-radio/thumbnail.png" alt="PTT Radio icon" width="96" align="right">
 
-Состояние: этап 1 из плана (мод v0.1 и эмулятор фиктивного голоса) готов и проверен. Компаньон v0.1 (`companion/`, Rust) собран и проверен на стенде тоном вместо микрофона; живой микрофон и PTT-клавиша в игре ещё не проверены.
+Push-to-talk voice radio for Factorio 2.1 multiplayer. You hold a key and talk, and the other players hear you. A list at the left edge of the screen shows who is talking, in their player colour. The voice travels through the multiplayer game itself, or over direct UDP between players when their networks allow it.
 
-## Администрирование рации
+Factorio mods cannot use the microphone or the speakers, so the radio has two parts:
 
-Раздел «Администрирование» в окне настроек доступен администраторам. В нём можно выбрать сигнал, ANY или HERE, назначить админ-канал, запретить или закрепить канал; по точному имени или индексу игрока — заглушить передачу, выдать право вещания, запретить приём/передачу на канале, заблокировать выбор или ограничить набор каналов. Ниже показана текущая политика; действия вызывают те же проверки, что и команды. При утрате прав следующий клик или выбор сигнала закрывает раздел и отказывает в изменении. Политика сохраняется в сейве.
+- **the mod**, `ptt-radio`, which is required on the server and on every client;
+- **the companion**, a small program that every player runs next to the game. It records the microphone, plays the voices and talks to the mod over the game's Lua UDP port.
 
-Те же операции доступны через `/radio-admin` (в серверной консоли без `/`). Канал — `ANY`, `HERE`, `тип/имя`, например `item/iron-plate`, `fluid/water`, `virtual/signal-A`, `space-location/vulcanus`; имя без типа означает `item`. HERE — «Здесь», по физической поверхности. Пустые, параметрические и специальные сигналы не принимаются. Игрок — положительный числовой индекс или точное имя; в команде имя с пробелами заключают в двойные кавычки. Экранирования кавычек нет: для имени с кавычкой используйте индекс. Числовое имя трактуется как индекс. В поле GUI имя пишется без кавычек.
+Only players who run their own companion can talk and hear voices. Everyone else still sees who is speaking.
 
-| Команда после `/radio-admin` | Действие |
+[Русская версия ниже](#быстрый-старт).
+
+## Download
+
+Everything is on the [releases page](https://github.com/vshuraeff/ptt-radio/releases). `<ver>` is the release version, for example `0.4.0`.
+
+| File | What it is |
 | --- | --- |
-| `channel <канал>` / `channel none` | Назначить / убрать обязательный админ-канал |
-| `publisher add <игрок>` / `publisher remove <игрок>` | Разрешить / отозвать передачу на админ-канале |
-| `ban <канал>` / `unban <канал>` | Глобальный запрет / снятие запрета |
-| `pin <канал>` / `unpin <канал>` | Закрепить / открепить канал в списке известных |
-| `deny <игрок> <канал> tx\|rx\|both` | Запретить игроку передачу, приём или оба |
-| `allow <игрок> <канал>` | Снять личный запрет на канал |
-| `lock <игрок> tx\|rx\|all` / `unlock <игрок>` | Блокировать выбор TX, RX или оба / разблокировать |
-| `confine <игрок> <каналы...>` / `release <игрок>` | Ограничить разрешёнными каналами / снять ограничение |
-| `mute <игрок>` / `unmute <игрок>` | Заглушить / разрешить передачу игрока |
+| `ptt-radio_<ver>.zip` | the mod |
+| `ptt-radio-companion-<ver>-windows-x86_64.zip` | companion for Windows |
+| `ptt-radio-companion-<ver>-macos-universal.zip` | companion for macOS (Apple silicon and Intel) |
+| `ptt-radio-companion-<ver>-linux-x86_64.tar.gz` | companion for Linux |
+| `ptt-radio-hub-<ver>-linux-x86_64.tar.gz`, `ptt-radio-hub-<ver>-linux-aarch64.tar.gz` | optional relay hub for the game server |
+| `SHA256SUMS` | checksums of all the files above |
 
-Например: `/radio-admin deny "Player Two" item/iron-plate tx`; `/radio-admin confine 2 ANY HERE item/copper-plate`. В GUI список ограничения использует те же ключи через пробел. Серверная консоль имеет полномочия администратора; игрок 0 не является целью этих команд. Противоречия (например, запрет обязательного админ-канала или одновременно запрет и закрепление) отклоняются целиком с объяснением. Повтор уже установленного значения не меняет политику.
+The hub is also published as a container image, `ghcr.io/vshuraeff/ptt-radio-hub`.
 
-Админ-канал слышат все с включённой рацией в пределах `ptt-radio-scope`; передавать на нём могут администраторы и разрешённые вещатели. Назначить ANY разрешено, но тогда обычные передатчики на ANY замолчат до выдачи права вещания. HERE нельзя назначить обязательным админ-каналом. Даже при `lock all` игрок может выключить всю рацию: это глушит админ-канал и серверный источник 0. Блокировки касаются каналов и пресетов. Каналы управляют воспроизведением у честных клиентов и не обеспечивают конфиденциальность против модифицированного клиента: игровой голосовой пакет реплицируется всем.
+## Quick start
 
-Выбор каналов и политика применяются сразу к игровому голосу, прямому UDP, HUD и щелчкам рации. Нужен обновлённый компаньон с поддержкой каналов: старые компаньоны не передают и не получают голос, а окно настроек предлагает обновление. GUI и команда проверяются Lua-тестами; живая визуальная приёмка остаётся отдельным шагом. Проверка: `lua mod/tests/admin_test.lua` из `ptt-radio/`.
+1. Install the mod. Put `ptt-radio_<ver>.zip` into your Factorio `mods` folder, or install PTT Radio from the mod portal. The server needs it too.
+2. Launch Factorio with the Lua UDP port open: add `--enable-lua-udp 34556` to the launch options. In Steam: right-click Factorio, then Properties, then Launch options.
+3. Unpack the companion for your system and start `ptt-radio-companion` from a terminal. With no arguments it uses port 34556 for the game and listens on 34555, which is the mod's default. On macOS, allow microphone access when asked.
+4. Join the game. The chat shows "Radio: companion connected."
+5. Hold **F8** to talk, or press **ALT + V** to toggle the open microphone.
 
-По умолчанию все на общем ANY — это отдельный канал, а не подписка на все разговоры. У каждого игрока один TX; он слышит этот канал, дополнительные RX и обязательный админ-канал. «Здесь» следует физической поверхности игрока; просмотр карты другой планеты его не меняет. Обычный сигнал планеты — статический канал, доступный с любой поверхности. `ptt-radio-scope` остаётся внешним ограничением: `all` по умолчанию, `force` — только своя команда. Полудуплекс при удержанном PTT глушит весь вывод, включая админ-канал; приоритета для него нет. Открытый микрофон полудуплекс не включает.
+If the chat says "Radio: no companion", the companion is not running or the game was started without `--enable-lua-udp`. The mod cannot tell these two apart. See [Troubleshooting](https://github.com/vshuraeff/ptt-radio/wiki/Troubleshooting).
 
-## Состав
+Server admins: the headless server also needs `--enable-lua-udp`. The [Server Setup](https://github.com/vshuraeff/ptt-radio/wiki/Server-Setup) and [Hub](https://github.com/vshuraeff/ptt-radio/wiki/Hub) pages cover it.
 
-- `mod/ptt-radio/`: мод. HELLO, POLICY и START3/VOICE3/STOP3, пересылка компаньонам разрешённых слушателей, HUD говорящих, щелчки `utility/gui_click` и `utility/list_box_click`, таймаут HUD по игровым тикам. С v0.2: кнопка открытого микрофона на панели быстрого доступа и клавиша `ALT + V` (MIC_STATE своему компаньону), heartbeat HELLO каждые 5 с и сообщения игроку, когда компаньон подключился или пропал. Настройки: `ptt-radio-companion-port`, `ptt-radio-echo` и `ptt-radio-half-duplex` (игрок; полудуплекс включён по умолчанию, в наушниках можно выключить), `ptt-radio-scope` (карта: `all` или `force`).
+## Controls
 
-  HUD говорящих (`mod/ptt-radio/hud.lua`, вместо прежней рамки «Рация» в `gui.left`) — стопка строк в `gui.screen` у левого края. Правый край занимает панель информации о сущности под курсором, и стопка её перекрывала. Первая строка стоит на 40 % высоты экрана, следующие ложатся ниже. Строка появляется после принятого голоса, с учётом каналов и `ptt-radio-scope`. Новый говорящий встаёт в конец; строка пропадает на принятом STOP или по таймауту говорящего, остальные сдвигаются вверх. Повторы START и VOICE порядок не меняют. В строке значок TX-канала, ник в цвете игрока и три деления качества связи. После смены TX первый принятый пакет новой политики обновляет значок на месте, сохраняя порядок и качество; задержавшийся старый пакет значок назад не меняет. Пока качество не измерено, деления серые, а подсказка говорит «качество связи неизвестно». У источника эха вместо делений красная метка «эхо» с подсказкой «эхо от динамиков». Молчащий источник эха строки не получает, его личная панель в `gui.left` остаётся. Если строки не помещаются до 80 % высоты экрана, последняя видимая заменяется на «ещё N», а показаны самые ранние говорящие. Положение и вместимость пересчитываются при смене разрешения и масштаба интерфейса.
+| Action | Default |
+| --- | --- |
+| Push to talk (a global key, held in the companion) | `F8`, change it with `--ptt-key` |
+| Open microphone on or off | `ALT + V`, or the radio button on the shortcut bar |
+| Radio settings window | `ALT + SHIFT + V`, or the radio-and-cog button on the shortcut bar |
+| Next channel preset | not assigned, bind "Cycle radio presets" in the controls |
 
-  Качество измеряет компаньон слушателя по последним двум секундам воспроизведённого звука: три зелёных деления при доле пропусков меньше 1 %, два жёлтых при 1–5 %, одно красное выше 5 %. Для первой оценки нужны 500 мс измеренного звука. Компаньон без `hud1`, устаревшая или ещё неизвестная оценка оставляют деления серыми; прямой маршрут сам по себе не означает три деления. Подсказка показывает выбранный маршрут и класс задержки, который пока остаётся неизвестным без замера от рта до уха. Оценка своя у каждого слушателя, исчезает на STOP или смене потока/фразы и истекает через 300 игровых тиков без обновления. Повтор START той же фразы сохраняет строку и оценку.
-- `tools/radio.py`: эмулятор компаньона без звука, `uv run -q tools/radio.py {hello|talk|listen}`; `talk --no-stop` изображает упавший компаньон.
-- `stand/`: headless-сервер 2.1.23 с модом, образ берётся из `../udp-probe/server`; по желанию рядом с ним хаб (`compose.hub.yaml`, `Dockerfile.hub`), чек-лист живой приёмки — `ACCEPTANCE.md`.
-- `client-mods/`: каталог модов для клиента (`--mod-directory`), чтобы не трогать основную установку.
+The settings window picks your transmit channel and the channels you listen to, holds up to 8 presets, and has a switch that turns the radio off completely. By default everyone talks on the shared `ANY` channel. Administrators also get a policy section there and the `/radio-admin` command, see [Channels and Admin](https://github.com/vshuraeff/ptt-radio/wiki/Channels-and-Admin).
 
-## Окно настроек рации
+## Good to know
 
-Окно (`mod/ptt-radio/settings_gui.lua`) открывается кнопкой «Настройки рации» на панели быстрого доступа (рация с шестерёнкой; соседняя кнопка с одной рацией переключает открытый микрофон) или клавишей `ALT + SHIFT + V`; закрывается Esc, повторным нажатием клавиши или кнопкой в заголовке. Клавиши назначаются в настройках управления игры:
+- **Half-duplex is on by default.** While you hold the push-to-talk key, other voices go quiet, so your speakers do not feed back into your microphone. With headphones you can turn it off in the mod settings.
+- **Echo warning.** If the companion hears your speakers in your microphone, your line in the speaker list says "echo" and you get a button to turn off the open microphone. Headphones fix it.
+- **Channels are not private.** They separate listeners only among honest clients. The server and a modified client can hear every channel.
+- **A paused game pauses the voice** that goes through the game. Autosaves do too.
+- **Windows:** the push-to-talk key does not work in the Windows companion yet. Use the open microphone (`ALT + V`) instead.
+- **Linux:** the push-to-talk key needs an X11 session. A pure Wayland session has no global key for the companion yet.
 
-| Управление | По умолчанию |
-|---|---|
-| Открыть настройки рации (`ptt-radio-settings-open`) | `ALT + SHIFT + V` |
-| Переключать пресеты рации (`ptt-radio-settings-cycle`) | не назначена: `ALT + C` занята в ваниле (`give-copper-wire`) |
-| Открытый микрофон (`ptt-radio-toggle-mic`) | `ALT + V` |
+## Documentation
 
-В окне сверху вниз:
+The [wiki](https://github.com/vshuraeff/ptt-radio/wiki) has the full guides in English and Russian:
 
-- **Рация выключена**: полностью выключает рацию, вы ничего не принимаете, включая канал администратора и сообщения сервера, и не передаёте. Блокировки администратора (`lock`) этот переключатель не отключают, против него у администратора только запрет передачи (mute).
-- **Канал передачи (TX)**: выбор сигнала (`choose-elem-button`) и кнопки «ANY» и «Здесь». Сигнал проходит через `channels.key`; пустой сигнал, параметр, «каждый», «любой» и «все» отклоняются, окно пишет причину и оставляет прежний канал. Если администратор запретил вам передачу, над выбором стоит «Передача запрещена администратором».
-- **Приём (RX)**: флажок на каждый известный или подписанный канал. Канал передачи включён всегда и недоступен для снятия; обязательный канал администратора, пока рация включена, тоже отмечен и недоступен.
-- **Пресеты**: до 8, «Добавить текущий TX», выше, ниже, убрать, «Следующий пресет» (то же делает клавиша переключения).
-- **Известные каналы**: значок, число слушающих и метка «админ»; нажатие переключает TX на этот канал. Новый канал создаётся выбором ещё не занятого сигнала в выборе TX.
-- Подсказка о честных клиентах: каналы разделяют слушателей только среди честных клиентов, сервер и изменённый клиент слышат всё.
+| English | Русский |
+| --- | --- |
+| [Installation](https://github.com/vshuraeff/ptt-radio/wiki/Installation) | [Установка](https://github.com/vshuraeff/ptt-radio/wiki/RU-Installation) |
+| [Companion](https://github.com/vshuraeff/ptt-radio/wiki/Companion) | [Компаньон](https://github.com/vshuraeff/ptt-radio/wiki/RU-Companion) |
+| [Server Setup](https://github.com/vshuraeff/ptt-radio/wiki/Server-Setup) | [Настройка сервера](https://github.com/vshuraeff/ptt-radio/wiki/RU-Server-Setup) |
+| [Hub](https://github.com/vshuraeff/ptt-radio/wiki/Hub) | [Хаб](https://github.com/vshuraeff/ptt-radio/wiki/RU-Hub) |
+| [Channels and Admin](https://github.com/vshuraeff/ptt-radio/wiki/Channels-and-Admin) | [Каналы и администрирование](https://github.com/vshuraeff/ptt-radio/wiki/RU-Channels-and-Admin) |
+| [Troubleshooting](https://github.com/vshuraeff/ptt-radio/wiki/Troubleshooting) | [Решение проблем](https://github.com/vshuraeff/ptt-radio/wiki/RU-Troubleshooting) |
+| [Building from Source](https://github.com/vshuraeff/ptt-radio/wiki/Building-from-Source) | [Сборка из исходников](https://github.com/vshuraeff/ptt-radio/wiki/RU-Building-from-Source) |
 
-Элемент, который запрещает политика сервера (блокировка `tx`, `rx` или `all`, запрет `deny`, ограничение `confine`, бан канала), отключён, а в подсказке названо ограничение. Причины совпадают с отказами `channels.lua`. Блок администрирования в нижней части окна рисует `admin.lua` через `settings_gui.configure(changed, render_admin)`; без него окно обходится без этого блока.
+## Быстрый старт
 
-Проверка без игры: `lua mod/tests/settings_gui_test.lua` из `ptt-radio/` (окно, выбор TX, RX, пресеты, выключатель под блокировкой, известные каналы, проводка в `control.lua`, наличие всех строк в обоих языках `locale/`). Вид окна и клавиши в живой игре эта проверка не заменяет.
+PTT Radio — рация с кнопкой «нажми и говори» для мультиплеера Factorio 2.1. Голос идёт через саму игру или напрямую по UDP между игроками. Слева на экране видно, кто сейчас говорит. Мод нужен на сервере и у каждого клиента. Кроме мода каждый игрок запускает компаньон — небольшую программу, которая работает с микрофоном и динамиками. Голоса слышат только те, у кого запущен свой компаньон.
 
-## Компаньон
+1. Установите мод: положите `ptt-radio_<версия>.zip` со [страницы релизов](https://github.com/vshuraeff/ptt-radio/releases) в папку `mods` или установите PTT Radio с мод-портала. На сервере мод тоже нужен.
+2. Запускайте Factorio с параметром `--enable-lua-udp 34556`. В Steam: правой кнопкой по Factorio, «Свойства», «Параметры запуска».
+3. Распакуйте компаньон для своей системы и запустите `ptt-radio-companion` из терминала. Без аргументов он работает с игрой на порту 34556 и слушает порт 34555 — это значение по умолчанию в настройках мода. На macOS разрешите доступ к микрофону, когда система спросит.
+4. Зайдите в игру. В чате появится «Рация: компаньон подключён».
+5. Держите **F8**, чтобы говорить, или нажмите **ALT + V**, чтобы включить открытый микрофон.
 
-`companion/`: бинарник `ptt-radio-companion`. Микрофон через `cpal` → Opus 48 кГц моно, 20 мс, VOIP, 16 кбит/с, без FEC и DTX → игра; обратно очередь и декодер на каждого говорящего, микшер с мягким ограничением → устройство вывода. HELLO уходит при старте и каждые 5 с, пока компаньон работает; `MIC_STATE` от мода включает и выключает открытый микрофон, `HALF_DUPLEX` — полудуплекс. PTT по умолчанию `F8`: глобальная клавиша съедается во всей системе, поэтому буквы не годятся, а `F8` без модификаторов Factorio 2.1 не занимает. Кнопки мыши и одиночные модификаторы потребуют `CGEventTap` с правом Input Monitoring, в v0.1 их нет.
+Если в чате написано «Рация: компаньон не найден», значит, компаньон не запущен или игра запущена без `--enable-lua-udp`; мод не может отличить одно от другого. Настройки рации открываются клавишами `ALT + SHIFT + V`. В Windows клавиша PTT в компаньоне пока не работает, говорите через открытый микрофон. В Linux клавиша PTT работает только в сеансе X11.
 
-Сборка: нужны Rust, cmake и компилятор C. libopus 1.6.1 собирается из исходников и линкуется статически (`opusic-c` с фичей `bundled`), системный libopus не нужен.
+Подробные инструкции на русском — в вики: [Установка](https://github.com/vshuraeff/ptt-radio/wiki/RU-Installation), [Решение проблем](https://github.com/vshuraeff/ptt-radio/wiki/RU-Troubleshooting).
 
-AEC включён по умолчанию, но микрофон остаётся сухим до обнаружения акустического эха. `--aec off` отключает детектор и подавитель. Наушники в офлайн-проверке проходят побитово; при динамиках gate не устраняет повреждение верхних гармоник при двойном разговоре, а слабое эхо на фоне собственного голоса может обнаруживаться десятки секунд. Замеры, задержка переключения и ограничения: [AEC в DESIGN.md](DESIGN.md#aec-только-при-обнаруженном-эхо). Качество на живом стенде ещё не принято.
+## For developers
 
-```sh
-cd companion
-cargo build --release && cargo test
-./target/release/ptt-radio-companion                      # микрофон, динамики, PTT на F8
-./target/release/ptt-radio-companion --help               # --game-port, --port, --bitrate, --ptt-key
-# проверка без микрофона и динамиков: тон 440 Гц, PTT на 3 с, запись принятого эха
-./target/release/ptt-radio-companion --tone 440 --aec off --auto-ptt 3 --no-playback --record-received echo.wav
-```
+The design, the wire formats, the trust boundaries and the measurements are in [DESIGN.md](DESIGN.md) (in Russian, with English sections for the v2 transport contracts). Build instructions are on the wiki's [Building from Source](https://github.com/vshuraeff/ptt-radio/wiki/Building-from-Source) page.
 
-При выходе (Ctrl-C, SIGTERM или конец `--auto-ptt`) печатается строка статистики: отправленные кадры, принятые по каждому говорящему, декодированные, ошибки декодирования, выброшенные опоздавшие, недоборы и RTT своих кадров (свой кадр узнаётся по номеру и совпадению байтов Opus).
+- `mod/ptt-radio/` is the mod (Lua), `mod/tests/` its tests, which run without Factorio.
+- `companion/` is the Rust crate with three binaries: the companion `ptt-radio-companion`, the relay hub `ptt-radio-hub` and the `relay` game emulator for end-to-end tests. Building needs Rust, cmake and a C compiler; libopus is built from source and linked statically.
+- `tools/gate.sh [--twice] [log dir]` is the full acceptance gate: `cargo fmt --check`, clippy, the debug and release test suites, the real-time voice scenarios, `aec_gate`, `luac -p` and the four Lua suites. It needs `cargo`, `flock`, `lua` and `luac` on `PATH`; on macOS `flock` comes from Homebrew. Real-time steps hold a shared lock file (`PTT_REALTIME_LOCK`, wait limit `PTT_REALTIME_WAIT`) so two runs on one machine do not measure at once, and a real-time test that fails is rerun once by name and reported as flaky if the rerun passes.
+- The Lua checks alone, from this directory: `luac -p mod/ptt-radio/*.lua mod/tests/*.lua`, then `lua mod/tests/<name>_test.lua mod/ptt-radio/control.lua` for `control`, `channels`, `admin` and `settings_gui`.
+- `tools/radio.py` emulates a companion without audio: `uv run -q tools/radio.py {hello|talk|listen}`; `talk --no-stop` imitates a crashed companion.
+- `stand/` runs a headless 2.1 server with the mod in Docker, optionally with the hub beside it (`compose.hub.yaml`). The live acceptance checklist is `stand/ACCEPTANCE.md`. `client-mods/` is a mod directory for a test client (`--mod-directory`), so your main installation stays untouched.
 
-Проверено 2026-10-24 на стенде с модом v0.2, эхо включено, сборка macOS x86_64:
+### Measured so far
 
-| Проверка | Результат |
-|---|---|
-| `cargo test` | 20 тестов: пакеты, правила буфера (40 мс, 60 мс, переполнение, STOP, 300 мс), PTT и `MIC_STATE`, микшер, ресемплер |
-| Эхо тона 440 Гц, `--auto-ptt 3` | отправлено 156 кадров (150 + pre-roll 6), вернулись все 156 по порядку, 0 выброшено; в WAV 3,12 с тона, частота 440,1 Гц |
-| RTT кадра | совпадает с `radio.py talk` в тех же условиях: p50 105–110 мс у обоих в одном состоянии стенда, 288–293 мс в другом; 76 мс из этапа 1 в этот день не воспроизвелись и у `radio.py` |
-| Псевдоговорящий «Сервер» (`radio.py talk` в контейнере) | 100 кадров от игрока 0, START и два STOP; фиктивные байты: 66 ошибок декодирования, 34 «кадра» декодировались в шум, компаньон не падает |
-| `MIC_STATE` от мода v0.2 | после HELLO приходит `open mic off`, компаньон остаётся в режиме PTT |
-| Регистрация `F8` | без ошибок |
+Recorded on 2026-10-24 on one macOS machine with the headless server in a local container. These are the current numbers, not a passed quality acceptance.
 
-Не проверено: живой микрофон и вывод на динамики, нажатие и отпускание `F8` при активном окне Factorio, запросы прав macOS (микрофон для неподписанного бинарника из терминала).
+- Through the game on the stand: frame round trip p50 75–77 ms, p95 87 ms or less; STOP 76–84 ms after the key is released. A companion that dies mid-phrase is closed by the mod 587 ms after its last frame.
+- Mouth-to-ear in the network model, by route: game 153 ms, direct 65 ms, hub 95 ms, player relay 85 ms, game fallback 154 ms. After the direct path is cut mid-phrase, the gap is 30 ms when it falls back to the hub and 70 ms to the game; after the hub fails, 50 ms.
+- Double-talk through the hub is a known flaky case: the other player's voice measured from −4.2 to −2.4 dB against a −4 dB threshold, 6 passes and 5 failures out of 11 known runs.
+- Warmed-up echo cancellation keeps your own returned voice below −50 dB, but in a three-way conversation the 1–4 kHz band lost up to 12.1 dB, and before the echo is detected on a cold start the return is audible.
+- Not yet checked live: the push-to-talk key with the Factorio window focused, real speakers, and the macOS permission prompts.
 
-### Сквозные сценарии без игры
+The tables and the conditions behind these numbers are in [DESIGN.md](DESIGN.md#network-lab).
 
-Контракт мода проверяется без Factorio: `lua mod/tests/control_test.lua mod/ptt-radio/control.lua` из `ptt-radio/`, синтаксис — `luac -p mod/ptt-radio/*.lua mod/tests/*.lua`; модель каналов — `lua mod/tests/channels_test.lua`, админка — `lua mod/tests/admin_test.lua`, окно настроек — `lua mod/tests/settings_gui_test.lua`. Проверка исполняет настоящие обработчики событий для SIGNAL/AUDIENCE, игрока 0, плашек v2 и стопки HUD (порядок, сжатие, таймаут, «ещё N», пересчёт при смене экрана, запоздалый STOP), а также HUD_STATUS: общий вектор байтов, атомарный отказ повреждённого пакета, возможности HELLO, текущую идентичность говорящего, изоляцию слушателей, подсказки и точную границу истечения оценки. UDP-проверки эмулятора: `cd companion && cargo test --lib relay:: -- --test-threads=1`. Это не заменяет приёмку входа игроков, паузы и GUI на живом стенде. Форматы и границы доверия описаны в [DESIGN.md](DESIGN.md#signaling-schema-and-trust).
+## License
 
-Игру и мод заменяет эмулятор `relay`, каждый игрок — отдельный процесс компаньона с виртуальным звуком. Устройство, модель транспорта и замеры описаны в [DESIGN.md](DESIGN.md#сквозной-стенд-без-игры).
-
-```sh
-cd companion
-cargo test --release --test scenarios -- --nocapture --test-threads=1  # матрица транспортов, около 8 минут
-cargo test --release --test scenarios direct:: -- --nocapture    # только прямой UDP
-PTT_E2E_VOICE=talk.wav cargo test --test scenarios -- --nocapture  # свой голос вместо синтетического у игрока A
-```
-
-Сценарии: задержка «рот–ухо» с разбивкой по этапам; эхо от динамиков с парой AEC off/on; двойной разговор с такой же парой и проверкой неизменного голоса игрока в наушниках; полудуплекс (A держит PTT, пока говорит B: с настройкой динамики A молчат и после отпускания звучат дальше в такт, без неё A слышит B всё время); остановка на 500 мс посреди фразы. Проверки фиксируют нынешний уровень с запасом, чтобы регрессия падала. Файлы последнего прогона лежат в `target/tmp/scenarios/<транспорт>/<сценарий>/aec-on/` и `aec-off/`: `a-mic.wav` и `a-speaker.wav` (что сказал и что услышал A, то же для `b`), трассы `*.trace`, логи компаньонов и `network.trace` маршрутизатора. Развёртка кодека принудительно AEC-off.
-
-Модули `game`, `direct`, `hub`, `player_relay`, `fallback` запускают одинаковые проверки и сверяют выбранный маршрут во время речи. Перед речью на сетевых путях добавлены 6 с тишины для ICE, ключей и BIND; исходные WAV и трассы сохраняют этот интервал. Исторически на базе `cff05478` выбор hub происходил около 6.3 с, лишь за 0.5 с до окна замера; более поздняя правка таймера в интеграции меняет этот старт, прогрев стенда остаётся. Игровой baseline идёт без прогрева. Тест `hard_direct_cut_to_hub_and_game` отдельно обрывает прямой путь и хаб посреди фразы, измеряя провал только между срезами действительно полученных кадров. PLC/FEC учитывается отдельно от доставки; в окне задержки и установившихся окнах до/после остановки требуется ноль таких срезов.
-
-Один авторский прогон 2026-10-24 до исправления опоры эха по обоим плечам: 31 проверка прошла, одна развёртка кодека пропущена; 510.28 с. «Рот–ухо» на модели game/direct/hub/player-relay/fallback — 153/65/95/85/154 мс. Провалы после разрыва прямого пути на hub/game и после отказа хаба — 30/70/50 мс в своих границах. На пяти известных прогонах до этой правки hub прошёл только 2 раза из 5, голос B был от −4.2 до −3.0 дБ: три провала включают два тихих прогона рецензента. С исправленной опорой известны четыре замера:
-
-- −2.5 дБ у автора (проход);
-- −4.2 дБ в тихом последовательном прогоне рецензента на голове юнита (провал);
-- −2.5 и −2.4 дБ в двух прогонах финального gate интеграции, уже с исправленным таймером объявления хабу (оба прохода);
-- −4.2 и −2.5 дБ в двух прогонах gate после исправлений ревью (провал и проход), хаб выбран на 1.38 с.
-
-Всего известно 6 проходов и 5 провалов. Последний провал получен с исправленным таймером, поэтому позднее переключение маршрута причиной не является. Правка опоры не меняет оценку сохранённых провалов. В новом проходе подавитель включился на той же 1.09 с речи, что и в провалах; время включения само по себе не объясняет различие. Это не устойчивый зелёный gate; порог −4 дБ остаётся. [Таблицы и условия измерения](DESIGN.md#network-lab).
-
-В офлайн `multiparty_lab` переменная `PTT_LAB_PATH=direct` задаёт односторонние задержки A–B/A–C/B–C 15/35/25 мс, `hub` — сумму двух плеч до сервера без игровых тиков, `game` сохраняет исходную модель. Остальные входы лаборатории, подавители и полосовая метрика общие; один полный прогон занимает около 5 минут в release.
-
-Единственный полный повтор после исправления: 33 проверки прошли, одна пропущена; 510.31 с. Во всех окнах задержки и установившихся окнах до/после остановки PLC=0. Это один проход, сохраняющий известные ограничения hub выше.
-
-Прогоны 2026-10-24 завершились за 272.61/272.92 с для direct/hub. У прогретого AEC3 возврат своего голоса был ниже −50 дБ, но в тройном разговоре потери в полосе 1–4 кГц доходили до 12.1/9.4 дБ, а до обнаружения эха на холодном старте был слышен возврат. Это измеренные ограничения, а не пройденная приёмка качества; таблица и условия приведены в [DESIGN](DESIGN.md#network-lab).
-
-Офлайн gate-лаборатория и контроль удаления динамиков требуют двух независимых mono 48 кГц 16-bit WAV:
-
-```sh
-PTT_LAB_A=a.wav PTT_LAB_B=b.wav cargo test --release --test aec_gate -- --ignored --nocapture
-```
-
-По умолчанию 60 с на строку; `PTT_LAB_SECONDS` меняет длину основной таблицы (минимум 20). WAV сохраняются без нормализации в `target/tmp/aec_gate/`: near, headphones и speakers-{6,20,30}db, холодный и прогретый старт.
-
-Вручную, в трёх терминалах: эмулятор на двух игроков, у второго открытый микрофон; компаньоны с виртуальным звуком, второй «с динамиками». Эмулятор запускайте первым и ждите строк `playerN: ...`: HELLO, отправленный раньше, теряется, и ROSTER (а с ним `--auto-ptt`) придёт только со следующим heartbeat через 5 с.
-
-```sh
-./target/release/relay --player 34556:34555 --player 34566:34565 --open-mic 2   # --echo N, --half-duplex N, --delay-ms, --jitter-ms, --stall-every S
-./target/release/ptt-radio-companion --ptt-key none --mic-wav talk.wav --speaker-wav a-heard.wav --auto-ptt 4 --exit-after 8
-./target/release/ptt-radio-companion --game-port 34566 --port 34565 --ptt-key none \
-  --speaker-wav b-heard.wav --couple-gain-db -6 --couple-delay-ms 2 --exit-after 8
-```
-
-`a-heard.wav` — голос A, вернувшийся через динамики B. Без `--mic-wav`/`--speaker-wav` компаньон работает с настоящими устройствами, так что `relay` годится и для живой проверки двух компаньонов на одной машине без Factorio.
-
-### Полный gate
-
-```sh
-tools/gate.sh [--twice] [каталог логов]   # из ptt-radio/; по умолчанию логи в <target>/gate/<время>/
-```
-
-Шаги: `cargo fmt --check`, clippy release по всем целям, отладочные `--lib --bins` и одиннадцать интеграционных наборов (`--test-threads 1`), release `--lib`, сценарии, `aec_gate`, процессные замеры политики `policy_playout --ignored`, `luac -p` по всем модулям мода и четыре Lua-теста (контракт мода, каналы, админка, окно настроек). Обычный прогон гоняет сценарии один раз, примерно 8,5 минуты на прогретом кеше. `--twice` добавляет второй полный прогон сценариев, который ловит нестабильные проверки, например известный флейк double-talk через хаб; для слияния он не обязателен. Замеры в реальном времени на общей машине иногда проваливаются под нагрузкой: гонка при занятии UDP-порта, общая задержка планировщика. Поэтому упавшие тесты шага реального времени один раз перезапускаются по точному имени. Если перезапуск прошёл, шаг помечается в `summary.txt` как `flaky` и gate не проваливает. Качество подавления эха (тёплое подавление больше 20 дБ, возврат эха не выше связи) сценарии только печатают как `warning`; обнаружение эха и индикатор проверяются по-прежнему. Шаги выполняются и после провала, в `summary.txt` для каждого шага пишутся код выхода и время, а скрипт завершается с ненулевым кодом, если провалился хотя бы один шаг.
-
-Сценарии и `aec_gate` меряют звук в реальном времени, поэтому каждый такой шаг держит `flock` на общем файле блокировки: две задачи на одной машине не меряют одновременно. Файл задаёт `PTT_REALTIME_LOCK`. По умолчанию это `ptt-realtime.lock` в общем каталоге git, одном для всех worktree репозитория. `PTT_REALTIME_WAIT` ограничивает ожидание блокировки (по умолчанию 3600 с). Время ожидания пишется в `summary.txt` отдельно от времени шага. Нужны `flock`, `lua` и `luac` в `PATH`; на macOS `flock` ставится через Homebrew.
-
-## Запуск стенда
-
-```sh
-cd stand && docker compose up -d --build
-open -n -a /Applications/factorio.app --args \
-  --mod-directory "$PWD/../client-mods" --enable-lua-udp 34556 --mp-connect 127.0.0.1:34197
-uv run -q ../tools/radio.py hello
-uv run -q ../tools/radio.py talk --seconds 3                                    # строка HUD с вашим именем
-docker exec ptt-radio-factorio uv run -q /tools/radio.py talk --seconds 3 --expect-silence   # строка HUD «Сервер»
-```
-
-Индикатор эха без компаньона: байты `ECHO_STATE` кладутся в UDP-порт `--enable-lua-udp` того игрока, чей клиент запущен. Мод принимает их только от компаньона, приславшего HELLO, поэтому сначала `uv run -q ../tools/radio.py hello`, затем в течение 15 с включить: `printf '\x52\x01\x05\x00\x00\x01' | nc -u -w1 127.0.0.1 34556`, выключить: то же с `\x00` в конце. Без новых HELLO флаг снимется сам через 15 с вместе с «пропавшим» компаньоном. Компаньон на Rust шлёт `ECHO_STATE` сам, когда в нём включается эхо-гейт.
-
-### Хаб рядом с сервером
-
-`ptt-radio-hub` — ретранслятор для компаньонов, у которых не получается прямой P2P. Для мода он игрок 0: раз в 5 с шлёт HELLO на Lua UDP-порт сервера, мод отвечает ему SIGNAL через `send_udp(port, data, 0)` на localhost сервера. Поэтому хаб должен жить в сетевом пространстве сервера, а не просто в той же docker-сети. Устройство и флаги описаны в [DESIGN.md](DESIGN.md#relay-hub).
-
-Хаб включается отдельным файлом поверх стенда; без него стенд работает как раньше:
-
-```sh
-cd stand
-docker compose -f compose.yaml -f compose.hub.yaml up -d --build    # factorio пересоздаётся: у него появляется порт хаба
-docker compose -f compose.yaml -f compose.hub.yaml logs hub         # строка «hub: public ... | game ... via ...»
-docker compose -f compose.yaml -f compose.hub.yaml stop hub         # SIGTERM: хаб печатает итоговую строку счётчиков
-```
-
-`compose.hub.yaml` добавляет сервис `hub` с `network_mode: "service:factorio"`: 127.0.0.1 внутри хаба — это loopback сервера. Публичный порт хаба объявлен у `factorio`, потому что порты общего сетевого пространства публикует только его владелец; у самого `hub` секции `ports` быть не может. Образ собирается из `companion/` по `stand/Dockerfile.hub` (Rust с cmake для встроенного libopus, затем slim-образ с одним бинарником).
-
-Флаги и переменные:
-
-- `--public 0.0.0.0:34560`: UDP-адрес, к которому привязываются компаньоны. Наружу он публикуется как `${HUB_PUBLIC_PORT-34560}/udp`. Хаб не знает своего внешнего адреса, а грант адреса не содержит, поэтому адрес хаба задаётся каждому компаньону флагом `--hub <адрес сервера>:<HUB_PUBLIC_PORT>` (ниже). BIND-ответ отражает компаньону его собственный внешний адрес, не адрес хаба.
-- `--game 127.0.0.1:${LUA_UDP_PORT-34556}`: Lua UDP-порт сервера, та же переменная `LUA_UDP_PORT`, что у `--enable-lua-udp` в `compose.yaml`. Пустой `LUA_UDP_PORT` выключает Lua UDP у сервера, и хаб становится бесполезен.
-- `--receive 127.0.0.1:34557`: локальный порт для SIGNAL от мода; его номер уходит в HELLO.
-- `--game` и `--receive` принимают только IP-адреса: `localhost` или имя сервиса не подойдут, флаг не разберётся.
-
-Компаньоны игроков: каждый запускается с `--hub <адрес сервера>:34560`, где адрес — тот же, к которому подключается игра, а порт — `HUB_PUBLIC_PORT`. Флаг принимает только IP-адрес с портом. Без `--hub` компаньон хабом не пользуется: остаются прямой P2P, ретрансляция через другого игрока и путь через игру. С `--game-only` компаньон не открывает UDP-маршрутов вовсе и шлёт голос только через игру. Какой маршрут выбран, видно по `--trace <файл>`: строки `switch <игрок> Direct selected`, `switch <игрок> Hub { session: N } selected`, `switch <игрок> PlayerRelay { ... } selected` или `switch <игрок> Game selected`. Отправленные копии кадра записываются строками `route_tx`. Остальные флаги UDP (`--udp-bind`, `--stun-server`) описаны в [DESIGN.md](DESIGN.md).
-
-Сеть: хаб работает только по UDP. На сервере с брандмауэром откройте входящий UDP на публичный порт хаба, за NAT пробросьте его на хост стенда (UDP, не TCP). Порт игры 34197/udp пробрасывается так же, как раньше.
-
-Как понять, что хаб зарегистрировался. Живых счётчиков у хаба нет, а мод не пишет игрокам про игрока 0. Итоговая строка печатается при остановке:
-
-```
-hub: forwarded N | bind replies N | signals N | refused grants N | dropped: ...
-```
-
-`signals` больше нуля значит, что мод доставлял хабу ANNOUNCE и хаб выдавал гранты, то есть регистрация прошла. `bind replies` — ответы на BIND от компаньонов, `forwarded` — пересланные датаграммы, `refused grants` — гранты, упёршиеся в лимиты.
-
-ROSTER, которым мод отвечает на HELLO хаба, хаб пропускает и не считает. Хаб не производит голос: его пятибайтовый HELLO регистрирует только сигнализацию и relay. `signals` считает SIGNAL, которые хаб отправил моду, то есть в основном гранты. Поэтому `signals 0` — нормальный результат, пока ни один компаньон, умеющий UDP, не прислал ANNOUNCE. Старые компаньоны ANNOUNCE не шлют. Компаньон с `--game-only` шлёт ANNOUNCE без возможности UDP, и хаб в ответ гранты не выдаёт, а снимает прежние гранты этого игрока.
-
-Если не работает:
-
-- `signals 0` при подключённых игроках с компаньонами, умеющими UDP: HELLO хаба не доходит до мода. Проверьте, что `--game` совпадает с `LUA_UDP_PORT` (`docker compose ... config` покажет оба), что сервер запущен с `--enable-lua-udp` и что хаб запущен поверх того же `factorio` (`network_mode: service:factorio`). Регистрация живёт 15 с без HELLO; после перезапуска контейнера `factorio` перезапустите и `hub`: он остаётся в сетевом пространстве старого контейнера.
-- `error: cannot bind receive` или `cannot bind public`: порт уже занят в пространстве сервера, например вторым хабом. Поменяйте `--receive`; мод узнает новый порт из следующего HELLO.
-- `bind replies 0` при `signals` больше нуля: компаньоны не достают до публичного порта. Порт не опубликован (смотрите `docker compose ... ps` у `factorio`), закрыт брандмауэром или не проброшен через NAT.
-- Игроки в одной локальной сети с сервером: внешний адрес хаба из LAN часто недоступен (роутер без hairpin NAT). Хаб слушает `0.0.0.0`, поэтому из LAN к нему можно обращаться по локальному адресу хоста.
-- Хаб, перезапущенный при живой игре, получает новую случайную генерацию: все старые гранты перестают действовать, компаньонам нужен новый ANNOUNCE.
-
-Приёмка на живом стенде: [stand/ACCEPTANCE.md](stand/ACCEPTANCE.md).
-
-## Проверено 2026-10-24
-
-Один клиент macOS и headless-сервер в OrbStack на одной машине.
-
-| Проверка | Результат |
-|---|---|
-| HELLO → ROSTER | список игроков с индексами и цветами, включая псевдоигрока 0 «Сервер» |
-| Плашка и щелчки | видно глазами: рамка «Рация» с ником в цвете игрока, затем «Сервер»; щелчки на начале и конце |
-| Пересылка от «Сервера» | 150/150 кадров, START и STOP |
-| Без эхо | свой голос не возвращается |
-| Эхо | 250/250 кадров подряд; RTT кадра p50 75–77 мс, p95 ≤87 мс; STOP через 76–84 мс после отпускания |
-| Упавший компаньон (`--no-stop`) | мод рассылает STOP через 587 мс после последнего кадра |
-| `ALT + T` в игре (v0.1) | TOGGLE приходит своему компаньону, но клавиша заодно открывает экран технологий; в v0.2 заменена на `ALT + V` |
-
-Разовый выброс: первый кадр одного прогона вернулся через 317 мс, в повторах этого не было.
-
-v0.2 на том же стенде: мод грузится на сервере и в клиенте с одинаковыми контрольными суммами, HELLO возвращает ростер и `open mic: off`. Кнопку, `ALT + V` и сообщения о компаньоне ещё не проверяли руками; это сделаем вместе с Rust-компаньоном (`radio.py listen --heartbeat` изображает живой компаньон).
+GPL-3.0-only. See [LICENSE](LICENSE).

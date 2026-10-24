@@ -461,6 +461,14 @@ end
 assert(slurp(dir .. "locale/ru/ptt-radio.cfg"):find("ередача запрещена администратором", 1, true))
 assert(slurp(dir .. "locale/ru/ptt-radio.cfg"):find("бязательный канал администратора", 1, true))
 assert(slurp(dir .. "locale/en/ptt-radio.cfg"):find("honest clients", 1, true))
+-- the no-companion hint is printed without parameters and points at the setup guide
+for lang, url in pairs({
+  en = "https://github.com/vshuraeff/ptt-radio/wiki",
+  ru = "https://github.com/vshuraeff/ptt-radio/wiki/RU-Installation",
+}) do
+  local hint = slurp(dir .. "locale/" .. lang .. "/ptt-radio.cfg"):match("\nno%-companion=([^\n]*)")
+  assert(hint and hint:sub(-#url) == url and not hint:find("__%d+__"), lang .. " no-companion hint")
+end
 
 -- control.lua wiring
 fresh()

@@ -4,6 +4,7 @@
   "title": "PTT Radio",
   "author": "vshuraeff",
   "factorio_version": "2.1",
-  "description": "Push-to-talk voice radio carried through the multiplayer game itself. Needs the ptt-radio companion and the --enable-lua-udp launch flag to talk and listen; shows who is speaking to every player.",
+  "homepage": "https://github.com/vshuraeff/ptt-radio",
+  "description": "Push-to-talk voice radio for multiplayer, with channels, a speaker HUD and admin controls. Every player who talks or listens needs the free ptt-radio companion app running and the game launched with --enable-lua-udp 34556. Required on the server and on every client. Setup guide: github.com/vshuraeff/ptt-radio/wiki",
   "dependencies": ["base >= 2.1.0"]
 }
