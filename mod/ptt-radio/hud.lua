@@ -1,5 +1,5 @@
 -- speaker hud: one row per active talker, stacked down from a fixed origin near the
--- right edge of gui.screen. rows appear on an accepted START, keep their place until
+-- left edge of gui.screen. rows appear on an accepted START, keep their place until
 -- the talker stops and the rest close up behind them.
 --
 -- storage.hud.rows is an array in activation order, so the array index is the
@@ -20,7 +20,7 @@ local SERVER_COLOR = { r = 0.8, g = 0.8, b = 0.8, a = 1 }
 
 -- sizes are gui units and scale with display_scale; the origin is a fraction of the
 -- screen height in pixels, and rows never reach below BOTTOM
-local ROW_WIDTH, ROW_HEIGHT, ROW_SPACING, RIGHT_MARGIN = 240, 32, 4, 8
+local ROW_WIDTH, ROW_HEIGHT, ROW_SPACING, LEFT_MARGIN = 240, 32, 4, 8
 local ICON_SIZE, NAME_WIDTH, TAIL_WIDTH = 24, 136, 56
 local TOP, BOTTOM = 0.4, 0.8
 local SEGMENT_WIDTH, SEGMENT_HEIGHTS = 6, { 8, 12, 16 }
@@ -134,7 +134,7 @@ function hud.render(viewer)
   local capacity = math.max(2, math.floor((resolution.height * BOTTOM - top + ROW_SPACING * scale) / pitch))
   local root = screen.add({ type = "flow", name = ROOT, direction = "vertical" })
   root.style.vertical_spacing = ROW_SPACING
-  root.location = { x = math.floor(resolution.width - (ROW_WIDTH + RIGHT_MARGIN) * scale), y = top }
+  root.location = { x = math.floor(LEFT_MARGIN * scale), y = top }
   -- an overflowing stack keeps the earliest talkers and turns the last slot into «ещё N»
   local count = #shown > capacity and capacity - 1 or #shown
   for i = 1, count do add_row(root, viewer, shown[i]) end

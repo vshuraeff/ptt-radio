@@ -425,7 +425,7 @@ game.tick = 320; handlers.on_tick({ tick = 320 }); assert(not level(3, 2) and ro
 emit(3, valid, 321); emit(2, packet(5, 0, "\1"), 322); assert(not row(3, 2).content.tail.bars)
 emit(2, packet(5, 0, "\0"), 323); assert(row(3, 2).content.tail.bars)
 players[3].display_resolution = { width = 1280, height = 300 }
-handlers.on_player_display_resolution_changed({ player_index = 3 }); assert(root(3).location.x == 1032)
+handlers.on_player_display_resolution_changed({ player_index = 3 }); assert(root(3).location.x == 8 and root(3).location.y == 120)
 emit(2, media(0x0D, nil, GEN, 1), 324); assert(row(3, 2))
 emit(2, media(0x0D, nil, GEN, 2), 325); assert(not row(3, 2) and not level(3, 2))
 game.tick = 356; nth[15]({ tick = 356 }); assert(not root(3))
@@ -437,9 +437,9 @@ for index = 1, 4 do emit(index, media(0x0B), index) end
 assert(stack(1) == "1,2,+2" and stack(2) == "1,2,3,4")
 players[1].display_resolution = { width = 1920, height = 1080 }
 handlers.on_player_display_resolution_changed({ player_index = 1 })
-assert(stack(1) == "1,2,3,4" and root(1).location.x == 1672)
+assert(stack(1) == "1,2,3,4" and root(1).location.x == 8 and root(1).location.y == 432)
 players[1].display_scale = 2; handlers.on_player_display_scale_changed({ player_index = 1 })
-assert(root(1).location.x == 1424 and stack(1) == "1,2,3,4")
+assert(root(1).location.x == 16 and stack(1) == "1,2,3,4")
 emit(2, media(0x0D)); assert(stack(3) == "1,3,4")
 
 -- microphone/half-duplex wiring and liveness remain independent of routing policy.
