@@ -23,7 +23,37 @@
    - Linux: `~/.factorio/mods`
 3. Запустите игру и проверьте в «Модах», что *PTT Radio* включён.
 
-## 2. Скачайте компаньон
+## 2. Установите компаньон
+
+На macOS или Linux выполните в Терминале:
+
+```sh
+curl -fsSL https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh | sh
+```
+
+На Windows x86_64 выполните в PowerShell 5.1 или новее:
+
+```powershell
+irm https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 | iex
+```
+
+Установщик скачивает последний релиз, сверяет SHA-256 и помещает программу в `ptt-radio-companion` внутри каталога данных Factorio (родительской папки `mods`, указанной выше). Он печатает команду запуска и параметр Steam, не требует прав администратора и не меняет настройки Steam. Повторный запуск обновляет установку. При ошибке загрузки, контрольной суммы или структуры архива предыдущая установка сохраняется.
+
+Для своих папок или конкретной версии сначала скачайте установщик и передайте параметры:
+
+```sh
+curl -fsSLo install.sh https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh
+sh install.sh --factorio-dir "/path/to/Factorio data" --mods-dir "/path/to/custom mods" --version v0.4.0
+```
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 -OutFile install.ps1
+& .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.0
+```
+
+`--mods-dir` / `-ModsDir` записывает абсолютный путь к модам в `install.json`; папку модов и `mod-list.json` установщик не меняет. Без этого параметра используется `<каталог данных>/mods`. Версия компаньона должна совпадать с модом. Архив Linux пока есть только для x86_64 с glibc 2.35 или новее; macOS поддерживает Apple silicon и Intel. Для остальных платформ установщик сообщает об отсутствии подходящего архива.
+
+### Ручная загрузка
 
 1. На [странице релизов](https://github.com/vshuraeff/ptt-radio/releases) скачайте файл для своей системы:
 
@@ -45,7 +75,7 @@
 **Steam (Windows, macOS, Linux).**
 
 1. В библиотеке Steam щёлкните по Factorio правой кнопкой и выберите «Свойства».
-2. На вкладке «Общие» впишите `--enable-lua-udp 34556` в поле «Параметры запуска».
+2. На вкладке «Общие» вставьте напечатанный установщиком параметр Steam в поле «Параметры запуска». Он имеет вид `"<каталог данных>/ptt-radio-companion/ptt-radio-companion" --launch %command%` (на Windows — с `.exe`). Компаньон запустится вместе с игрой и добавит флаг Lua UDP. Если запускаете компаньон отдельно, укажите `--enable-lua-udp 34556`.
 3. Закройте окно и запускайте игру как обычно.
 
 **Версия с factorio.com.** Запускайте игру с флагом или допишите его в ярлык:
@@ -63,7 +93,7 @@ open -a factorio --args --enable-lua-udp 34556
 
 ## 4. Проверьте
 
-1. Запустите компаньон (см. [Компаньон](RU-Companion)).
+1. Выполните напечатанную установщиком команду запуска или запустите Factorio через указанный параметр Steam (см. [Компаньон](RU-Companion)).
 2. Зайдите в сетевую игру.
 3. Через несколько секунд в чате появится `Рация: компаньон подключён.`, а компаньон выведет список игроков после строки `roster:`.
 

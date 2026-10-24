@@ -24,6 +24,7 @@ Everything is on the [releases page](https://github.com/vshuraeff/ptt-radio/rele
 | `ptt-radio-companion-<ver>-macos-universal.zip` | companion for macOS (Apple silicon and Intel) |
 | `ptt-radio-companion-<ver>-linux-x86_64.tar.gz` | companion for Linux |
 | `ptt-radio-hub-<ver>-linux-x86_64.tar.gz`, `ptt-radio-hub-<ver>-linux-aarch64.tar.gz` | optional relay hub for the game server |
+| `install.sh`, `install.ps1` | companion installers for macOS/Linux and Windows |
 | `SHA256SUMS` | checksums of all the files above |
 
 The hub is also published as a container image, `ghcr.io/vshuraeff/ptt-radio-hub`.
@@ -32,9 +33,23 @@ The hub is also published as a container image, `ghcr.io/vshuraeff/ptt-radio-hub
 
 1. Install the mod. Put `ptt-radio_<ver>.zip` into your Factorio `mods` folder, or install PTT Radio from the mod portal. The server needs it too.
 2. Launch Factorio with the Lua UDP port open: add `--enable-lua-udp 34556` to the launch options. In Steam: right-click Factorio, then Properties, then Launch options.
-3. Unpack the companion for your system and start `ptt-radio-companion` from a terminal. With no arguments it uses port 34556 for the game and listens on 34555, which is the mod's default. On macOS, allow microphone access when asked.
+3. Install the companion with the command below, then run the start command it prints. With no arguments it uses port 34556 for the game and listens on 34555, which is the mod's default. On macOS, allow microphone access when asked.
 4. Join the game. The chat shows "Radio: companion connected."
 5. Hold **F8** to talk, or press **ALT + V** to toggle the open microphone.
+
+macOS / Linux (Terminal):
+
+```sh
+curl -fsSL https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell 5.1 or later):
+
+```powershell
+irm https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 | iex
+```
+
+The installer verifies the release archive against `SHA256SUMS` and puts the companion in `ptt-radio-companion` inside Factorio's user-data folder. Run it again to update. It prints a Steam launch option that starts both programs and supplies the Lua UDP flag. It needs no administrator access and does not edit Steam settings. For custom folders, pinned versions or manual downloads, see [Installation](https://github.com/vshuraeff/ptt-radio/wiki/Installation).
 
 If the chat says "Radio: no companion", the companion is not running or the game was started without `--enable-lua-udp`. The mod cannot tell these two apart. See [Troubleshooting](https://github.com/vshuraeff/ptt-radio/wiki/Troubleshooting).
 
@@ -81,9 +96,21 @@ PTT Radio — рация с кнопкой «нажми и говори» для
 
 1. Установите мод: положите `ptt-radio_<версия>.zip` со [страницы релизов](https://github.com/vshuraeff/ptt-radio/releases) в папку `mods` или установите PTT Radio с мод-портала. На сервере мод тоже нужен.
 2. Запускайте Factorio с параметром `--enable-lua-udp 34556`. В Steam: правой кнопкой по Factorio, «Свойства», «Параметры запуска».
-3. Распакуйте компаньон для своей системы и запустите `ptt-radio-companion` из терминала. Без аргументов он работает с игрой на порту 34556 и слушает порт 34555 — это значение по умолчанию в настройках мода. На macOS разрешите доступ к микрофону, когда система спросит.
+3. Установите компаньон командой ниже (Terminal на macOS/Linux, PowerShell на Windows), затем выполните напечатанную команду запуска. Установщик проверяет SHA-256 и кладёт программу в папку `ptt-radio-companion` внутри каталога данных Factorio. Повторный запуск обновляет установку. Он также печатает параметр Steam для совместного запуска игры и компаньона. Без аргументов компаньон работает с игрой на порту 34556 и слушает порт 34555 — это значение по умолчанию в настройках мода. На macOS разрешите доступ к микрофону, когда система спросит.
 4. Зайдите в игру. В чате появится «Рация: компаньон подключён».
 5. Держите **F8**, чтобы говорить, или нажмите **ALT + V**, чтобы включить открытый микрофон.
+
+macOS / Linux (Терминал):
+
+```sh
+curl -fsSL https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell 5.1 или новее):
+
+```powershell
+irm https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 | iex
+```
 
 Если в чате написано «Рация: компаньон не найден», значит, компаньон не запущен или игра запущена без `--enable-lua-udp`; мод не может отличить одно от другого. Настройки рации открываются клавишами `ALT + SHIFT + V`. Компаньон из релиза сам обновляется до последней версии при каждом запуске (отключается флагом `--no-self-update`). В Linux клавиша PTT работает только в сеансе X11.
 
