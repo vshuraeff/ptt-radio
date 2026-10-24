@@ -31,7 +31,7 @@ A player without the companion sees who is speaking but hears nothing and cannot
 
 - Channels separate listeners only among honest clients. The server and a modified client can hear every channel.
 - A paused game, and an autosave, pause the voice that goes through the game.
-- The push-to-talk key does not work in the Windows companion yet; use the open microphone there. On Linux the key needs an X11 session.
+- On Linux the push-to-talk key needs an X11 session.
 
 ### Help
 
@@ -62,7 +62,7 @@ Installation, server setup and troubleshooting: [wiki](https://github.com/vshura
 
 - Каналы разделяют слушателей только среди честных клиентов. Сервер и изменённый клиент слышат все каналы.
 - Пауза и автосохранение останавливают голос, который идёт через игру.
-- В Windows клавиша PTT в компаньоне пока не работает, говорите через открытый микрофон. В Linux клавиша работает только в сеансе X11.
+- В Linux клавиша PTT работает только в сеансе X11.
 
 ### Помощь
 

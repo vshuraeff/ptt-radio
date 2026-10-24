@@ -88,9 +88,14 @@ The companion starts and the key works, but nobody hears you. macOS gives an app
 
 ## Self-update messages
 
-At start the companion may print a line beginning with `self-update:`, for example when there is no internet, GitHub does not answer, the checksum does not match, or the companion may not replace its own file. This is not an error that stops anything: the companion keeps running the version you have and tries again at the next start.
+At every start the companion prints one line beginning with `self-update:`. A failed check never stops anything: the companion keeps running the version you have and tries again at the next start.
 
-- If the line says the file cannot be replaced, the companion sits in a folder you cannot write to (for example *Program Files* or a system folder). Move it to a folder of your own, or update by hand from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases).
+- `self-update: up to date (0.4.0, latest release 0.4.0)`: nothing to do.
+- `self-update: updated to 0.4.1`: the new version has just replaced the old one and restarted.
+- `self-update: GET https://...: ...`: no internet, or GitHub did not answer in time.
+- `self-update: checksum mismatch for ..., update refused`: the download was damaged or tampered with; nothing was installed.
+- `self-update: replace ...: ...` or `self-update: recovery copy of ...: ...`: the companion sits in a folder you cannot write to (for example *Program Files* or a system folder). Move it to a folder of your own, or update by hand from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases).
+- `self-update: replace failed (...), restore failed: ...; the previous version is ...`: the swap broke halfway. The old program is kept under the name the line shows; rename it back to `ptt-radio-companion` (`ptt-radio-companion.exe` on Windows) or download the release again.
 - `self-update: disabled (not a release build)` means you built the companion yourself; such builds never update.
 - To turn the check off, start with `--no-self-update` or set `PTT_RADIO_NO_SELF_UPDATE=1`.
 

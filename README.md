@@ -57,7 +57,7 @@ The settings window picks your transmit channel and the channels you listen to, 
 - **Echo warning.** If the companion hears your speakers in your microphone, your line in the speaker list says "echo" and you get a button to turn off the open microphone. Headphones fix it.
 - **Channels are not private.** They separate listeners only among honest clients. The server and a modified client can hear every channel.
 - **A paused game pauses the voice** that goes through the game. Autosaves do too.
-- **Windows:** the push-to-talk key does not work in the Windows companion yet. Use the open microphone (`ALT + V`) instead.
+- **The companion keeps itself up to date.** Release builds check the latest GitHub release at every start, install it after verifying its checksum, and restart. Turn it off with `--no-self-update` or `PTT_RADIO_NO_SELF_UPDATE=1`.
 - **Linux:** the push-to-talk key needs an X11 session. A pure Wayland session has no global key for the companion yet.
 
 ## Documentation
@@ -84,7 +84,7 @@ PTT Radio — рация с кнопкой «нажми и говори» для
 4. Зайдите в игру. В чате появится «Рация: компаньон подключён».
 5. Держите **F8**, чтобы говорить, или нажмите **ALT + V**, чтобы включить открытый микрофон.
 
-Если в чате написано «Рация: компаньон не найден», значит, компаньон не запущен или игра запущена без `--enable-lua-udp`; мод не может отличить одно от другого. Настройки рации открываются клавишами `ALT + SHIFT + V`. В Windows клавиша PTT в компаньоне пока не работает, говорите через открытый микрофон. В Linux клавиша PTT работает только в сеансе X11.
+Если в чате написано «Рация: компаньон не найден», значит, компаньон не запущен или игра запущена без `--enable-lua-udp`; мод не может отличить одно от другого. Настройки рации открываются клавишами `ALT + SHIFT + V`. Компаньон из релиза сам обновляется до последней версии при каждом запуске (отключается флагом `--no-self-update`). В Linux клавиша PTT работает только в сеансе X11.
 
 Подробные инструкции на русском — в вики: [Установка](https://github.com/vshuraeff/ptt-radio/wiki/RU-Installation), [Решение проблем](https://github.com/vshuraeff/ptt-radio/wiki/RU-Troubleshooting).
 
