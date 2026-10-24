@@ -1,11 +1,17 @@
 #!/bin/bash
-# full acceptance gate: fmt, clippy, debug tests, release lib, the real-time scenario suite twice, aec_gate, lua checks.
+# full acceptance gate: fmt, clippy, debug tests, release lib, the real-time scenario suite, aec_gate, lua checks.
 # every step runs even after a failure; the exit status is non-zero when any step failed.
-# usage: tools/gate.sh [log dir]
+# usage: tools/gate.sh [--twice] [log dir]
+#   --twice  runs the scenario suite a second time to expose flaky cases; use it for the check before landing
 # env: PTT_REALTIME_LOCK  lock file shared by everything that measures real-time audio on this machine
 #                         (default: ptt-realtime.lock in the repository's git common dir, shared by all worktrees)
 #      PTT_REALTIME_WAIT  seconds to wait for that lock per real-time step (default 3600)
 set -uo pipefail
+runs=1
+if [ "${1:-}" = --twice ]; then
+  runs=2
+  shift
+fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 companion=$root/companion
 target=${CARGO_TARGET_DIR:-$companion/target}
@@ -51,7 +57,7 @@ realtime() {
   exec 9>&-
 }
 
-note "gate $(git -C "$root" rev-parse HEAD) logs $log lock $lock"
+note "gate $(git -C "$root" rev-parse HEAD) logs $log lock $lock scenario runs $runs"
 step fmt cargo fmt --check
 step clippy cargo clippy --locked --all-targets --release -- -D warnings
 
@@ -61,9 +67,10 @@ for t in bridge_repr connectivity crypto_sessions game_probe multiparty_lab netl
 done
 
 step release-lib cargo test --locked --release --lib
-# two full runs of the real-time suite expose flaky cases; a failure in either fails the gate
-realtime scenarios-1 cargo test --locked --release --test scenarios -- --nocapture --test-threads 1
-realtime scenarios-2 cargo test --locked --release --test scenarios -- --nocapture --test-threads 1
+# with --twice a second full run exposes flaky cases; a failure in either run fails the gate
+for run in $(seq 1 "$runs"); do
+  realtime "scenarios-$run" cargo test --locked --release --test scenarios -- --nocapture --test-threads 1
+done
 realtime aec_gate cargo test --locked --release --test aec_gate -- --nocapture --test-threads 1
 
 step luac-control luac -p ../mod/ptt-radio/control.lua
