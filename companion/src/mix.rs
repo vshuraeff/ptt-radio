@@ -1,6 +1,6 @@
 //! one stream per speaker: a reorder stage, one opus decoder and a jitter queue,
 //! mixed every SLICE tick. a packet that continues its stream is decoded as it
-//! arrives (the game transport is lossless and in order); one behind a gap waits
+//! arrives; one behind a gap waits
 //! in the reorder stage until the gap fills or its deadline, when the gap is
 //! concealed (PLC, or FEC from the next packet). decoded audio is queued as
 //! SLICE-long pieces, so senders with 10 ms and 20 ms packets mix alike and
@@ -9,9 +9,10 @@
 //! any slice once the backlog has stood for SHED_SPEECH_AFTER, with a short
 //! crossfade over the cut.
 //!
-//! a player is on legacy game media until trusted signaling selects a stream
-//! generation for it (`select`); then only its v2 media of that generation plays,
-//! under the talkspurt rules of `game`, and its legacy copies are ignored. its
+//! a legacy player needs no stream selection. v2 game media waits in a bounded
+//! hold until trusted signaling selects its generation (`select`); then only
+//! v2 media of that generation plays under the talkspurt rules of `game`, and
+//! legacy copies are ignored. its
 //! order and decoder outlive an idle close of its pcm stream until a newer
 //! talkspurt opens, so a late copy of what already played stays a duplicate.
 
@@ -23,10 +24,10 @@ use opusic_c::{Channels, Decoder, SampleRate};
 use crate::audio::OPUS_RATE;
 use crate::jitter::{Pull, SLICE, Stream};
 use crate::reorder::{self, Reorder};
-use crate::transport::wire::{GameMedia, Kind};
+use crate::transport::wire::{GameMedia, Kind, MAX_OPUS};
 use crate::transport::{
-    CompressedFrame, InsertResult, Ordered, PreDecodeOrder, SerialOrder, StreamId, selected_stream,
-    serial_order,
+    CompressedFrame, InsertResult, Ordered, PreDecodeOrder, SerialOrder, StreamId, extend_sequence,
+    selected_stream, serial_order,
 };
 
 pub const SLICE_SAMPLES: usize = OPUS_RATE as usize * SLICE.as_millis() as usize / 1000;
@@ -49,6 +50,136 @@ const LEGACY: u64 = 0;
 /// a selected stream's talkspurt is forgotten after this long without its media, long
 /// before 32768 presses could make a newer one compare as older
 const TALKSPURT_FORGET: Duration = Duration::from_secs(60);
+const EARLY_LIMIT: usize = 20;
+const EARLY_PLAYERS: usize = 256;
+const EARLY_TTL: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaOutcome {
+    Accepted,
+    Held,
+    Duplicate,
+    Dropped(&'static str),
+}
+
+struct Held {
+    kind: Kind,
+    sequence: u16,
+    talkspurt: u16,
+    opus: Vec<u8>,
+    at: Instant,
+}
+
+struct Early {
+    generation: u64,
+    voice: Vec<Held>,
+    start: Option<Held>,
+    stop: Option<Held>,
+}
+
+impl Early {
+    fn len(&self) -> usize {
+        self.voice.len() + usize::from(self.start.is_some()) + usize::from(self.stop.is_some())
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.voice
+            .retain(|m| now.saturating_duration_since(m.at) < EARLY_TTL);
+        if self
+            .start
+            .as_ref()
+            .is_some_and(|m| now.saturating_duration_since(m.at) >= EARLY_TTL)
+        {
+            self.start = None;
+        }
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|m| now.saturating_duration_since(m.at) >= EARLY_TTL)
+        {
+            self.stop = None;
+        }
+    }
+
+    fn push(&mut self, media: GameMedia<'_>, now: Instant) -> bool {
+        if media.opus.len() > MAX_OPUS {
+            return false;
+        }
+        let held = Held {
+            kind: media.kind,
+            sequence: media.sequence,
+            talkspurt: media.talkspurt,
+            opus: media.opus.to_vec(),
+            at: now,
+        };
+        match media.kind {
+            Kind::Voice => {
+                if self
+                    .voice
+                    .iter()
+                    .any(|m| m.sequence == media.sequence && m.talkspurt == media.talkspurt)
+                {
+                    return false;
+                }
+                if self.len() == EARLY_LIMIT && self.start.take().is_none() {
+                    self.voice.remove(0);
+                }
+                self.voice.push(held);
+            }
+            Kind::Start => {
+                if let Some(start) = &self.start {
+                    if serial_order(media.talkspurt, start.talkspurt) != SerialOrder::Newer {
+                        return false;
+                    }
+                } else if self.len() == EARLY_LIMIT {
+                    return false;
+                }
+                self.start = Some(held);
+            }
+            Kind::Stop => {
+                if let Some(stop) = &self.stop {
+                    if serial_order(media.talkspurt, stop.talkspurt) != SerialOrder::Newer
+                        && !(media.talkspurt == stop.talkspurt
+                            && serial_order(media.sequence, stop.sequence) == SerialOrder::Newer)
+                    {
+                        return false;
+                    }
+                } else if self.len() == EARLY_LIMIT && self.start.take().is_none() {
+                    self.voice.remove(0);
+                }
+                self.stop = Some(held);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn ordered(mut self) -> Vec<Held> {
+        self.voice.extend(self.start);
+        self.voice.extend(self.stop);
+        let Some(first) = self.voice.iter().min_by_key(|m| m.at) else {
+            return Vec::new();
+        };
+        let talk_reference = 0x10000 | u32::from(first.talkspurt);
+        let sequence_reference = 0x10000 | u32::from(first.sequence);
+        self.voice.retain(|m| {
+            extend_sequence(m.talkspurt, talk_reference).is_some()
+                && extend_sequence(m.sequence, sequence_reference).is_some()
+        });
+        self.voice.sort_by_key(|m| {
+            (
+                extend_sequence(m.talkspurt, talk_reference).unwrap(),
+                extend_sequence(m.sequence, sequence_reference).unwrap(),
+                match m.kind {
+                    Kind::Start => 0,
+                    Kind::Voice => 1,
+                    _ => 2,
+                },
+            )
+        });
+        self.voice
+    }
+}
 
 /// SLICE of decoded audio and where it came from: the packet's seq and the sample
 /// offset of its first sample in that packet
@@ -109,10 +240,14 @@ pub struct Pulled {
 }
 
 impl Speaker {
-    fn new(stream: StreamId, now: Instant) -> Self {
+    fn new(stream: StreamId, wait: Option<Duration>, now: Instant) -> Self {
+        let mut order = Reorder::new(stream, reorder::GAME_ONLY);
+        if let Some(wait) = wait {
+            order.set_wait(wait);
+        }
         Speaker {
             stream: Some(Stream::new(now)),
-            order: Reorder::new(stream, reorder::GAME_ONLY),
+            order,
             decoder: Decoder::new(Channels::Mono, SampleRate::Hz48000).expect("opus decoder"),
             pending: VecDeque::new(),
             level: 0.0,
@@ -231,6 +366,8 @@ pub struct Mixer {
     speakers: BTreeMap<u16, Speaker>,
     /// players on v2 game media; the rest are on legacy media
     selected: BTreeMap<u16, Selection>,
+    early: BTreeMap<u16, Early>,
+    waits: BTreeMap<u16, Duration>,
     pub stats: MixStats,
     /// what the last `tick` played, per audible speaker
     pub pulled: Vec<Pulled>,
@@ -244,6 +381,14 @@ fn legacy(sender: u16) -> StreamId {
 }
 
 impl Mixer {
+    /// changes the gap budget without replacing the decoder or queued identities.
+    pub fn reorder_wait(&mut self, player: u16, wait: Duration) {
+        self.waits.insert(player, wait);
+        if let Some(speaker) = self.speakers.get_mut(&player) {
+            speaker.order.set_wait(wait);
+        }
+    }
+
     /// legacy START. it carries no generation, so the sequence begins anew with the next
     /// VOICE: a restarted legacy companion counts from 1 again
     pub fn start(&mut self, sender: u16, now: Instant) {
@@ -253,6 +398,9 @@ impl Mixer {
         self.start_stream(legacy(sender), now);
         let speaker = self.speakers.get_mut(&sender).expect("opened above");
         speaker.order = Reorder::new(legacy(sender), reorder::GAME_ONLY);
+        if let Some(wait) = self.waits.get(&sender) {
+            speaker.order.set_wait(*wait);
+        }
     }
 
     /// legacy VOICE; returns whether it was queued for decoding
@@ -262,7 +410,7 @@ impl Mixer {
             self.stats.discarded += 1;
             return false;
         }
-        self.push(legacy(sender), 0, seq, packet, now)
+        self.push(legacy(sender), 0, seq, packet, now) == MediaOutcome::Accepted
     }
 
     /// legacy STOP
@@ -274,15 +422,17 @@ impl Mixer {
 
     /// trusted signaling (ANNOUNCE) selected `stream` for its player: from now on only v2
     /// media of that generation plays, and the player's legacy copies are ignored. a new
-    /// generation is a restarted companion: the former stream, its decoder and queues go
-    pub fn select(&mut self, stream: StreamId, now: Instant) {
+    /// generation is a restarted companion: the former stream, its decoder and queues go.
+    /// returns the voice identities released from the bounded game hold, for logical rx traces.
+    pub fn select(&mut self, stream: StreamId, now: Instant) -> Vec<(u16, u16)> {
+        self.expire_early(now);
         let player = stream.player;
         if self
             .selected
             .get(&player)
             .is_some_and(|s| s.generation == stream.generation)
         {
-            return;
+            return Vec::new();
         }
         self.selected.insert(
             player,
@@ -293,18 +443,97 @@ impl Mixer {
             },
         );
         self.speakers.remove(&player);
+        let mut received = Vec::new();
+        if let Some(early) = self
+            .early
+            .remove(&player)
+            .filter(|e| e.generation == stream.generation)
+        {
+            for held in early.ordered() {
+                let media = GameMedia {
+                    stream,
+                    kind: held.kind,
+                    sequence: held.sequence,
+                    talkspurt: held.talkspurt,
+                    opus: &held.opus,
+                };
+                if self.authenticated(media, now) && held.kind == Kind::Voice {
+                    received.push((player, held.sequence));
+                }
+            }
+        }
+        received
     }
 
-    /// v2 game media (START2, VOICE2, STOP2) of a selected stream; returns whether it was
-    /// taken. talkspurts: a repeated START of the open one changes nothing, STOP closes
+    fn expire_early(&mut self, now: Instant) {
+        self.early.retain(|_, early| {
+            early.expire(now);
+            early.len() != 0
+        });
+    }
+
+    /// trusted v2 game media: holds unselected generations without decoding and returns
+    /// true only when admitted to the selected stream. talkspurts: a repeated START of
+    /// the open one changes nothing, STOP closes
     /// only the open one it names and any other STOP is discarded, anything of an older
     /// or already closed one is discarded, and START or VOICE of a newer one opens it
     /// even when its START was lost
     pub fn game(&mut self, media: GameMedia<'_>, now: Instant) -> bool {
+        self.receive_game(media, now) == MediaOutcome::Accepted
+    }
+
+    pub fn receive_game(&mut self, media: GameMedia<'_>, now: Instant) -> MediaOutcome {
+        self.expire_early(now);
+        if self
+            .selected
+            .get(&media.stream.player)
+            .is_none_or(|s| s.generation != media.stream.generation)
+        {
+            if self.early.len() >= EARLY_PLAYERS && !self.early.contains_key(&media.stream.player) {
+                self.stats.discarded += 1;
+                return MediaOutcome::Dropped("hold-capacity");
+            }
+            let early = self
+                .early
+                .entry(media.stream.player)
+                .or_insert_with(|| Early {
+                    generation: media.stream.generation,
+                    voice: Vec::new(),
+                    start: None,
+                    stop: None,
+                });
+            let outcome = if early.generation != media.stream.generation {
+                MediaOutcome::Dropped("pending-generation")
+            } else if media.kind == Kind::Voice
+                && early
+                    .voice
+                    .iter()
+                    .any(|m| m.sequence == media.sequence && m.talkspurt == media.talkspurt)
+            {
+                MediaOutcome::Duplicate
+            } else if early.push(media, now) {
+                MediaOutcome::Held
+            } else {
+                MediaOutcome::Dropped("hold-control")
+            };
+            if outcome != MediaOutcome::Held {
+                self.stats.discarded += 1;
+            }
+            return outcome;
+        }
+        self.receive_authenticated(media, now)
+    }
+
+    /// authenticated UDP never establishes a stream or enters the game hold.
+    pub fn authenticated(&mut self, media: GameMedia<'_>, now: Instant) -> bool {
+        self.receive_authenticated(media, now) == MediaOutcome::Accepted
+    }
+
+    pub fn receive_authenticated(&mut self, media: GameMedia<'_>, now: Instant) -> MediaOutcome {
         let player = media.stream.player;
         let Some(selection) = self.selected.get_mut(&player) else {
             self.stats.discarded += 1;
-            return false;
+            return MediaOutcome::Dropped("unselected");
         };
         let selected = StreamId {
             player,
@@ -312,7 +541,7 @@ impl Mixer {
         };
         if selected_stream(selected, player, media.stream.generation).is_none() {
             self.stats.discarded += 1;
-            return false;
+            return MediaOutcome::Dropped("generation");
         }
         if now - selection.last_seen > TALKSPURT_FORGET {
             selection.talkspurt = None;
@@ -326,18 +555,18 @@ impl Mixer {
             // overtake its own talkspurt's media, which then plays and closes when idle
             if order != Some((SerialOrder::Equal, true)) {
                 self.stats.discarded += 1;
-                return false;
+                return MediaOutcome::Dropped("talkspurt-stop");
             }
             selection.talkspurt = Some((media.talkspurt, false));
             self.stop_stream(player);
-            return true;
+            return MediaOutcome::Accepted;
         }
         let opens = match order {
             None | Some((SerialOrder::Newer, _)) => true,
             Some((SerialOrder::Equal, true)) => false,
             _ => {
                 self.stats.discarded += 1;
-                return false;
+                return MediaOutcome::Dropped("talkspurt");
             }
         };
         selection.talkspurt = Some((media.talkspurt, true));
@@ -357,7 +586,7 @@ impl Mixer {
         if media.kind == Kind::Voice {
             return self.push(selected, media.talkspurt, media.sequence, media.opus, now);
         }
-        true
+        MediaOutcome::Accepted
     }
 
     /// START on a stream that still plays keeps its decoder and queues (Stream::restart)
@@ -368,8 +597,10 @@ impl Mixer {
                 None => speaker.stream = Some(Stream::new(now)),
             },
             None => {
-                self.speakers
-                    .insert(stream.player, Speaker::new(stream, now));
+                self.speakers.insert(
+                    stream.player,
+                    Speaker::new(stream, self.waits.get(&stream.player).copied(), now),
+                );
             }
         }
     }
@@ -382,26 +613,35 @@ impl Mixer {
         seq: u16,
         opus: &[u8],
         now: Instant,
-    ) -> bool {
+    ) -> MediaOutcome {
         // without a speaker the START was missed (companion started mid-transmission)
         let speaker = self
             .speakers
             .entry(stream.player)
-            .or_insert_with(|| Speaker::new(stream, now));
-        let queued = speaker.order.media_id(seq).is_some_and(|id| {
-            let frame = CompressedFrame {
-                id,
-                talkspurt,
-                opus: opus.to_vec(),
-            };
-            speaker.order.push(frame, now) == InsertResult::Queued
-        });
-        if !queued {
+            .or_insert_with(|| Speaker::new(stream, self.waits.get(&stream.player).copied(), now));
+        let outcome = speaker
+            .order
+            .media_id(seq)
+            .map_or(MediaOutcome::Dropped("sequence"), |id| {
+                let frame = CompressedFrame {
+                    id,
+                    talkspurt,
+                    opus: opus.to_vec(),
+                };
+                match speaker.order.push(frame, now) {
+                    InsertResult::Queued => MediaOutcome::Accepted,
+                    InsertResult::Duplicate => MediaOutcome::Duplicate,
+                    InsertResult::Late => MediaOutcome::Dropped("late"),
+                    InsertResult::WrongStream => MediaOutcome::Dropped("stream"),
+                    InsertResult::Ambiguous => MediaOutcome::Dropped("sequence"),
+                }
+            });
+        if outcome != MediaOutcome::Accepted {
             self.stats.discarded += 1;
-            return false;
+            return outcome;
         }
         speaker.drain(now, &mut self.stats);
-        true
+        MediaOutcome::Accepted
     }
 
     /// STOP: what waits behind a gap is released now, then the queue plays out and closes
@@ -423,6 +663,7 @@ impl Mixer {
 
     /// one SLICE of the mix at 48 kHz, or None when nobody is audible
     pub fn tick(&mut self, now: Instant) -> Option<Vec<f32>> {
+        self.expire_early(now);
         let mut mix = vec![0.0f32; SLICE_SAMPLES];
         let mut audible = false;
         let mut pcm = [0.0f32; SLICE_SAMPLES];
@@ -537,6 +778,94 @@ impl Mute {
 mod tests {
     use super::*;
     use crate::tx::{Codec, Transmitter};
+
+    #[test]
+    fn wait_before_first_frame_survives_idle_talkspurt_and_generation_reset() {
+        let now = Instant::now();
+        let wait = Duration::from_millis(80);
+        let mut mixer = Mixer::default();
+        let mut stream = StreamId {
+            player: 1,
+            generation: 1,
+        };
+        mixer.reorder_wait(1, wait);
+        mixer.select(stream, now);
+        let voice = |stream, sequence, talkspurt| GameMedia {
+            stream,
+            sequence,
+            talkspurt,
+            kind: Kind::Voice,
+            opus: &[0xf8, 0xff, 0xfe],
+        };
+        assert!(mixer.game(voice(stream, 1, 1), now));
+        assert!(mixer.game(voice(stream, 3, 1), now));
+        assert_eq!(mixer.speakers[&1].order.deadline(), Some(now + wait));
+        assert!(mixer.game(
+            GameMedia {
+                kind: Kind::Stop,
+                opus: &[],
+                ..voice(stream, 3, 1)
+            },
+            now
+        ));
+        for n in 0..100 {
+            mixer.tick(now + SLICE * n);
+        }
+        assert!(mixer.is_idle());
+        let later = now + Duration::from_secs(1);
+        assert!(mixer.game(voice(stream, 4, 2), later));
+        assert!(mixer.game(voice(stream, 6, 2), later));
+        assert_eq!(mixer.speakers[&1].order.deadline(), Some(later + wait));
+        stream.generation = 2;
+        mixer.select(stream, later);
+        assert!(mixer.game(voice(stream, 7, 1), later));
+        assert!(mixer.game(voice(stream, 9, 1), later));
+        assert_eq!(mixer.speakers[&1].order.deadline(), Some(later + wait));
+        mixer.reorder_wait(2, wait);
+        mixer.start(2, now);
+        mixer.voice(2, 1, &[0xf8, 0xff, 0xfe], now);
+        mixer.voice(2, 3, &[0xf8, 0xff, 0xfe], now);
+        assert_eq!(mixer.speakers[&2].order.deadline(), Some(now + wait));
+    }
+
+    #[test]
+    fn receive_outcomes_distinguish_storage_duplicate_and_admission_drop() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let media = GameMedia {
+            stream: StreamId {
+                player: 1,
+                generation: 1,
+            },
+            kind: Kind::Voice,
+            sequence: 1,
+            talkspurt: 1,
+            opus: &[0xf8, 0xff, 0xfe],
+        };
+        assert_eq!(
+            mixer.receive_authenticated(media, now),
+            MediaOutcome::Dropped("unselected")
+        );
+        assert_eq!(mixer.receive_game(media, now), MediaOutcome::Held);
+        assert_eq!(mixer.receive_game(media, now), MediaOutcome::Duplicate);
+        let other = GameMedia {
+            stream: StreamId {
+                generation: 2,
+                ..media.stream
+            },
+            ..media
+        };
+        assert_eq!(
+            mixer.receive_game(other, now),
+            MediaOutcome::Dropped("pending-generation")
+        );
+        assert_eq!(mixer.select(media.stream, now), vec![(1, 1)]);
+        assert_eq!(mixer.receive_game(media, now), MediaOutcome::Duplicate);
+        assert_eq!(
+            mixer.receive_authenticated(other, now),
+            MediaOutcome::Dropped("generation")
+        );
+    }
 
     fn tone(samples: usize) -> Vec<f32> {
         (0..samples)
@@ -657,12 +986,203 @@ mod tests {
     }
 
     #[test]
-    fn legacy_media_until_a_stream_is_selected_then_only_v2() {
+    fn early_game_media_releases_in_sequence_once_even_when_stop_arrives_first() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let opus = opus_frames(20, 3);
+        assert!(!mixer.game(v2(Kind::Stop, GEN_A, 1, 3, &[]), now));
+        for sequence in [3, 1, 2, 2] {
+            assert!(!mixer.game(
+                v2(
+                    Kind::Voice,
+                    GEN_A,
+                    1,
+                    sequence,
+                    &opus[sequence as usize - 1]
+                ),
+                now
+            ));
+        }
+        mixer.game(v2(Kind::Start, GEN_A, 1, 0, &[]), now);
+        assert_eq!(mixer.stats.decoded, 0);
+        assert_eq!(
+            mixer.select(
+                StreamId {
+                    player: 1,
+                    generation: GEN_A
+                },
+                now + Duration::from_millis(100)
+            ),
+            vec![(1, 1), (1, 2), (1, 3)]
+        );
+        assert_eq!(mixer.stats.decoded, 3);
+        assert!(
+            mixer
+                .select(
+                    StreamId {
+                        player: 1,
+                        generation: GEN_A
+                    },
+                    now + Duration::from_millis(101)
+                )
+                .is_empty()
+        );
+        assert!(!mixer.game(
+            v2(Kind::Voice, GEN_A, 1, 2, &opus[1]),
+            now + Duration::from_millis(101)
+        ));
+        let mut played = Vec::new();
+        for n in 0..10 {
+            mixer.tick(now + Duration::from_millis(100) + SLICE * n);
+            played.extend(mixer.pulled.iter().filter_map(|p| p.slice));
+        }
+        assert_eq!(played.len(), 6);
+        assert!(mixer.is_idle());
+    }
+
+    #[test]
+    fn early_sort_crosses_sequence_and_talkspurt_wrap() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let opus = opus_frames(20, 4);
+        for (kind, talk, sequence, body) in [
+            (Kind::Stop, 0, 1, &[][..]),
+            (Kind::Voice, 0, 1, &opus[3][..]),
+            (Kind::Voice, 65535, 65535, &opus[1][..]),
+            (Kind::Voice, 0, 0, &opus[2][..]),
+            (Kind::Start, 65535, 65533, &[][..]),
+            (Kind::Voice, 65535, 65534, &opus[0][..]),
+        ] {
+            mixer.game(v2(kind, GEN_A, talk, sequence, body), now);
+        }
+        assert_eq!(
+            mixer.select(
+                StreamId {
+                    player: 1,
+                    generation: GEN_A
+                },
+                now
+            ),
+            vec![(1, 65534), (1, 65535), (1, 0), (1, 1)]
+        );
+        assert_eq!(mixer.stats.decoded, 4);
+        assert!(!mixer.game(v2(Kind::Voice, GEN_A, 65535, 65535, &opus[1]), now));
+    }
+
+    #[test]
+    fn early_hold_expires_and_another_generation_can_then_claim_it() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let opus = opus_frames(20, 1);
+        mixer.game(v2(Kind::Voice, GEN_A, 1, 1, &opus[0]), now);
+        mixer.game(
+            v2(Kind::Voice, GEN_B, 1, 2, &opus[0]),
+            now + Duration::from_millis(100),
+        );
+        assert_eq!(mixer.early[&1].generation, GEN_A);
+        assert!(
+            mixer
+                .select(
+                    StreamId {
+                        player: 1,
+                        generation: GEN_A
+                    },
+                    now + EARLY_TTL
+                )
+                .is_empty()
+        );
+        mixer.game(v2(Kind::Voice, GEN_B, 1, 3, &opus[0]), now + EARLY_TTL);
+        assert_eq!(mixer.early[&1].generation, GEN_B);
+        mixer.game(v2(Kind::Voice, GEN_A, 1, 4, &opus[0]), now + EARLY_TTL);
+        assert_eq!(mixer.early[&1].generation, GEN_B);
+        assert_eq!(
+            mixer.select(
+                StreamId {
+                    player: 1,
+                    generation: GEN_B
+                },
+                now + EARLY_TTL
+            ),
+            vec![(1, 3)]
+        );
+        assert_eq!(mixer.stats.decoded, 2);
+        assert_eq!(queued(&mixer), 2);
+    }
+
+    #[test]
+    fn early_hold_caps_records_players_and_start_refreshes_do_not_displace_voice() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let opus = opus_frames(20, 1);
+        for sequence in 1..=25 {
+            mixer.game(v2(Kind::Voice, GEN_A, 1, sequence, &opus[0]), now);
+        }
+        for _ in 0..100 {
+            mixer.game(v2(Kind::Start, GEN_A, 1, 0, &[]), now);
+        }
+        assert_eq!(mixer.early[&1].len(), EARLY_LIMIT);
+        assert_eq!(mixer.early[&1].voice.first().unwrap().sequence, 6);
+        for player in 2..=257 {
+            let mut media = v2(Kind::Voice, GEN_A, 1, 1, &opus[0]);
+            media.stream.player = player;
+            mixer.game(media, now);
+        }
+        assert_eq!(mixer.early.len(), EARLY_PLAYERS);
+        assert_eq!(
+            mixer
+                .select(
+                    StreamId {
+                        player: 1,
+                        generation: GEN_A
+                    },
+                    now
+                )
+                .len(),
+            EARLY_LIMIT
+        );
+        mixer.tick(now + EARLY_TTL);
+        assert!(mixer.early.is_empty());
+    }
+
+    #[test]
+    fn selecting_another_generation_discards_hold_and_udp_never_enters_it() {
+        let now = Instant::now();
+        let mut mixer = Mixer::default();
+        let opus = opus_frames(20, 1);
+        assert!(!mixer.authenticated(v2(Kind::Voice, GEN_A, 1, 1, &opus[0]), now));
+        assert!(mixer.early.is_empty());
+        mixer.game(v2(Kind::Voice, GEN_A, 1, 1, &opus[0]), now);
+        assert!(
+            mixer
+                .select(
+                    StreamId {
+                        player: 1,
+                        generation: GEN_B
+                    },
+                    now
+                )
+                .is_empty()
+        );
+        assert!(mixer.early.is_empty());
+        assert_eq!(mixer.stats.decoded, 0);
+        assert!(mixer.game(v2(Kind::Voice, GEN_B, 1, 2, &opus[0]), now));
+        mixer.select(
+            StreamId {
+                player: 1,
+                generation: GEN_A,
+            },
+            now,
+        );
+        assert!(!mixer.speakers.contains_key(&1));
+    }
+
+    #[test]
+    fn legacy_and_announced_senders_keep_separate_streams() {
         let t0 = Instant::now();
         let opus = opus_frames(20, 3);
         let mut mixer = Mixer::default();
         assert!(!mixer.game(v2(Kind::Voice, GEN_A, 1, 1, &opus[0]), t0));
-        assert!(mixer.voice(1, 1, &opus[0], t0));
+        assert!(mixer.voice(2, 1, &opus[0], t0));
         mixer.select(
             StreamId {
                 player: 1,
@@ -670,10 +1190,10 @@ mod tests {
             },
             t0,
         );
-        // the legacy copy of a selected player is ignored, its v2 copy plays
+        // a selected sender cannot inject legacy media into its announced stream
         assert!(!mixer.voice(1, 2, &opus[1], t0));
         assert!(mixer.game(v2(Kind::Voice, GEN_A, 1, 2, &opus[1]), t0));
-        assert_eq!((mixer.stats.decoded, mixer.stats.discarded), (2, 2));
+        assert_eq!((mixer.stats.decoded, mixer.stats.discarded), (3, 1));
     }
 
     #[test]

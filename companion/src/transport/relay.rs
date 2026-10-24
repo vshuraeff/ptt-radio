@@ -716,6 +716,17 @@ impl BindClient {
             attempt,
             client_nonce: random()?,
         };
+        Self::from_request(grant, request)
+    }
+
+    /// uses the connectivity owner's reflection request without changing its transcript.
+    pub fn from_request(grant: RelayGrant, request: BindRequest) -> Option<BindClient> {
+        if request.session != grant.session
+            || request.hub_generation != grant.hub_generation
+            || (request.player != grant.sender && request.player != grant.recipient)
+        {
+            return None;
+        }
         Some(BindClient {
             grant,
             request,

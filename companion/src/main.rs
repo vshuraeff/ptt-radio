@@ -1,5 +1,5 @@
-//! ptt-radio companion: carries push-to-talk voice through the Factorio mod
-//! ptt-radio over the game's Lua UDP API. see ../DESIGN.md.
+//! ptt-radio companion: negotiated direct/relay UDP with the trusted game path
+//! for signaling, compatibility and fallback. see ../DESIGN.md.
 //!
 //! threads: main (OS events for the PTT key, HELLO heartbeat, auto-ptt),
 //! transmit (capture or tone -> opus -> game), receive (game -> jitter queues),
@@ -29,10 +29,11 @@ use ptt_key::PttKey;
 use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
 use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
-use ptt_radio_companion::mix::{self, Mixer, Mute, SLICE_SAMPLES};
+use ptt_radio_companion::mix::{self, MediaOutcome, Mixer, Mute, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
-use ptt_radio_companion::transport::lab::LabPath;
-use ptt_radio_companion::transport::wire::{self, Kind};
+use ptt_radio_companion::runtime::{Media, Output, Runtime, RuntimeConfig};
+use ptt_radio_companion::runtime_io::{Network, Resolver};
+use ptt_radio_companion::transport::wire::Kind;
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
@@ -113,7 +114,19 @@ struct Args {
     /// test: append per-frame timestamps to this file for the end-to-end scenarios
     #[arg(long, value_name = "FILE")]
     trace: Option<PathBuf>,
-    /// test: bind a network-lab path (src/transport/lab.rs) to this router inside address; nothing sends through it yet
+    /// UDP endpoint of the relay hub beside the game server
+    #[arg(long, value_name = "ADDR")]
+    hub: Option<SocketAddr>,
+    /// local UDP interface and port (repeat for up to four sockets; default: default-route interfaces)
+    #[arg(long, value_name = "ADDR")]
+    udp_bind: Vec<SocketAddr>,
+    /// public STUN address (repeat; default: stun.l.google.com:19302)
+    #[arg(long, value_name = "HOST:PORT")]
+    stun_server: Vec<String>,
+    /// use the game transport only, retaining v2 framing and stream identity
+    #[arg(long)]
+    game_only: bool,
+    /// test: carry actual UDP datagrams through this network-lab router
     #[arg(long, value_name = "ADDR")]
     netlab: Option<SocketAddr>,
     /// test: private address of the lab path, as registered with the router (default 127.0.0.1:0)
@@ -135,6 +148,7 @@ struct Shared {
     // own VOICE frames by seq, to time their echo
     sent: Mutex<HashMap<u16, (Instant, Vec<u8>)>>,
     trace: Option<Mutex<BufWriter<File>>>,
+    runtime: Mutex<(Runtime, Network)>,
 }
 
 impl Shared {
@@ -165,7 +179,44 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
             args.port
         )
     })?;
-    socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+    socket.set_nonblocking(true)?;
+    let network = Network::bind(
+        args.udp_bind.clone(),
+        args.netlab.map(|router| {
+            (
+                args.netlab_bind
+                    .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+                router,
+            )
+        }),
+    )?;
+    let mut config = RuntimeConfig {
+        hub: args.hub,
+        game_only: args.game_only,
+        ..Default::default()
+    };
+    let mut lookup_names = Vec::new();
+    if !args.game_only {
+        let servers = if args.stun_server.is_empty() && args.netlab.is_none() {
+            vec!["stun.l.google.com:19302".to_string()]
+        } else {
+            args.stun_server.clone()
+        };
+        for server in servers.into_iter().take(4) {
+            match server.parse::<SocketAddr>() {
+                Ok(address) => config.connectivity.discovery.stun_servers.push(address),
+                Err(_) => lookup_names.push(server),
+            }
+        }
+        config.connectivity.discovery.stun_servers.truncate(4);
+    }
+    let runtime = Runtime::new(network.addresses()?, config).map_err(|e| e.to_string())?;
+    if let Some(router) = args.netlab {
+        println!(
+            "netlab: path {} via router {router}",
+            network.addresses()?[0]
+        );
+    }
     let trace = match &args.trace {
         Some(path) => Some(Mutex::new(BufWriter::new(File::create(path)?))),
         None => None,
@@ -183,7 +234,26 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         echo: EchoPath::new(aec),
         sent: Mutex::new(HashMap::new()),
         trace,
+        runtime: Mutex::new((runtime, network)),
     });
+    let hello = packet::encode(
+        HELLO,
+        0,
+        format!("ptt-radio-companion {} v2", env!("CARGO_PKG_VERSION")).as_bytes(),
+    );
+    send(&shared, &hello);
+    send_echo_state(&shared, shared.echo.gate_state().engaged);
+    let resolver = if lookup_names.is_empty() {
+        None
+    } else {
+        match Resolver::start(lookup_names, Instant::now()) {
+            Ok(resolver) => Some(resolver),
+            Err(err) => {
+                eprintln!("STUN discovery unavailable: {err}");
+                None
+            }
+        }
+    };
     shared.trace(format_args!(
         "canceller {} 0",
         if aec { echo::CANCELLER } else { "none" }
@@ -198,20 +268,6 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         args.port,
         args.game_port
     );
-
-    // held until exit so the router keeps a live endpoint for this player
-    let _lab = match args.netlab {
-        Some(router) => {
-            let local = args
-                .netlab_bind
-                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
-            let path = LabPath::bind(local, router)
-                .map_err(|err| format!("--netlab-bind {local}: {err}"))?;
-            println!("netlab: path {} via router {router}", path.local_addr()?);
-            Some(path)
-        }
-        None => None,
-    };
 
     let ptt_key = match args.ptt_key.as_str() {
         "none" => None,
@@ -321,7 +377,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     };
     let rx_thread = {
         let shared = shared.clone();
-        thread::spawn(move || receive(&shared))
+        thread::spawn(move || receive(&shared, resolver))
     };
     let playout_thread = {
         let shared = shared.clone();
@@ -329,15 +385,10 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     };
 
     let started = Instant::now();
-    let mut next_hello = started;
+    let mut next_hello = started + HELLO_EVERY;
     let mut roster_warned = false;
     let mut auto = args.auto_ptt.map(|_| Auto::WaitRoster);
     let mut code = ExitCode::SUCCESS;
-    let hello = packet::encode(
-        HELLO,
-        0,
-        format!("ptt-radio-companion {}", env!("CARGO_PKG_VERSION")).as_bytes(),
-    );
     let exit_at = args
         .exit_after
         .map(|s| started + Duration::from_secs_f64(s));
@@ -555,7 +606,9 @@ fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u6
                     .lock()
                     .unwrap()
                     .insert(seq, (Instant::now(), p[5..].to_vec()));
-                send(shared, &p);
+                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+                runtime.transmit(&p, Instant::now());
+                drain_runtime(shared, runtime, network, None);
                 shared.trace(format_args!(
                     "tx {seq} {voice_frame} {} {ready_us} {}",
                     (voice_frame < frame) as u8,
@@ -565,7 +618,9 @@ fn send_packets(shared: &Shared, packets: Vec<Vec<u8>>, frame: u64, ready_us: u6
             }
             kind => {
                 println!("sent {}", if kind == START { "START" } else { "STOP" });
-                send(shared, &p);
+                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+                runtime.transmit(&p, Instant::now());
+                drain_runtime(shared, runtime, network, None);
             }
         }
     }
@@ -589,14 +644,150 @@ struct RxStats {
     ignored: u64,
 }
 
-fn receive(shared: &Shared) -> RxStats {
+fn drain_runtime(
+    shared: &Shared,
+    runtime: &mut Runtime,
+    network: &mut Network,
+    mut stats: Option<&mut RxStats>,
+) {
+    while let Some(output) = runtime.poll() {
+        match output {
+            Output::Game(bytes) => send(shared, &bytes),
+            Output::Udp(tx) => {
+                if let Err(err) = network.send(&tx) {
+                    shared.trace(format_args!("drop 0 socket-send"));
+                    eprintln!("UDP send failed: {err}");
+                }
+            }
+            Output::Select(stream) => {
+                let received = shared.mixer.lock().unwrap().select(stream, Instant::now());
+                for (sender, sequence) in received {
+                    shared.trace(format_args!("rx {sender} {sequence}"));
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.senders.entry(sender).or_default().voice += 1;
+                    }
+                }
+            }
+            Output::Reorder(player, wait) => {
+                shared.mixer.lock().unwrap().reorder_wait(player, wait)
+            }
+            Output::Trace(text) => shared.trace(format_args!("{text}")),
+            Output::Media(media) => accept_media(shared, media, true, stats.as_deref_mut()),
+            Output::UdpMedia(media) => accept_media(shared, media, false, stats.as_deref_mut()),
+        }
+    }
+}
+
+fn accept_media(shared: &Shared, media: Media, game: bool, stats: Option<&mut RxStats>) {
+    let now = Instant::now();
+    let outcome = {
+        let mut mixer = shared.mixer.lock().unwrap();
+        if game {
+            mixer.receive_game(media.borrowed(), now)
+        } else {
+            mixer.receive_authenticated(media.borrowed(), now)
+        }
+    };
+    let taken = outcome == MediaOutcome::Accepted;
+    if media.kind == Kind::Voice {
+        if taken {
+            shared.trace(format_args!(
+                "rx {} {}",
+                media.stream.player, media.sequence
+            ));
+        } else if outcome == MediaOutcome::Held {
+            shared.trace(format_args!(
+                "hold {} media {}",
+                media.stream.player, media.sequence
+            ));
+        } else if outcome == MediaOutcome::Duplicate {
+            shared.trace(format_args!(
+                "duplicate {} media {}",
+                media.stream.player, media.sequence
+            ));
+        } else if let MediaOutcome::Dropped(reason) = outcome {
+            shared.trace(format_args!(
+                "drop {} media {} {reason}",
+                media.stream.player, media.sequence
+            ));
+        }
+    }
+    if let Some(stats) = stats {
+        let s = stats.senders.entry(media.stream.player).or_default();
+        match media.kind {
+            Kind::Start => s.starts += u64::from(taken),
+            Kind::Stop => s.stops += u64::from(taken),
+            Kind::Voice => {
+                s.voice += u64::from(taken);
+                let mut sent = shared.sent.lock().unwrap();
+                if sent
+                    .get(&media.sequence)
+                    .is_some_and(|(_, body)| *body == media.opus)
+                {
+                    let (at, _) = sent.remove(&media.sequence).unwrap();
+                    stats.rtt_ms.push((now - at).as_secs_f64() * 1000.0);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
     let mut stats = RxStats::default();
     let mut open_mic: Option<bool> = None;
     let mut buf = [0u8; 65536];
     while !shared.done.load(Relaxed) {
-        let len = match shared.socket.recv(&mut buf) {
-            Ok(len) => len,
+        if let Some(result) = resolver.as_mut().and_then(|r| r.poll(Instant::now())) {
+            resolver = None;
+            match result {
+                Ok(servers) => {
+                    if let Err(err) = shared
+                        .runtime
+                        .lock()
+                        .unwrap()
+                        .0
+                        .stun_servers(servers, Instant::now())
+                    {
+                        eprintln!("STUN discovery: {err}");
+                    }
+                }
+                Err(err) => eprintln!("STUN discovery unavailable: {err}"),
+            }
+        }
+        {
+            let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+            for _ in 0..256 {
+                match network.receive(&mut buf) {
+                    Ok(Some((source, destination, len, now))) => {
+                        if let Err(err) = runtime.udp(source, destination, &buf[..len], now) {
+                            shared.trace(format_args!("drop 0 udp-runtime"));
+                            eprintln!("UDP runtime: {err}");
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        eprintln!("UDP receive: {err}");
+                        break;
+                    }
+                }
+            }
+            if let Err(err) = runtime.tick(
+                Instant::now(),
+                shared.ptt.load(Relaxed) || shared.open_mic.load(Relaxed),
+            ) {
+                eprintln!("transport tick: {err}");
+            }
+            drain_runtime(shared, runtime, network, Some(&mut stats));
+        }
+        let len = match shared.socket.recv_from(&mut buf) {
+            Ok((len, sender)) if sender.ip() == shared.game.ip() => len,
+            Ok(_) => {
+                shared.trace(format_args!("drop 0 game-source"));
+                continue;
+            }
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                thread::sleep(Duration::from_millis(1));
                 continue;
             }
             Err(err) => {
@@ -605,24 +796,19 @@ fn receive(shared: &Shared) -> RxStats {
             }
         };
         let now = Instant::now();
-        // v2 game media plays only for a player trusted signaling selected a stream for
-        if let Ok(media) = wire::decode_game(&buf[..len]) {
-            let taken = shared.mixer.lock().unwrap().game(media, now);
-            let s = stats.senders.entry(media.stream.player).or_default();
-            match media.kind {
-                Kind::Start => s.starts += 1,
-                Kind::Stop => s.stops += 1,
-                _ => {
-                    s.voice += 1;
-                    if taken {
-                        shared.trace(format_args!(
-                            "rx {} {}",
-                            media.stream.player, media.sequence
-                        ));
-                    }
+        {
+            let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+            let consumed = match runtime.game(&buf[..len], now) {
+                Ok(consumed) => consumed,
+                Err(err) => {
+                    eprintln!("game signaling: {err}");
+                    true
                 }
+            };
+            drain_runtime(shared, runtime, network, Some(&mut stats));
+            if consumed {
+                continue;
             }
-            continue;
         }
         let Some(incoming) = packet::parse(&buf[..len]) else {
             if stats.ignored == 0 {
@@ -636,6 +822,11 @@ fn receive(shared: &Shared) -> RxStats {
         match incoming {
             Incoming::Roster(roster) => {
                 shared.roster_seen.store(true, Relaxed);
+                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+                if let Err(err) = runtime.roster(roster.iter().map(|p| p.index).collect(), now) {
+                    eprintln!("transport roster: {err}");
+                }
+                drain_runtime(shared, runtime, network, Some(&mut stats));
                 if roster != stats.roster {
                     println!("roster:");
                     for p in &roster {
@@ -645,6 +836,11 @@ fn receive(shared: &Shared) -> RxStats {
                 }
             }
             Incoming::MicState { player, open } => {
+                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+                if let Err(err) = runtime.identify(player, now) {
+                    eprintln!("transport identity: {err}");
+                }
+                drain_runtime(shared, runtime, network, Some(&mut stats));
                 shared.open_mic.store(open, Relaxed);
                 if open_mic != Some(open) {
                     println!(
@@ -660,12 +856,18 @@ fn receive(shared: &Shared) -> RxStats {
                 }
             }
             Incoming::Start { sender, seq } => {
+                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                    continue;
+                }
                 let s = stats.senders.entry(sender).or_default();
                 s.starts += 1;
                 s.last_seq = Some(seq);
                 shared.mixer.lock().unwrap().start(sender, now);
             }
             Incoming::Voice { sender, seq, frame } => {
+                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                    continue;
+                }
                 let s = stats.senders.entry(sender).or_default();
                 s.voice += 1;
                 if s.last_seq.is_some_and(|last| seq != last.wrapping_add(1)) {
@@ -684,6 +886,9 @@ fn receive(shared: &Shared) -> RxStats {
                 }
             }
             Incoming::Stop { sender, .. } => {
+                if !shared.runtime.lock().unwrap().0.allows_receive(sender) {
+                    continue;
+                }
                 stats.senders.entry(sender).or_default().stops += 1;
                 shared.mixer.lock().unwrap().stop(sender);
             }

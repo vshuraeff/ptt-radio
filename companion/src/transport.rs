@@ -1,4 +1,4 @@
-//! p2p contracts only; production still uses the game transport in packet.rs.
+//! shared p2p media, transport and signaling contracts consumed by runtime.rs.
 
 pub mod hub;
 pub mod lab;

@@ -703,9 +703,10 @@ fn netlab_router_starts_with_three_nat_types() {
         assert!(log.contains(&want), "companion {name} log lacks {want:?}");
     }
     assert!(
-        lab.pump.trace().is_empty(),
-        "nothing sends through the lab path yet"
+        !lab.pump.trace().is_empty(),
+        "runtime must send its ICE checks through the lab"
     );
+    let before = lab.pump.trace().len();
 
     // the companions are gone, so their private addresses are free: probe the router from the
     // third player's and read the labelled trace
@@ -719,7 +720,7 @@ fn netlab_router_starts_with_three_nat_types() {
     let (len, _) = lab.server.recv_from(&mut buf).unwrap();
     let seen = decode_addr(&buf[..len]).unwrap();
     assert_eq!(*seen.ip(), lab::player_ip(2));
-    assert_eq!(lab.labelled(), [("STUN", Verdict::Forwarded)]);
+    assert_eq!(lab.labelled()[before..], [("STUN", Verdict::Forwarded)]);
 }
 
 // ---- the session: relay in this process, one companion process per player
@@ -866,6 +867,9 @@ impl Session {
                 cmd.arg("--auto-ptt").arg(hold.to_string());
             }
             cmd.args(["--aec", if enabled { "on" } else { "off" }]);
+            if !talker.args.iter().any(|arg| arg == "--netlab") {
+                cmd.arg("--game-only");
+            }
             cmd.args(&talker.args);
             if talker.coupled {
                 cmd.arg("--couple-gain-db")
@@ -1031,6 +1035,8 @@ impl Trace {
                 }
                 "aec_gate" => trace.gate_samples.push(num(5)),
                 "echo_state" => {}
+                "route" | "route_tx" | "network_rtt" | "switch" | "generation" | "key"
+                | "duplicate" | "drop" | "hold" => {}
                 "codec" => trace.frame_samples = num(2) as usize,
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
                 "mute" => trace.mute.push((num(3), f[2] == "1")),
@@ -1166,7 +1172,13 @@ fn frame_timings(
     let relayed: HashMap<u16, &relay::Delivery> = relay
         .deliveries
         .iter()
-        .filter(|d| d.sender == sender && d.kind == VOICE)
+        .filter(|d| {
+            d.sender == sender
+                && matches!(
+                    d.kind,
+                    VOICE | ptt_radio_companion::transport::wire::GAME_VOICE
+                )
+        })
         .map(|d| (d.seq, d))
         .collect();
     listener

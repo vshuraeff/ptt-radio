@@ -44,6 +44,10 @@ pub struct Reorder {
 }
 
 impl Reorder {
+    pub fn set_wait(&mut self, wait: Duration) {
+        self.config.wait = wait.min(Duration::from_millis(200));
+    }
+
     pub fn new(stream: StreamId, config: ReorderConfig) -> Self {
         Reorder {
             stream,
@@ -185,6 +189,21 @@ mod tests {
                 Ordered::Wait => return out,
             }
         }
+    }
+
+    #[test]
+    fn path_delay_update_keeps_queued_and_emitted_frame_identities() {
+        let now = Instant::now();
+        let mut order = Reorder::new(STREAM, GAME_ONLY);
+        assert_eq!(push(&mut order, 1, now), InsertResult::Queued);
+        assert_eq!(drain(&mut order, now), [1]);
+        assert_eq!(push(&mut order, 3, now), InsertResult::Queued);
+        order.set_wait(Duration::from_secs(1));
+        assert_eq!(order.deadline(), Some(now + Duration::from_millis(200)));
+        assert!(drain(&mut order, now + Duration::from_millis(199)).is_empty());
+        assert_eq!(push(&mut order, 1, now), InsertResult::Duplicate);
+        assert_eq!(push(&mut order, 2, now), InsertResult::Queued);
+        assert_eq!(drain(&mut order, now), [2, 3]);
     }
 
     #[test]

@@ -183,7 +183,7 @@ pub struct PairConnectivity {
     publish_backoff: Duration,
 }
 
-fn valid_socket(addr: SocketAddr) -> bool {
+pub(crate) fn valid_socket(addr: SocketAddr) -> bool {
     addr.port() != 0
         && !addr.ip().is_unspecified()
         && !addr.ip().is_multicast()
@@ -249,6 +249,73 @@ fn valid_credentials(credentials: &IceCredentials) -> bool {
 }
 
 impl PairConnectivity {
+    /// retains the exact outstanding reflection transcript with the binding's attempt floor.
+    pub fn hub_binding_request(
+        &mut self,
+        source: SocketAddr,
+        hub: SocketAddr,
+        original: crate::transport::wire::BindRequest,
+        minimum: u64,
+    ) -> Option<crate::transport::wire::BindRequest> {
+        self.discovery.hub_request(source, hub, original, minimum)
+    }
+
+    /// late DNS results never replace a hub exchange still awaiting its deadline.
+    pub fn discover_stun(
+        &mut self,
+        servers: Vec<SocketAddr>,
+        now: Instant,
+    ) -> Result<(), ConnectivityError> {
+        let mut config = self.config.discovery.clone();
+        config.hub = None;
+        config.stun_servers = servers;
+        Discovery::validate(&config)?;
+        self.config.discovery.stun_servers = config.stun_servers;
+        if !self
+            .discovery
+            .public_servers(&self.config.discovery.stun_servers)
+        {
+            let sockets = if self.config.discovery.hub.is_some() {
+                self.discovery.missing_sockets(&self.sockets)
+            } else {
+                self.sockets.clone()
+            };
+            if sockets.is_empty() {
+                return Ok(());
+            }
+            config.stun_servers = self.config.discovery.stun_servers.clone();
+            let (discovery, actions) = Discovery::start(self.local.player, &sockets, &config, now)?;
+            let complete = discovery.complete();
+            self.discovery = discovery;
+            self.actions
+                .extend(actions.into_iter().map(Action::Discovery));
+            if complete {
+                self.actions.push_back(Action::DiscoveryComplete);
+                self.actions.push_back(Action::PublishCandidates);
+            }
+        }
+        Ok(())
+    }
+
+    /// a game-authenticated grant makes the configured hub's BIND usable.
+    pub fn discover_hub(
+        &mut self,
+        hub: HubReflection,
+        now: Instant,
+    ) -> Result<(), ConnectivityError> {
+        self.config.discovery.hub = Some(hub);
+        let (discovery, actions) = Discovery::start(
+            self.local.player,
+            &self.sockets,
+            &self.config.discovery,
+            now,
+        )?;
+        self.discovery = discovery;
+        self.actions
+            .extend(actions.into_iter().map(Action::Discovery));
+        Ok(())
+    }
+
     /// selected_remote is supplied by the trusted ANNOUNCE owner. a delayed
     /// packet cannot select a new stream; call select_remote explicitly instead.
     pub fn new(
@@ -772,7 +839,12 @@ impl PairConnectivity {
     }
 
     pub fn handle_timeout(&mut self, now: Instant) -> Result<(), ConnectivityError> {
-        if self.discovery.expire(now) {
+        let was_complete = self.discovery.complete();
+        if let Some(actions) = self.discovery.fallback(now)? {
+            self.actions
+                .extend(actions.into_iter().map(Action::Discovery));
+        }
+        if (!was_complete && self.discovery.complete()) || self.discovery.expire(now) {
             self.reset_publication(now);
             self.actions.push_back(Action::DiscoveryComplete);
             self.actions.push_back(Action::PublishCandidates);

@@ -10,6 +10,128 @@ pub struct HubReflection {
     pub hub_generation: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_attempt_floor_updates_the_exact_reflection_transcript() {
+        let now = Instant::now();
+        let source = "10.0.0.1:5000".parse().unwrap();
+        let (mut discovery, initial) = Discovery::start(1, &[source], &config(), now).unwrap();
+        let DiscoveryAction::BeginHubBinding { hub, request, .. } = initial[0] else {
+            panic!("hub request")
+        };
+        let original = request;
+        let request = discovery
+            .hub_request(source, hub, original, u64::MAX)
+            .unwrap();
+        assert_eq!(request.attempt, u64::MAX);
+        assert_eq!(request.client_nonce, original.client_nonce);
+        let challenge = |request| BindChallenge {
+            request,
+            endpoint: "198.51.100.1:5000".parse().unwrap(),
+            challenge: [1; 32],
+            expires_at_ms: u64::MAX,
+        };
+        if original != request {
+            assert!(
+                discovery
+                    .authenticated_hub_response(source, hub, challenge(original), now)
+                    .is_none()
+            );
+        }
+        assert!(
+            discovery
+                .authenticated_hub_response(source, hub, challenge(request), now)
+                .is_some()
+        );
+        assert!(discovery.complete());
+    }
+
+    fn config() -> DiscoveryConfig {
+        DiscoveryConfig {
+            hub: Some(HubReflection {
+                endpoint: "203.0.113.9:34560".parse().unwrap(),
+                session: 7,
+                hub_generation: 8,
+            }),
+            stun_servers: vec![
+                "203.0.113.10:3478".parse().unwrap(),
+                "[2001:db8::10]:3478".parse().unwrap(),
+            ],
+            timeout: Duration::from_millis(800),
+        }
+    }
+
+    #[test]
+    fn unreachable_hub_falls_back_for_every_affected_socket() {
+        let now = Instant::now();
+        let sockets = vec![
+            "10.0.0.1:5000".parse().unwrap(),
+            "[2001:db8::1]:5000".parse().unwrap(),
+        ];
+        let (mut discovery, initial) = Discovery::start(1, &sockets, &config(), now).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert!(
+            discovery
+                .fallback(now + Duration::from_millis(799))
+                .unwrap()
+                .is_none()
+        );
+        let fallback = discovery
+            .fallback(now + Duration::from_millis(800))
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.len(), 2);
+        for action in fallback {
+            assert!(matches!(action, DiscoveryAction::Send(_)));
+        }
+        assert!(!discovery.complete());
+        assert!(discovery.expire(now + Duration::from_millis(1600)));
+        assert!(discovery.complete());
+    }
+
+    #[test]
+    fn successful_hub_leaves_public_fallback_only_for_the_unserved_family() {
+        let now = Instant::now();
+        let sockets = vec![
+            "10.0.0.1:5000".parse().unwrap(),
+            "[2001:db8::1]:5000".parse().unwrap(),
+        ];
+        let config = config();
+        let (mut discovery, initial) = Discovery::start(1, &sockets, &config, now).unwrap();
+        let DiscoveryAction::BeginHubBinding {
+            source,
+            hub,
+            request,
+        } = initial[0]
+        else {
+            panic!("hub request")
+        };
+        let mapped = "198.51.100.1:5000".parse().unwrap();
+        assert_eq!(
+            discovery.authenticated_hub_response(
+                source,
+                hub,
+                BindChallenge {
+                    request,
+                    endpoint: mapped,
+                    challenge: [1; 32],
+                    expires_at_ms: u64::MAX
+                },
+                now
+            ),
+            Some(mapped)
+        );
+        let fallback = discovery.fallback(now + config.timeout).unwrap().unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert!(
+            matches!(&fallback[0],DiscoveryAction::Send(tx) if tx.source.is_ipv6() && tx.destination.is_ipv6())
+        );
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DiscoveryConfig {
     /// when present, BIND is used instead of public STUN. the relay owner
@@ -58,26 +180,30 @@ pub(super) struct Discovery {
     pending: Vec<Request>,
     deadline: Instant,
     complete: bool,
+    fallback: Option<(u16, Vec<SocketAddr>, DiscoveryConfig)>,
+    reflected: Vec<SocketAddr>,
 }
 
 impl Discovery {
+    pub(super) fn validate(config: &DiscoveryConfig) -> Result<(), ConnectivityError> {
+        if config.timeout.is_zero()
+            || config.timeout > Duration::from_secs(2)
+            || config.stun_servers.len() > 4
+            || config.stun_servers.iter().any(|s| !valid_socket(*s))
+            || config.hub.is_some_and(|h| !valid_socket(h.endpoint))
+        {
+            return Err(ConnectivityError::Configuration);
+        }
+        Ok(())
+    }
+
     pub(super) fn start(
         player: u16,
         sockets: &[SocketAddr],
         config: &DiscoveryConfig,
         now: Instant,
     ) -> Result<(Self, Vec<DiscoveryAction>), ConnectivityError> {
-        if config.timeout.is_zero()
-            || config.timeout > Duration::from_secs(2)
-            || config.stun_servers.len() > 4
-        {
-            return Err(ConnectivityError::Configuration);
-        }
-        if config.stun_servers.iter().any(|s| !valid_socket(*s))
-            || config.hub.is_some_and(|h| !valid_socket(h.endpoint))
-        {
-            return Err(ConnectivityError::Configuration);
-        }
+        Self::validate(config)?;
         let mut pending = Vec::new();
         let mut actions = Vec::new();
         for &source in sockets {
@@ -128,12 +254,19 @@ impl Discovery {
                 }
             }
         }
-        let complete = pending.is_empty();
+        let fallback = config.hub.map(|_| {
+            let mut public = config.clone();
+            public.hub = None;
+            (player, sockets.to_vec(), public)
+        });
+        let complete = pending.is_empty() && fallback.is_none();
         Ok((
             Self {
                 pending,
                 deadline: now + config.timeout,
                 complete,
+                fallback,
+                reflected: Vec::new(),
             },
             actions,
         ))
@@ -141,6 +274,43 @@ impl Discovery {
 
     pub(super) fn complete(&self) -> bool {
         self.complete
+    }
+
+    pub(super) fn hub_request(
+        &mut self,
+        source: SocketAddr,
+        hub: SocketAddr,
+        original: BindRequest,
+        minimum: u64,
+    ) -> Option<BindRequest> {
+        self.pending.iter_mut().find_map(|pending| match pending {
+            Request::Hub {
+                source: local,
+                hub: server,
+                request,
+            } if *local == source && *server == hub && *request == original => {
+                request.attempt = request.attempt.max(minimum);
+                Some(*request)
+            }
+            _ => None,
+        })
+    }
+
+    pub(super) fn public_servers(&mut self, servers: &[SocketAddr]) -> bool {
+        if let Some((_, _, config)) = &mut self.fallback {
+            config.stun_servers = servers.to_vec();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn missing_sockets(&self, sockets: &[SocketAddr]) -> Vec<SocketAddr> {
+        sockets
+            .iter()
+            .filter(|s| !self.reflected.contains(s))
+            .copied()
+            .collect()
     }
 
     pub(super) fn deadline(&self) -> Option<Instant> {
@@ -154,6 +324,23 @@ impl Discovery {
         self.pending.clear();
         self.complete = true;
         true
+    }
+
+    pub(super) fn fallback(
+        &mut self,
+        now: Instant,
+    ) -> Result<Option<Vec<DiscoveryAction>>, ConnectivityError> {
+        if now < self.deadline {
+            return Ok(None);
+        }
+        let Some((player, sockets, config)) = self.fallback.take() else {
+            return Ok(None);
+        };
+        let missing = self.missing_sockets(&sockets);
+        let (mut replacement, actions) = Self::start(player, &missing, &config, now)?;
+        replacement.reflected.append(&mut self.reflected);
+        *self = replacement;
+        Ok(Some(actions))
     }
 
     pub(super) fn stun_response(
@@ -172,7 +359,15 @@ impl Discovery {
         }
         let index = self.pending.iter().position(|r| matches!(r, Request::Stun { source: local, server, transaction } if *local == destination && *server == source && bytes.get(8..20) == Some(transaction.as_slice())))?;
         self.pending.remove(index);
-        self.complete = self.pending.is_empty();
+        self.reflected.push(destination);
+        self.complete = self.pending.is_empty()
+            && self
+                .fallback
+                .as_ref()
+                .is_none_or(|(_, sockets, _)| sockets.iter().all(|s| self.reflected.contains(s)));
+        if self.complete {
+            self.fallback = None;
+        }
         Some(mapped)
     }
 
@@ -194,7 +389,15 @@ impl Discovery {
         }
         let index = self.pending.iter().position(|r| matches!(r, Request::Hub { source: local, hub: server, request } if *local == source && *server == hub && *request == challenge.request))?;
         self.pending.remove(index);
-        self.complete = self.pending.is_empty();
+        self.reflected.push(source);
+        self.complete = self.pending.is_empty()
+            && self
+                .fallback
+                .as_ref()
+                .is_none_or(|(_, sockets, _)| sockets.iter().all(|s| self.reflected.contains(s)));
+        if self.complete {
+            self.fallback = None;
+        }
         Some(challenge.endpoint)
     }
 }
