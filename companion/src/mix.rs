@@ -114,13 +114,6 @@ impl Early {
         };
         match media.kind {
             Kind::Voice => {
-                if self
-                    .voice
-                    .iter()
-                    .any(|m| m.sequence == media.sequence && m.talkspurt == media.talkspurt)
-                {
-                    return false;
-                }
                 if self.len() == EARLY_LIMIT && self.start.take().is_none() {
                     self.voice.remove(0);
                 }

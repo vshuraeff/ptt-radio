@@ -260,12 +260,19 @@ impl PairConnectivity {
         self.discovery.hub_request(source, hub, original, minimum)
     }
 
-    /// late DNS results never replace a hub exchange still awaiting its deadline.
+    /// late DNS results never replace a hub exchange still awaiting its deadline,
+    /// and a result without a new server leaves running discovery untouched.
     pub fn discover_stun(
         &mut self,
         servers: Vec<SocketAddr>,
         now: Instant,
     ) -> Result<(), ConnectivityError> {
+        if servers
+            .iter()
+            .all(|s| self.config.discovery.stun_servers.contains(s))
+        {
+            return Ok(());
+        }
         let mut config = self.config.discovery.clone();
         config.hub = None;
         config.stun_servers = servers;
