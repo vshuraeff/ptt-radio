@@ -13,6 +13,7 @@
 local hud = require("hud")
 local channels = require("channels")
 local admin = require("admin")
+local settings_gui = require("settings_gui")
 
 local MAGIC = 0x52
 local VERSION = 1
@@ -43,6 +44,7 @@ local OLD_BADGE = "ptt_radio_badge"
 -- every talkspurt is on the common channel until u4 passes the sender's tx key
 local CHANNEL = "ptt/any"
 local SHORTCUT = "ptt-radio-open-mic"
+local SETTINGS_SHORTCUT = "ptt-radio-settings"
 local ECHO_PANEL = "ptt_radio_echo_panel"
 local ECHO_OFF_BUTTON = "ptt_radio_echo_open_mic_off"
 local START_SOUND = "utility/gui_click"
@@ -195,11 +197,14 @@ local function audience_changed()
   send_audience(0)
 end
 
+-- a policy change also re-derives every open settings window's disabled controls
 admin.configure(function()
   render_all_huds()
   audience_changed()
+  for _, player in pairs(game.connected_players) do settings_gui.refresh(player) end
 end)
 admin.register()
+settings_gui.configure(audience_changed, admin.render)
 
 local function forward_signal(sender_index, payload)
   if #payload < 5 or #payload - 5 > MAX_SIGNAL_BODY then return end
@@ -340,6 +345,7 @@ local function init_storage()
   storage.audience_revision = storage.audience_revision or string.rep(string.char(0), 8)
   hud.init()
   channels.init()
+  settings_gui.init()
 end
 
 script.on_init(init_storage)
@@ -443,9 +449,19 @@ script.on_event("ptt-radio-toggle-mic", function(event)
   toggle_open_mic(game.get_player(event.player_index))
 end)
 
+script.on_event("ptt-radio-settings-open", function(event)
+  settings_gui.toggle(game.get_player(event.player_index))
+end)
+
+script.on_event("ptt-radio-settings-cycle", function(event)
+  settings_gui.cycle(game.get_player(event.player_index))
+end)
+
 script.on_event(defines.events.on_lua_shortcut, function(event)
   if event.prototype_name == SHORTCUT then
     toggle_open_mic(game.get_player(event.player_index))
+  elseif event.prototype_name == SETTINGS_SHORTCUT then
+    settings_gui.toggle(game.get_player(event.player_index))
   end
 end)
 
@@ -459,7 +475,7 @@ script.on_event(defines.events.on_player_joined_game, function(event)
 end)
 
 script.on_event(defines.events.on_gui_click, function(event)
-  if admin.on_gui_click(event) then return end
+  if admin.on_gui_click(event) or settings_gui.on_gui_click(event) then return end
   if event.element.valid and event.element.name == ECHO_OFF_BUTTON then
     local player = game.get_player(event.player_index)
     if storage.open_mic[player.index] then
@@ -468,7 +484,12 @@ script.on_event(defines.events.on_gui_click, function(event)
   end
 end)
 
-script.on_event(defines.events.on_gui_elem_changed, admin.on_gui_elem_changed)
+-- one handler per event: a second script.on_event would replace the first
+script.on_event(defines.events.on_gui_elem_changed, function(event)
+  if not admin.on_gui_elem_changed(event) then settings_gui.on_gui_elem_changed(event) end
+end)
+script.on_event(defines.events.on_gui_checked_state_changed, settings_gui.on_gui_checked_state_changed)
+script.on_event(defines.events.on_gui_closed, settings_gui.on_gui_closed)
 
 script.on_event(defines.events.on_player_left_game, function(event)
   if storage.speakers[event.player_index] then
