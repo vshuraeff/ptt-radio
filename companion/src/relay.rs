@@ -585,9 +585,7 @@ fn tick(
                 && member.speaking.is_some_and(|last| game_tick - last > 30)
             {
                 member.speaking = None;
-                if member.talk.is_none() {
-                    synthetic.push((sender, packet::encode(STOP, member.index, &[0, 0])));
-                }
+                synthetic.push((sender, packet::encode(STOP, member.index, &[0, 0])));
             }
             if game_tick.is_multiple_of(60) {
                 if member
@@ -972,7 +970,11 @@ mod tests {
         assert_eq!(recv(&b), forwarded(&start));
         send(&start);
         assert_eq!(recv(&b), forwarded(&start));
+        let mixed = packet::encode(VOICE, 10, &[5]);
+        send(&mixed);
+        assert_eq!(recv(&b), forwarded(&mixed));
         thread::sleep(Duration::from_millis(750));
+        assert_eq!(recv(&b), packet::encode(STOP, 1, &[0, 0]));
         quiet(&b);
         send(&start);
         assert_eq!(recv(&b), forwarded(&start));

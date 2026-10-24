@@ -414,10 +414,8 @@ script.on_nth_tick(15, function(event)
     if event.tick - last_tick > STALE_TICKS then
       local talk = storage.talks[index]
       set_speaking(index, false, talk ~= nil)
-      -- badge freshness does not close media still arriving over udp
-      if not talk then
-        fan_out(index, STOP, string.char(MAGIC, VERSION, STOP, 0, 0))
-      end
+      -- legacy listeners need a timeout stop; v2 listeners ignore it
+      fan_out(index, STOP, string.char(MAGIC, VERSION, STOP, 0, 0))
     end
   end
 end)
