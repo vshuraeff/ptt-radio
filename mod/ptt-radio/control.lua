@@ -12,6 +12,7 @@
 
 local hud = require("hud")
 local channels = require("channels")
+local admin = require("admin")
 
 local MAGIC = 0x52
 local VERSION = 1
@@ -193,6 +194,12 @@ local function audience_changed()
   end
   send_audience(0)
 end
+
+admin.configure(function()
+  render_all_huds()
+  audience_changed()
+end)
+admin.register()
 
 local function forward_signal(sender_index, payload)
   if #payload < 5 or #payload - 5 > MAX_SIGNAL_BODY then return end
@@ -452,6 +459,7 @@ script.on_event(defines.events.on_player_joined_game, function(event)
 end)
 
 script.on_event(defines.events.on_gui_click, function(event)
+  if admin.on_gui_click(event) then return end
   if event.element.valid and event.element.name == ECHO_OFF_BUTTON then
     local player = game.get_player(event.player_index)
     if storage.open_mic[player.index] then
@@ -459,6 +467,8 @@ script.on_event(defines.events.on_gui_click, function(event)
     end
   end
 end)
+
+script.on_event(defines.events.on_gui_elem_changed, admin.on_gui_elem_changed)
 
 script.on_event(defines.events.on_player_left_game, function(event)
   if storage.speakers[event.player_index] then
