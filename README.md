@@ -45,6 +45,8 @@ cargo build --release && cargo test
 
 ### Сквозные сценарии без игры
 
+Контракт мода проверяется без Factorio: `lua mod/tests/control_test.lua mod/ptt-radio/control.lua` из `ptt-radio/`, синтаксис — `luac -p mod/ptt-radio/control.lua mod/tests/control_test.lua`. Проверка исполняет настоящие обработчики событий для SIGNAL/AUDIENCE, игрока 0 и плашек v2. UDP-проверки эмулятора: `cd companion && cargo test --lib relay:: -- --test-threads=1`. Это не заменяет приёмку входа игроков, паузы и GUI на живом стенде. Форматы и границы доверия описаны в [DESIGN.md](DESIGN.md#signaling-schema-and-trust).
+
 Игру и мод заменяет эмулятор `relay`, каждый игрок — отдельный процесс компаньона с виртуальным звуком. Устройство, модель транспорта и замеры описаны в [DESIGN.md](DESIGN.md#сквозной-стенд-без-игры).
 
 ```sh
