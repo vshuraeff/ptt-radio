@@ -75,6 +75,8 @@ uv run -q ../tools/radio.py talk --seconds 3                                    
 docker exec ptt-radio-factorio uv run -q /tools/radio.py talk --seconds 3 --expect-silence   # плашка «Сервер»
 ```
 
+Индикатор эха без компаньона: байты `ECHO_STATE` кладутся в UDP-порт `--enable-lua-udp` того игрока, чей клиент запущен. Мод принимает их только от компаньона, приславшего HELLO, поэтому сначала `uv run -q ../tools/radio.py hello`, затем в течение 15 с включить: `printf '\x52\x01\x05\x00\x00\x01' | nc -u -w1 127.0.0.1 34556`, выключить: то же с `\x00` в конце. Без новых HELLO флаг снимется сам через 15 с вместе с «пропавшим» компаньоном. Компаньон на Rust шлёт `ECHO_STATE` сам, когда в нём включается эхо-гейт.
+
 ## Проверено 2026-10-24
 
 Один клиент macOS и headless-сервер в OrbStack на одной машине.

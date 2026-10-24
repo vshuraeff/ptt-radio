@@ -20,12 +20,17 @@ local STOP = 0x04
 local ROSTER = 0x10
 local MIC_STATE = 0x11
 local HALF_DUPLEX = 0x12
+local ECHO_STATE = 0x05
 
 local STALE_TICKS = 30
 -- the companion sends HELLO every 5 s; three missed heartbeats mean it is gone
 local COMPANION_TIMEOUT_TICKS = 15 * 60
 local BADGE = "ptt_radio_badge"
 local SHORTCUT = "ptt-radio-open-mic"
+local ECHO_PANEL = "ptt_radio_echo_panel"
+local ECHO_OFF_BUTTON = "ptt_radio_echo_open_mic_off"
+local ECHO_GLYPH = "[img=item/programmable-speaker] "
+local ECHO_COLOR = { r = 1, g = 0.25, b = 0.25, a = 1 }
 local SERVER_COLOR = { r = 0.8, g = 0.8, b = 0.8, a = 1 }
 local START_SOUND = "utility/gui_click"
 local STOP_SOUND = "utility/list_box_click"
@@ -51,8 +56,15 @@ local function render_badge(viewer)
   if root[BADGE] then
     root[BADGE].destroy()
   end
-  local speakers = {}
+  local shown = {}
   for index in pairs(storage.speakers) do
+    shown[index] = true
+  end
+  for index in pairs(storage.echo_sources) do
+    shown[index] = true
+  end
+  local speakers = {}
+  for index in pairs(shown) do
     if in_scope(index, viewer) then
       speakers[#speakers + 1] = index
     end
@@ -64,9 +76,17 @@ local function render_badge(viewer)
   local frame = root.add({ type = "frame", name = BADGE, direction = "vertical", caption = { "ptt-radio.title" } })
   for _, index in ipairs(speakers) do
     local speaker = index ~= 0 and game.get_player(index) or nil
-    local label = frame.add({ type = "label", caption = speaker and speaker.name or { "ptt-radio.server" } })
+    local echo = storage.echo_sources[index] ~= nil and speaker ~= nil
+    local caption = speaker and speaker.name or { "ptt-radio.server" }
+    if echo then
+      caption = { "", ECHO_GLYPH, caption }
+    end
+    local label = frame.add({ type = "label", caption = caption })
     label.style.font = "default-bold"
-    if speaker then
+    if echo then
+      label.tooltip = { "ptt-radio.echo-tooltip" }
+      label.style.font_color = ECHO_COLOR
+    elseif speaker then
       local c = speaker.chat_color
       label.style.font_color = { r = c.r, g = c.g, b = c.b, a = 1 }
     else
@@ -78,6 +98,38 @@ end
 local function render_all_badges()
   for _, viewer in pairs(game.connected_players) do
     render_badge(viewer)
+  end
+end
+
+-- personal panel for the echo source only; rebuilt from events, never printed to chat
+local function render_echo_panel(player)
+  local root = player.gui.left
+  if root[ECHO_PANEL] then
+    root[ECHO_PANEL].destroy()
+  end
+  if not storage.echo_sources[player.index] then
+    return
+  end
+  local frame = root.add({ type = "frame", name = ECHO_PANEL, direction = "vertical" })
+  local label = frame.add({ type = "label", caption = { "ptt-radio.echo-panel" } })
+  label.style.font = "default-bold"
+  label.style.font_color = ECHO_COLOR
+  label.style.single_line = false
+  label.style.maximal_width = 280
+  local button = frame.add({ type = "button", name = ECHO_OFF_BUTTON, style = "red_button", caption = { "ptt-radio.echo-open-mic-off" } })
+  -- with open mic already off there is nothing to switch off
+  button.visible = storage.open_mic[player.index] ~= nil
+end
+
+local function set_echo(player_index, on)
+  if (storage.echo_sources[player_index] ~= nil) == on then
+    return
+  end
+  storage.echo_sources[player_index] = on or nil
+  render_all_badges()
+  local player = game.get_player(player_index)
+  if player then
+    render_echo_panel(player)
   end
 end
 
@@ -126,6 +178,9 @@ local function set_open_mic(player, open)
   storage.open_mic[player.index] = open or nil
   player.set_shortcut_toggled(SHORTCUT, open)
   send_mic_state(player)
+  if storage.echo_sources[player.index] then
+    render_echo_panel(player)
+  end
 end
 
 local function toggle_open_mic(player)
@@ -150,6 +205,7 @@ end
 local function forget_companion(player_index)
   storage.companions[player_index] = nil
   storage.open_mic[player_index] = nil
+  set_echo(player_index, false)
 end
 
 local function fan_out(sender_index, kind, payload)
@@ -179,6 +235,7 @@ local function init_storage()
   storage.speakers = storage.speakers or {}
   storage.companions = storage.companions or {}
   storage.open_mic = storage.open_mic or {}
+  storage.echo_sources = storage.echo_sources or {}
 end
 
 script.on_init(init_storage)
@@ -205,6 +262,15 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
   elseif kind == STOP then
     set_speaking(sender_index, false)
     fan_out(sender_index, kind, payload)
+  elseif kind == ECHO_STATE then
+    -- header is 5 bytes; the body is exactly one byte, 0 or 1. only a companion that said
+    -- HELLO counts: its timeout is what clears a flag nobody resets
+    if sender_index ~= 0 and storage.companions[sender_index] and #payload == 6 then
+      local state = string.byte(payload, 6)
+      if state == 0 or state == 1 then
+        set_echo(sender_index, state == 1)
+      end
+    end
   end
 end)
 
@@ -246,7 +312,17 @@ script.on_event(defines.events.on_player_joined_game, function(event)
   local player = game.get_player(event.player_index)
   player.set_shortcut_toggled(SHORTCUT, storage.open_mic[player.index] ~= nil)
   render_badge(player)
+  render_echo_panel(player)
   send_roster_to_all()
+end)
+
+script.on_event(defines.events.on_gui_click, function(event)
+  if event.element.valid and event.element.name == ECHO_OFF_BUTTON then
+    local player = game.get_player(event.player_index)
+    if storage.open_mic[player.index] then
+      set_open_mic(player, false)
+    end
+  end
 end)
 
 script.on_event(defines.events.on_player_left_game, function(event)
