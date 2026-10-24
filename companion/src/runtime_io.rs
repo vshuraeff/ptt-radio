@@ -63,17 +63,16 @@ impl Resolver {
         if self.done {
             return None;
         }
-        let result = if now >= self.deadline {
-            Err(io::Error::new(
+        // a result that already arrived is delivered even past the deadline, which
+        // starts before audio startup; only an empty channel can time out.
+        let result = match self.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) if now >= self.deadline => Err(io::Error::new(
                 ErrorKind::TimedOut,
                 "STUN DNS result deadline",
-            ))
-        } else {
-            match self.result.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => Err(io::Error::other("STUN DNS worker ended")),
-            }
+            )),
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => Err(io::Error::other("STUN DNS worker ended")),
         };
         self.done = true;
         Some(result)
@@ -243,5 +242,16 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(resolver.poll(now).unwrap().unwrap(), vec![address]);
         assert!(resolver.poll(now).is_none());
+    }
+
+    #[test]
+    fn ready_result_is_delivered_after_the_deadline() {
+        let now = Instant::now();
+        let (mut resolver, worker) =
+            Resolver::spawn(now, || Ok("127.0.0.1:3478".to_socket_addrs()?.collect())).unwrap();
+        worker.join().unwrap();
+        let found = resolver.poll(now + DNS_LIMIT * 2).unwrap().unwrap();
+        assert_eq!(found, vec!["127.0.0.1:3478".parse().unwrap()]);
+        assert!(resolver.poll(now + DNS_LIMIT * 2).is_none());
     }
 }

@@ -197,6 +197,36 @@ mod tests {
     }
 
     #[test]
+    fn late_dns_without_a_new_server_changes_nothing() {
+        let now = Instant::now();
+        let source = "127.0.0.1:45001".parse().unwrap();
+        let server = "127.0.0.1:3478".parse().unwrap();
+        for servers in [Vec::new(), vec![server]] {
+            let mut config = ConnectivityConfig::default();
+            config.discovery.stun_servers = servers.clone();
+            let mut ice = PairConnectivity::new(
+                StreamId {
+                    player: 1,
+                    generation: 1,
+                },
+                StreamId {
+                    player: 2,
+                    generation: 2,
+                },
+                vec![source],
+                config,
+                now,
+            )
+            .unwrap();
+            while ice.poll_action().is_some() {}
+            for late in [Vec::new(), servers.clone()] {
+                ice.discover_stun(late, now + ms(1)).unwrap();
+                assert!(ice.poll_action().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn rejected_late_stun_result_preserves_config_hub_and_future_roster() {
         let mut pair = Pair::new();
         add_hub(&mut pair, 0);
@@ -258,6 +288,51 @@ mod tests {
             runtime.game(&update(2, vec![2]), pair.now).unwrap();
             assert!(runtime.allows_receive(2));
         }
+    }
+
+    #[test]
+    fn identify_alone_does_not_authorize_an_audience_reset() {
+        let now = Instant::now();
+        let update = |revision, scope: Vec<u16>| {
+            signaling::encode_audience(&Audience {
+                revision,
+                send_to: scope.clone(),
+                receive_from: scope,
+            })
+            .unwrap()
+        };
+        let mut runtime = Runtime::new(
+            vec!["127.0.0.1:41001".parse().unwrap()],
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime.game(&update(500, vec![]), now).unwrap();
+        runtime.identify(1, now).unwrap();
+        runtime.game(&update(3, vec![2]), now).unwrap();
+        assert!(!runtime.allows_receive(2));
+        runtime.roster(vec![1, 2], now).unwrap();
+        runtime.game(&update(3, vec![2]), now).unwrap();
+        assert!(runtime.allows_receive(2));
+    }
+
+    #[test]
+    fn startup_roster_then_audience_is_accepted_after_identify() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(
+            vec!["127.0.0.1:41001".parse().unwrap()],
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime.roster(vec![1, 2], now).unwrap();
+        runtime.identify(1, now).unwrap();
+        let audience = signaling::encode_audience(&Audience {
+            revision: 1,
+            send_to: vec![2],
+            receive_from: vec![2],
+        })
+        .unwrap();
+        runtime.game(&audience, now).unwrap();
+        assert!(runtime.allows_receive(2));
     }
 
     #[test]
@@ -1566,11 +1641,16 @@ impl Runtime {
         }));
         self.relay = Some(Relay::new(player, self.generation, Limits::default()));
         self.trace(format!("generation {player} {}", self.generation));
-        self.roster(self.roster.clone(), now)
+        self.apply_roster(self.roster.clone(), now)
     }
 
+    /// the trusted ROSTER signal; only it authorizes the one-shot AUDIENCE reset.
     pub fn roster(&mut self, players: Vec<u16>, now: Instant) -> Result<()> {
         self.audience_reset = true;
+        self.apply_roster(players, now)
+    }
+
+    fn apply_roster(&mut self, players: Vec<u16>, now: Instant) -> Result<()> {
         self.roster = players;
         let Some(local) = self.player else {
             return Ok(());
