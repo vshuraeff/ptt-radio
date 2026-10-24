@@ -1,6 +1,6 @@
 # DTLN-aec runtime experiment
 
-Standalone experiment, outside the companion's Cargo dependency graph. It does not replace the shipped canceller. `Stream48` is a callable Rust library for the multi-party evaluation; the binary provides parity, latency and coupled-fixture checks. Runtime inference uses `tract-onnx` 0.23.9 and RustFFT, with explicit recurrent state for each stream. TensorFlow/Python are used only to convert and validate weights offline.
+Standalone experiment, also a companion dev-dependency for offline comparisons, outside the production dependency graph. It does not replace the shipped canceller. `Stream48` is a callable Rust library for the multi-party evaluation; the binary provides parity, latency and coupled-fixture checks. Runtime inference uses `tract-onnx` 0.23.9 and RustFFT, with explicit recurrent state for each stream. TensorFlow/Python are used only to convert and validate weights offline.
 
 ## Models and conversion
 

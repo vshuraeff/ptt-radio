@@ -16,8 +16,10 @@ hound = "3.5"
 opusic-c = "1.6.1"
 sonora = "=0.2.0"
 
-# tests/multiparty_lab.rs only: the stock canceller it compares, and its stft
+# offline comparison only; no neural runtime in the production companion
 [dev-dependencies]
+cpu-time = "1.0"
+dtln-runtime-lab = { path = "experiments/dtln-runtime" }
 rustfft = "6.4"
 sonora = "=0.2.0"
 

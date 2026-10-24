@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cpu_time::ProcessTime;
+use dtln_runtime_lab::{RateConverter, Stream48};
 use opusic_c::{Channels, Decoder, SampleRate};
+use ptt_radio_companion::echo::{EchoPath, GateState};
 use ptt_radio_companion::packet::VOICE;
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{Coupling, read_wav};
@@ -64,6 +67,9 @@ const HOWL_WINDOW: usize = 50;
 trait Canceller {
     fn far_end(&mut self, block: &[f32]);
     fn near_end(&mut self, frame: &mut [f32]);
+    fn gates(&self) -> &[GateState] {
+        &[]
+    }
 }
 
 struct Bypass;
@@ -137,12 +143,99 @@ impl Canceller for Sonora {
 /// a fresh canceller for one player
 type MakeCanceller = fn() -> Box<dyn Canceller>;
 
-/// the rows compared. slot for the gated canceller of unit u4 (src/echo.rs `EchoPath`
-/// with its echo gate): a row whose `far_end`/`near_end` call `EchoPath::far_end` and
-/// `EchoPath::near_end`; it is added once u4 lands
-const ROWS: [(&str, MakeCanceller); 2] = [
+struct Gated {
+    echo: EchoPath,
+    states: Vec<GateState>,
+}
+
+impl Canceller for Gated {
+    fn far_end(&mut self, block: &[f32]) {
+        self.echo.far_end(block);
+    }
+
+    fn near_end(&mut self, frame: &mut [f32]) {
+        for block in frame.as_chunks_mut::<BLOCK>().0 {
+            self.echo.near_end(block);
+            self.states.push(self.echo.gate_state());
+        }
+    }
+
+    fn gates(&self) -> &[GateState] {
+        &self.states
+    }
+}
+
+struct Neural {
+    stream: Stream48,
+    render: VecDeque<[f32; BLOCK]>,
+}
+
+impl Neural {
+    fn new(units: usize) -> Self {
+        let variable = format!("PTT_LAB_DTLN_{units}");
+        let default =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("experiments/dtln-runtime/models");
+        let default = if units == 512 {
+            default.join("512")
+        } else {
+            default
+        };
+        let directory = std::env::var_os(&variable).map_or(default, PathBuf::from);
+        Self {
+            stream: Stream48::load(&directory, units).unwrap_or_else(|e| {
+                panic!(
+                    "load DTLN {units} at {} ({variable}): {e:#}",
+                    directory.display()
+                )
+            }),
+            render: VecDeque::new(),
+        }
+    }
+}
+
+impl Canceller for Neural {
+    fn far_end(&mut self, block: &[f32]) {
+        self.render.extend(block.as_chunks::<BLOCK>().0);
+    }
+
+    fn near_end(&mut self, frame: &mut [f32]) {
+        for block in frame.as_chunks_mut::<BLOCK>().0 {
+            let far = self
+                .render
+                .pop_front()
+                .expect("one render per capture block");
+            *block = self.stream.process(block, &far).expect("DTLN inference");
+        }
+    }
+}
+
+#[derive(Default)]
+struct Resampled(RateConverter);
+
+impl Canceller for Resampled {
+    fn far_end(&mut self, _block: &[f32]) {}
+
+    fn near_end(&mut self, frame: &mut [f32]) {
+        for block in frame.as_chunks_mut::<BLOCK>().0 {
+            let down = self.0.down(block);
+            *block = self.0.up(&down);
+        }
+    }
+}
+
+const WET_DELAY: usize = 436;
+const ROWS: [(&str, MakeCanceller); 6] = [
     ("none", || Box::new(Bypass)),
     ("sonora-hmm", || Box::new(Sonora::new())),
+    ("aec3-gate", || {
+        Box::new(Gated {
+            echo: EchoPath::default(),
+            states: Vec::new(),
+        })
+    }),
+    ("resample-only", || Box::new(Resampled::default())),
+    ("dtln-128", || Box::new(Neural::new(128))),
+    ("dtln-512", || Box::new(Neural::new(512))),
 ];
 
 /// capture delay through a canceller: where an impulse comes out with no far end
@@ -387,6 +480,9 @@ struct Run {
     howl: Option<f64>,
     /// schedule offset, s
     offset: f64,
+    gates: Vec<Vec<GateState>>,
+    cpu: Vec<Duration>,
+    blocks: Vec<usize>,
 }
 
 fn simulate(scn: &Scenario, voices: &[Vec<f32>], make: MakeCanceller, warm: bool) -> Run {
@@ -427,6 +523,9 @@ fn simulate(scn: &Scenario, voices: &[Vec<f32>], make: MakeCanceller, warm: bool
         clipped: vec![0; n],
         howl: None,
         offset,
+        gates: vec![Vec::new(); n],
+        cpu: vec![Duration::ZERO; n],
+        blocks: vec![0; n],
     };
     let mut frames = vec![vec![0.0f32; 2 * BLOCK]; n];
     let mut loudness = vec![0.0; n];
@@ -453,7 +552,10 @@ fn simulate(scn: &Scenario, voices: &[Vec<f32>], make: MakeCanceller, warm: bool
             // the mixer's soft limiter
             mix.iter_mut().for_each(|s| *s = s.tanh());
             run.speaker[l][k0 + AHEAD..k0 + AHEAD + BLOCK].copy_from_slice(&mix);
+            let cpu = ProcessTime::now();
             cancellers[l].far_end(&mix);
+            run.cpu[l] += cpu.elapsed();
+            run.blocks[l] += 1;
             let frame = &mut frames[l][(t % 2) * BLOCK..(t % 2 + 1) * BLOCK];
             for (i, s) in frame.iter_mut().enumerate() {
                 let k = k0 + i;
@@ -465,11 +567,16 @@ fn simulate(scn: &Scenario, voices: &[Vec<f32>], make: MakeCanceller, warm: bool
                 *s = mic.clamp(-1.0, 1.0);
             }
             if t % 2 == 1 {
+                let cpu = ProcessTime::now();
                 cancellers[l].near_end(&mut frames[l]);
+                run.cpu[l] += cpu.elapsed();
                 let pcm = links[l].send(&frames[l]);
                 run.decoded[l][k0 + BLOCK - 2 * BLOCK..k0 + BLOCK].copy_from_slice(&pcm);
             }
         }
+    }
+    for (states, canceller) in run.gates.iter_mut().zip(&cancellers) {
+        states.extend_from_slice(canceller.gates());
     }
     run
 }
@@ -790,6 +897,93 @@ fn delayed(x: &[f32], d: usize) -> Vec<f32> {
     out
 }
 
+/// decoded sample -> original capture sample; gate targets select the stable dry/wet delay
+fn capture_at(sample: usize, codec: usize, delay: usize, gates: &[GateState]) -> Option<usize> {
+    let output = sample.checked_sub(codec)?;
+    let delay = gates
+        .get(output / BLOCK)
+        .map_or(delay, |s| if s.engaged { WET_DELAY } else { 0 });
+    output.checked_sub(delay)
+}
+
+fn aligned(x: &[f32], codec: usize, delay: usize, gates: &[GateState]) -> Vec<f32> {
+    (0..x.len())
+        .map(|k| capture_at(k, codec, delay, gates).map_or(0.0, |i| x[i]))
+        .collect()
+}
+
+fn transitions(gates: &[GateState]) -> impl Iterator<Item = (usize, &GateState)> {
+    gates
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| s.engaged != i.checked_sub(1).is_some_and(|j| gates[j].engaged))
+}
+
+/// reject the whole fit support if it touches a crossfade or its conservative codec guard
+fn stable_gate_window(w: &WindowFit, codec: usize, gates: &[GateState]) -> bool {
+    let half = ((M - 1) * HOP + FFT) / 2;
+    let from = w.centre.saturating_sub(half);
+    let to = w.centre + half;
+    transitions(gates).all(|(block, _)| {
+        let at = block * BLOCK + codec;
+        to <= at.saturating_sub(2 * BLOCK) || from >= at + BLOCK + 2 * BLOCK
+    })
+}
+
+#[test]
+fn gate_alignment_uses_wet_delay_and_excludes_transition_support() {
+    let codec = 312;
+    let at = 20 * BLOCK;
+    let gates: Vec<_> = (0..60)
+        .map(|i| GateState {
+            engaged: (20..45).contains(&i),
+            ..GateState::default()
+        })
+        .collect();
+    assert_eq!(capture_at(at - 1 + codec, codec, 0, &gates), Some(at - 1));
+    assert_eq!(
+        capture_at(at + codec, codec, 0, &gates),
+        Some(at - WET_DELAY)
+    );
+    assert_eq!(
+        capture_at(45 * BLOCK + codec, codec, 0, &gates),
+        Some(45 * BLOCK)
+    );
+    let window = |centre| WindowFit {
+        centre,
+        n_active: true,
+        e_active: false,
+        bands: [Band::default(); 3],
+    };
+    for centre in [at + codec - BLOCK, at + codec, at + codec + 3 * BLOCK] {
+        assert!(!stable_gate_window(&window(centre), codec, &gates));
+    }
+    assert!(stable_gate_window(
+        &window(at + codec + 10 * BLOCK),
+        codec,
+        &gates
+    ));
+    assert!(!stable_gate_window(
+        &window(45 * BLOCK + codec),
+        codec,
+        &gates
+    ));
+    assert!(stable_gate_window(
+        &window(at + codec - 10 * BLOCK),
+        codec,
+        &gates
+    ));
+    assert_eq!(transitions(&gates).count(), 2);
+}
+
+#[test]
+fn new_adapters_preserve_cadence_and_resampler_delay() {
+    assert_eq!(canceller_delay(|| Box::new(Resampled::default())), 126);
+    assert_eq!(canceller_delay(ROWS[2].1), 0);
+    let x: Vec<f32> = (0..RATE).map(|i| (i as f32 * 0.1).sin()).collect();
+    assert_eq!(aligned(&x, 312, 126, &[]), delayed(&x, 438));
+}
+
 /// the four controls of the metric, on the lab's own voices without codec or canceller
 fn controls(n: &[f32], far: &[f32], fft: &Arc<dyn Fft<f64>>) {
     let c = coupling(-6.0);
@@ -1002,13 +1196,12 @@ fn write(path: &Path, samples: &[f32]) {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: RATE as u32,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
     };
     let mut wav = hound::WavWriter::create(path, spec).unwrap();
     for s in samples {
-        wav.write_sample((s.clamp(-1.0, 1.0) * 32767.0) as i16)
-            .unwrap();
+        wav.write_sample(*s).unwrap();
     }
     wav.finalize().unwrap();
 }
@@ -1039,6 +1232,7 @@ fn multiparty_lab() {
         .iter()
         .map(|(_, make)| canceller_delay(*make))
         .collect();
+    assert_eq!(delays, [0, WET_DELAY, 0, 126, 1662, 1662]);
     println!(
         "opus delay {codec} samples; canceller delay: {}",
         ROWS.iter()
@@ -1047,20 +1241,44 @@ fn multiparty_lab() {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    // the floor every canceller row sits on: each voice alone through opus
+    // isolated controls remain measurable even when the uncancelled closed loop howls
     for (name, v) in ["A", "B", "C"].iter().zip(&voices) {
-        let mut link = Link::new();
-        let v = &v[..v.len() / link.frame * link.frame];
-        let decoded: Vec<f32> = v
-            .chunks_exact(link.frame)
-            .flat_map(|f| link.send(f))
-            .collect();
-        let fits = fit(&decoded, &delayed(v, codec), &vec![0.0; v.len()], &fft);
-        println!(
-            "  {:<18}{}",
-            format!("{name} codec only"),
-            cells(&summarise(fits.iter()))
-        );
+        for (label, make, delay) in [
+            ("codec only", ROWS[0].1, 0),
+            ("FIR + codec", ROWS[3].1, 126),
+        ] {
+            let mut link = Link::new();
+            let mut canceller = make();
+            let v = &v[..v.len() / link.frame * link.frame];
+            let decoded: Vec<f32> = v
+                .chunks_exact(link.frame)
+                .flat_map(|f| {
+                    let mut frame = f.to_vec();
+                    canceller.near_end(&mut frame);
+                    link.send(&frame)
+                })
+                .collect();
+            let reference = delayed(v, codec + delay);
+            let fits = fit(&decoded, &reference, &vec![0.0; v.len()], &fft);
+            println!(
+                "  {:<18}{}",
+                format!("{name} {label}"),
+                cells(&summarise(fits.iter()))
+            );
+            let tag = if delay == 0 {
+                "codec-only"
+            } else {
+                "resample-codec"
+            };
+            write(
+                &dir.join(format!("control-{tag}-{name}-decoded.wav")),
+                &decoded,
+            );
+            write(
+                &dir.join(format!("control-{tag}-{name}-aligned-clean.wav")),
+                &reference,
+            );
+        }
     }
 
     for scn in scenarios() {
@@ -1087,7 +1305,82 @@ fn multiparty_lab() {
                 let start = if warm { "warm" } else { "cold" };
                 let run = simulate(&scn, &voices, *make, warm);
                 let tag = format!("{}-{row}-{start}", scn.name);
+                let available = if run.howl.is_some() {
+                    run.blocks.iter().min().unwrap() / 2 * (2 * BLOCK)
+                } else {
+                    run.voice[0].len()
+                };
+                let write = |path: &Path, samples: &[f32]| {
+                    write(path, &samples[..available.min(samples.len())]);
+                };
                 for (l, s) in seats.iter().enumerate() {
+                    let reference = aligned(&run.voice[l], codec, *cd, &run.gates[l]);
+                    write(
+                        &dir.join(format!("{tag}-{}-clean.wav", s.name)),
+                        &run.voice[l],
+                    );
+                    write(
+                        &dir.join(format!("{tag}-{}-decoded.wav", s.name)),
+                        &run.decoded[l],
+                    );
+                    write(
+                        &dir.join(format!("{tag}-{}-aligned-clean.wav", s.name)),
+                        &reference,
+                    );
+                    let intervals: &[(&str, f64, f64)] = if scn.name == "a" {
+                        &[("double", 23.0, 30.0), ("triple", 34.0, 41.0)]
+                    } else {
+                        &[("double", 16.0, 27.0)]
+                    };
+                    for &(phase, from, to) in intervals {
+                        let from = ((from + run.offset) * RATE as f64) as usize;
+                        let to = ((to + run.offset) * RATE as f64) as usize;
+                        let invalid = dir.join(format!("{tag}-{}-{phase}-invalid.txt", s.name));
+                        if to > available {
+                            for kind in ["decoded", "aligned-clean"] {
+                                let old = dir.join(format!("{tag}-{}-{phase}-{kind}.wav", s.name));
+                                if old.exists() {
+                                    std::fs::remove_file(old).unwrap();
+                                }
+                            }
+                            std::fs::write(
+                                invalid,
+                                format!("invalid crop: simulation stopped for howl; only {available} fully processed capture samples ({:.3}s); requested [{from},{to})\n", available as f64 / RATE as f64),
+                            ).unwrap();
+                            continue;
+                        }
+                        if invalid.exists() {
+                            std::fs::remove_file(invalid).unwrap();
+                        }
+                        for (kind, samples) in
+                            [("decoded", &run.decoded[l]), ("aligned-clean", &reference)]
+                        {
+                            write(
+                                &dir.join(format!("{tag}-{}-{phase}-{kind}.wav", s.name)),
+                                &samples[from..to],
+                            );
+                        }
+                    }
+                    if !run.gates[l].is_empty() {
+                        let mut trace = String::from(
+                            "capture_sample,engaged,score,lag_ms,last_transition_sample\n",
+                        );
+                        use std::fmt::Write;
+                        for (i, state) in run.gates[l].iter().enumerate() {
+                            writeln!(
+                                trace,
+                                "{},{},{:.6},{:.3},{}",
+                                i * BLOCK,
+                                state.engaged,
+                                state.score,
+                                state.lag_ms,
+                                state.capture_sample
+                            )
+                            .unwrap();
+                        }
+                        std::fs::write(dir.join(format!("{tag}-{}-gate.csv", s.name)), trace)
+                            .unwrap();
+                    }
                     write(
                         &dir.join(format!("{tag}-{}-hears.wav", s.name)),
                         &run.speaker[l],
@@ -1130,6 +1423,39 @@ fn multiparty_lab() {
                         .join("/"),
                     clipped.join(", ")
                 );
+                println!(
+                    "    process CPU ms/player/10ms (far + near, no load/codec/analysis/IO): {}",
+                    run.cpu
+                        .iter()
+                        .zip(&run.blocks)
+                        .map(|(cpu, blocks)| format!(
+                            "{:.4}",
+                            cpu.as_secs_f64() * 1000.0 / (*blocks).max(1) as f64
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("/")
+                );
+                for (p, states) in run.gates.iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+                    let changes = transitions(states)
+                        .map(|(i, s)| {
+                            format!(
+                                "{:.3}s:{} score={:.3} lag={:.1}ms",
+                                i as f64 / 100.0 - run.offset,
+                                if s.engaged { "wet" } else { "dry" },
+                                s.score,
+                                s.lag_ms
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "    {} gate: {} wet blocks / {}; transitions [{}]",
+                        seats[p].name,
+                        states.iter().filter(|s| s.engaged).count(),
+                        states.len(),
+                        changes
+                    );
+                }
                 if let Some(at) = run.howl {
                     let when = if at < 0.0 {
                         format!("{:.1} s into the warm-up", at + run.offset)
@@ -1160,8 +1486,11 @@ fn multiparty_lab() {
                         .filter(|(p, v)| *p != l && v.couple_db.is_some())
                     {
                         let back = delayed(&run.decoded[p], path(via, s) + AHEAD);
-                        let nominal =
-                            2 * (cd + codec + AHEAD) + path(s, via) + path(via, s) + ms(2);
+                        let return_delay = if *row == "aec3-gate" { WET_DELAY } else { *cd };
+                        let nominal = 2 * (return_delay + codec + AHEAD)
+                            + path(s, via)
+                            + path(via, s)
+                            + ms(2);
                         let (lag, level) = echo_return(&run.voice[l], &back, from, to, nominal);
                         let found = if level < ECHO_FLOOR_DB {
                             format!("below {ECHO_FLOOR_DB} dB")
@@ -1181,17 +1510,31 @@ fn multiparty_lab() {
                     "talker, phase", "<1k", "1-4k", "4-8k", "<1k", "1-4k", "4-8k", "dist", "skip"
                 );
                 for (p, s) in seats.iter().enumerate() {
-                    let d = cd + codec;
+                    let gates = &run.gates[p];
                     let fits = fit(
                         &run.decoded[p],
-                        &delayed(&run.voice[p], d),
-                        &delayed(&run.echo[p], d),
+                        &aligned(&run.voice[p], codec, *cd, gates),
+                        &aligned(&run.echo[p], codec, *cd, gates),
                         &fft,
                     );
+                    if !gates.is_empty() {
+                        println!(
+                            "    {} gate alignment excluded {} / {} fit windows ({} near-active); remaining use dry 0/wet {WET_DELAY} samples + codec {codec}",
+                            s.name,
+                            fits.iter()
+                                .filter(|w| !stable_gate_window(w, codec, gates))
+                                .count(),
+                            fits.len(),
+                            fits.iter()
+                                .filter(|w| w.n_active && !stable_gate_window(w, codec, gates))
+                                .count()
+                        );
+                    }
                     // phase at the talker's own time: how many talk with him, or far end only;
                     // a window across a turn edge has none
                     let phase_at = |sample: usize| -> Option<usize> {
-                        let t = (sample.checked_sub(d)?) as f64 / RATE as f64 - run.offset;
+                        let t = capture_at(sample, codec, *cd, gates)? as f64 / RATE as f64
+                            - run.offset;
                         let on: Vec<usize> = scn
                             .talk
                             .iter()
@@ -1206,6 +1549,9 @@ fn multiparty_lab() {
                     };
                     let half = (M * HOP + FFT) / 2;
                     let phase = |w: &WindowFit| {
+                        if !stable_gate_window(w, codec, gates) {
+                            return None;
+                        }
                         let at = phase_at(w.centre.saturating_sub(half));
                         (at == phase_at(w.centre + half)).then_some(at).flatten()
                     };
