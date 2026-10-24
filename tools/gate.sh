@@ -29,12 +29,12 @@ gate_start=$(date +%s)
 
 note() { echo "$*" | tee -a "$summary"; }
 
-# step <name> <command...>: runs the command from the companion dir, output to <log>/<name>.log
+# step <name> <command...>: runs the command from the companion dir (or $dir), output to <log>/<name>.log
 step() {
   local name=$1 start rc
   shift
   start=$(date +%s)
-  (cd "$companion" && "$@") > "$log/$name.log" 2>&1
+  (cd "${dir:-$companion}" && "$@") > "$log/$name.log" 2>&1
   rc=$?
   [ "$rc" -eq 0 ] || failed=1
   note "$(printf '%-28s rc=%-3s %5ss' "$name" "$rc" "$(($(date +%s) - start))")"
@@ -62,7 +62,7 @@ step fmt cargo fmt --check
 step clippy cargo clippy --locked --all-targets --release -- -D warnings
 
 step debug-lib cargo test --locked --lib --bins
-for t in bridge_repr connectivity crypto_sessions game_probe multiparty_lab netlab receive_order relay_hub transport_contract; do
+for t in bridge_repr connectivity crypto_sessions game_probe multiparty_lab netlab policy_contract policy_playout receive_order relay_hub transport_contract; do
   step "debug-$t" cargo test --locked --test "$t" -- --test-threads 1
 done
 
@@ -72,10 +72,14 @@ for run in $(seq 1 "$runs"); do
   realtime "scenarios-$run" cargo test --locked --release --test scenarios -- --nocapture --test-threads 1
 done
 realtime aec_gate cargo test --locked --release --test aec_gate -- --nocapture --test-threads 1
+# the policy revocation, retune and double-talk measurements of the real companion process
+realtime policy_playout cargo test --locked --test policy_playout -- --ignored --nocapture --test-threads 1
 
-step luac-control luac -p ../mod/ptt-radio/control.lua
-step luac-settings luac -p ../mod/ptt-radio/settings.lua
-step lua-control-test lua ../mod/tests/control_test.lua ../mod/ptt-radio/control.lua
+# the mod's tests resolve its modules relative to ptt-radio/
+dir=$root step luac-mod luac -p mod/ptt-radio/*.lua mod/tests/*.lua
+for t in control channels admin settings_gui; do
+  dir=$root step "lua-$t-test" lua "mod/tests/${t}_test.lua" mod/ptt-radio/control.lua
+done
 
 note "gate total $(($(date +%s) - gate_start))s, $([ "$failed" -eq 0 ] && echo passed || echo FAILED)"
 exit "$failed"
