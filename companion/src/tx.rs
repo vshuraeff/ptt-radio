@@ -9,7 +9,7 @@ use opusic_c::{Application, Bitrate, Channels, Encoder, InbandFec, SampleRate};
 
 use crate::audio::OPUS_RATE;
 use crate::packet::{self, START, STOP, VOICE};
-use crate::transport::wire::MAX_OPUS;
+use crate::transport::wire::MAX_POLICY_OPUS;
 
 /// audio captured before the press, the frame in progress included
 const PREROLL_MS: usize = 120;
@@ -53,6 +53,8 @@ pub struct Transmitter {
     open_mic: bool,
     on_air: bool,
     preroll: VecDeque<Vec<f32>>,
+    permitted: bool,
+    policy_reset: u64,
 }
 
 impl Transmitter {
@@ -76,6 +78,8 @@ impl Transmitter {
             open_mic: false,
             on_air: false,
             preroll: VecDeque::new(),
+            permitted: true,
+            policy_reset: 0,
         })
     }
 
@@ -93,8 +97,20 @@ impl Transmitter {
         self.open_mic = open;
     }
 
+    pub fn set_policy(&mut self, permitted: bool, _revision: Option<u64>, reset: u64) {
+        if !permitted || reset != self.policy_reset {
+            self.on_air = false;
+            self.preroll.clear();
+        }
+        self.permitted = permitted;
+        self.policy_reset = reset;
+    }
+
     /// takes one 48 kHz mono frame of `frame_samples` and returns the packets to send, in order
     pub fn frame(&mut self, pcm: &[f32]) -> Vec<Vec<u8>> {
+        if !self.permitted {
+            return Vec::new();
+        }
         let want = self.ptt || self.open_mic;
         let mut out = Vec::new();
         if self.on_air {
@@ -136,7 +152,7 @@ impl Transmitter {
     fn voice(&mut self, pcm: &[f32]) -> Vec<u8> {
         // libopus fits each packet into the buffer it is given, so every frame fits every
         // route, the relay's included; opus alone would allow 1275 bytes
-        let mut buf = [0u8; MAX_OPUS];
+        let mut buf = [0u8; MAX_POLICY_OPUS];
         let len = self
             .encoder
             .encode_float_to_slice(pcm, &mut buf)
@@ -149,6 +165,66 @@ impl Transmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_policy_revision_preserves_idle_pcm_preroll() {
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
+        tx.set_policy(true, Some(7), 1);
+        let lead_in: Vec<_> = (0..tx.frame_samples())
+            .map(|sample| (sample as f32 * std::f32::consts::TAU * 880.0 / 48_000.0).sin() * 0.3)
+            .collect();
+        for _ in 0..3 {
+            assert!(tx.frame(&lead_in).is_empty());
+        }
+        tx.set_policy(true, Some(8), 1);
+        tx.set_ptt(true);
+        let packets = tx.frame(&silence());
+        assert_eq!(kinds(&packets), [START, VOICE, VOICE, VOICE, VOICE]);
+        let mut decoder = opusic_c::Decoder::new(Channels::Mono, SampleRate::Hz48000).unwrap();
+        let mut pcm = [0.0; 960];
+        decoder
+            .decode_float_to_slice(&packets[1][5..], &mut pcm, false)
+            .unwrap();
+        assert!(pcm.iter().any(|sample| sample.abs() > 0.05));
+    }
+
+    #[test]
+    fn own_permission_changes_discard_idle_preroll() {
+        for mute in [false, true] {
+            let mut tx = Transmitter::new(Codec::default()).unwrap();
+            tx.set_policy(true, Some(7), 1);
+            for _ in 0..3 {
+                assert!(tx.frame(&silence()).is_empty());
+            }
+            tx.set_policy(!mute, Some(8), 2);
+            if mute {
+                assert!(tx.frame(&silence()).is_empty());
+                tx.set_policy(true, Some(9), 3);
+            }
+            tx.set_ptt(true);
+            assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
+        }
+    }
+
+    #[test]
+    fn policy_mute_discards_preroll_and_open_mic_reenables_as_a_fresh_transmission() {
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
+        tx.set_open_mic(true);
+        tx.set_policy(true, Some(7), 1);
+        assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
+        tx.set_policy(true, Some(8), 1);
+        assert_eq!(kinds(&tx.frame(&silence())), [VOICE]);
+        tx.set_policy(false, Some(9), 2);
+        for _ in 0..10 {
+            assert!(tx.frame(&silence()).is_empty());
+        }
+        tx.set_policy(true, Some(10), 3);
+        assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
+        tx.set_policy(true, Some(11), 4);
+        assert_eq!(kinds(&tx.frame(&silence())), [START, VOICE]);
+        tx.set_policy(true, Some(11), 4);
+        assert_eq!(kinds(&tx.frame(&silence())), [VOICE]);
+    }
 
     fn kinds(packets: &[Vec<u8>]) -> Vec<u8> {
         packets.iter().map(|p| p[2]).collect()
@@ -279,7 +355,7 @@ mod tests {
             }
         }
         // the encoder runs at the cap, so a larger buffer would have overrun it
-        assert!(largest > MAX_OPUS * 9 / 10, "{largest}");
+        assert!(largest > MAX_POLICY_OPUS * 9 / 10, "{largest}");
     }
 
     #[test]

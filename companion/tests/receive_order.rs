@@ -122,6 +122,7 @@ fn push(order: &mut Reorder, seq: u16, at: Instant) -> InsertResult {
         id: order.media_id(seq).expect("in window"),
         talkspurt: 1,
         opus: SILENCE.to_vec(),
+        revision: None,
     };
     order.push(frame, at)
 }

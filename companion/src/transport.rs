@@ -61,6 +61,7 @@ pub struct CompressedFrame {
     pub id: MediaId,
     pub talkspurt: u16,
     pub opus: Vec<u8>,
+    pub revision: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

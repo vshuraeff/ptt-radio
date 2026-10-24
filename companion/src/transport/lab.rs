@@ -50,6 +50,9 @@ pub fn label(first: Option<u8>) -> &'static str {
             Ok(Kind::Stop) => "STOP",
             Ok(Kind::Ping) => "PING",
             Ok(Kind::Pong) => "PONG",
+            Ok(Kind::PolicyVoice) => "POLICY-VOICE",
+            Ok(Kind::PolicyStart) => "POLICY-START",
+            Ok(Kind::PolicyStop) => "POLICY-STOP",
             Err(_) => "UNKNOWN",
         },
     }

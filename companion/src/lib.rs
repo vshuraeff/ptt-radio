@@ -9,6 +9,7 @@ pub mod echo;
 pub mod jitter;
 pub mod mix;
 pub mod packet;
+pub mod policy;
 pub mod relay;
 pub mod reorder;
 pub mod runtime;

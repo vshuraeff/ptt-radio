@@ -15,12 +15,18 @@ pub const MEDIA_OVERHEAD: usize = UDP_HEADER + INNER_HEADER + TAG;
 pub const RELAY_HEADER: usize = 5;
 pub const RELAY_MEDIA_OVERHEAD: usize = RELAY_HEADER + MEDIA_OVERHEAD;
 pub const MAX_OPUS: usize = MAX_DATAGRAM - RELAY_MEDIA_OVERHEAD;
+pub const POLICY_REVISION_BYTES: usize = 8;
+pub const MAX_POLICY_OPUS: usize = MAX_OPUS - POLICY_REVISION_BYTES;
 pub const GAME_START: u8 = 0x07;
 pub const GAME_VOICE: u8 = 0x08;
 pub const GAME_STOP: u8 = 0x09;
+pub const GAME_POLICY_START: u8 = 0x0B;
+pub const GAME_POLICY_VOICE: u8 = 0x0C;
+pub const GAME_POLICY_STOP: u8 = 0x0D;
 pub const SIGNAL_OUT: u8 = 0x06;
 pub const SIGNAL_IN: u8 = 0x13;
 pub const AUDIENCE: u8 = 0x14;
+pub const POLICY: u8 = 0x15;
 pub const GAME_OUT_HEADER: usize = 15;
 pub const GAME_IN_HEADER: usize = GAME_OUT_HEADER + 2;
 
@@ -109,6 +115,9 @@ pub enum Kind {
     Stop = 6,
     Ping = 7,
     Pong = 8,
+    PolicyVoice = 9,
+    PolicyStart = 10,
+    PolicyStop = 11,
 }
 
 impl TryFrom<u8> for Kind {
@@ -120,6 +129,9 @@ impl TryFrom<u8> for Kind {
             6 => Ok(Self::Stop),
             7 => Ok(Self::Ping),
             8 => Ok(Self::Pong),
+            9 => Ok(Self::PolicyVoice),
+            10 => Ok(Self::PolicyStart),
+            11 => Ok(Self::PolicyStop),
             _ => Err(CodecError::UnknownType),
         }
     }
@@ -141,7 +153,8 @@ pub struct Inner<'a> {
     pub kind: Kind,
     pub sequence: u16,
     pub talkspurt: u16,
-    /// opus for VOICE, eight-byte probe token for PING/PONG, empty for START/STOP.
+    /// policy media prefixes the ordinary media body with its eight-byte revision.
+    /// ordinary voice is opus, ping/pong a probe token, start/stop empty.
     pub body: &'a [u8],
 }
 
@@ -150,6 +163,12 @@ fn valid_inner(inner: Inner<'_>) -> Result<(), CodecError> {
         Kind::Voice if !inner.body.is_empty() && inner.body.len() <= MAX_OPUS => Ok(()),
         Kind::Start | Kind::Stop if inner.body.is_empty() => Ok(()),
         Kind::Ping | Kind::Pong if inner.body.len() == 8 => Ok(()),
+        Kind::PolicyVoice
+            if inner.body.len() > POLICY_REVISION_BYTES && inner.body.len() <= MAX_OPUS =>
+        {
+            Ok(())
+        }
+        Kind::PolicyStart | Kind::PolicyStop if inner.body.len() == POLICY_REVISION_BYTES => Ok(()),
         _ => Err(CodecError::Invalid),
     }
 }
@@ -179,6 +198,52 @@ pub fn decode_inner(data: &[u8], expected: Kind) -> Result<Inner<'_>, CodecError
     };
     valid_inner(inner)?;
     Ok(inner)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyInner<'a> {
+    pub kind: Kind,
+    pub sequence: u16,
+    pub talkspurt: u16,
+    pub revision: u64,
+    pub opus: &'a [u8],
+}
+
+pub fn encode_policy_inner(media: PolicyInner<'_>) -> Result<Vec<u8>, CodecError> {
+    if !matches!(
+        media.kind,
+        Kind::PolicyVoice | Kind::PolicyStart | Kind::PolicyStop
+    ) || media.opus.len() > MAX_POLICY_OPUS
+    {
+        return Err(CodecError::Invalid);
+    }
+    let mut body = media.revision.to_be_bytes().to_vec();
+    body.extend_from_slice(media.opus);
+    encode_inner(Inner {
+        kind: media.kind,
+        sequence: media.sequence,
+        talkspurt: media.talkspurt,
+        body: &body,
+    })
+}
+
+/// expected must come from the authenticated outer packet kind.
+pub fn decode_policy_inner(data: &[u8], expected: Kind) -> Result<PolicyInner<'_>, CodecError> {
+    let inner = decode_inner(data, expected)?;
+    if !matches!(
+        inner.kind,
+        Kind::PolicyVoice | Kind::PolicyStart | Kind::PolicyStop
+    ) {
+        return Err(CodecError::Invalid);
+    }
+    let mut r = Reader::new(inner.body)?;
+    Ok(PolicyInner {
+        kind: inner.kind,
+        sequence: inner.sequence,
+        talkspurt: inner.talkspurt,
+        revision: r.u64()?,
+        opus: r.0,
+    })
 }
 
 /// identity comes from the authenticated key context, never the raw UDP header.
@@ -375,7 +440,7 @@ pub fn decode_datagram(data: &[u8]) -> Result<Datagram<'_>, CodecError> {
     let mut r = Reader::new(data)?;
     let kind = r.u8()?;
     match kind {
-        4..=8 => {
+        4..=11 => {
             let flags = r.u8()?;
             if flags & !1 != 0 {
                 return Err(CodecError::Invalid);
@@ -397,7 +462,7 @@ pub fn decode_datagram(data: &[u8]) -> Result<Datagram<'_>, CodecError> {
         0x10 => {
             let session = r.u32()?;
             // no recursive wrappers: inspect the child type before decoding it.
-            if !matches!(r.0.first(), Some(4..=8)) {
+            if !matches!(r.0.first(), Some(4..=11)) {
                 return Err(CodecError::Invalid);
             }
             decode_datagram(r.0)?;
@@ -495,5 +560,79 @@ pub fn decode_game(data: &[u8]) -> Result<GameMedia<'_>, CodecError> {
         sequence,
         talkspurt,
         opus: r.0,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyGameMedia<'a> {
+    /// kind is a policy media kind.
+    pub media: GameMedia<'a>,
+    pub revision: u64,
+}
+
+pub fn encode_policy_game(
+    packet: PolicyGameMedia<'_>,
+    forwarded: bool,
+) -> Result<Vec<u8>, CodecError> {
+    let media = packet.media;
+    let kind = match media.kind {
+        Kind::PolicyStart => GAME_POLICY_START,
+        Kind::PolicyVoice => GAME_POLICY_VOICE,
+        Kind::PolicyStop => GAME_POLICY_STOP,
+        _ => return Err(CodecError::Invalid),
+    };
+    let inner = encode_policy_inner(PolicyInner {
+        kind: media.kind,
+        sequence: media.sequence,
+        talkspurt: media.talkspurt,
+        revision: packet.revision,
+        opus: media.opus,
+    })?;
+    let mut out = vec![MAGIC, VERSION, kind];
+    if forwarded {
+        out.extend_from_slice(&media.stream.player.to_be_bytes());
+    }
+    out.extend_from_slice(&media.sequence.to_be_bytes());
+    out.extend_from_slice(&media.stream.generation.to_be_bytes());
+    out.extend_from_slice(&media.talkspurt.to_be_bytes());
+    out.extend_from_slice(&inner[INNER_HEADER..]);
+    bounded(out)
+}
+
+/// parses only forwarded policy game media; legacy media is a separate codec.
+pub fn decode_policy_game(data: &[u8]) -> Result<PolicyGameMedia<'_>, CodecError> {
+    let mut r = Reader::new(data)?;
+    if r.u8()? != MAGIC {
+        return Err(CodecError::Invalid);
+    }
+    if r.u8()? != VERSION {
+        return Err(CodecError::UnsupportedVersion);
+    }
+    let kind = match r.u8()? {
+        GAME_POLICY_START => Kind::PolicyStart,
+        GAME_POLICY_VOICE => Kind::PolicyVoice,
+        GAME_POLICY_STOP => Kind::PolicyStop,
+        _ => return Err(CodecError::UnknownType),
+    };
+    let player = r.u16()?;
+    let sequence = r.u16()?;
+    let generation = r.u64()?;
+    let talkspurt = r.u16()?;
+    valid_inner(Inner {
+        kind,
+        sequence,
+        talkspurt,
+        body: r.0,
+    })?;
+    let revision = r.u64()?;
+    Ok(PolicyGameMedia {
+        media: GameMedia {
+            kind,
+            stream: StreamId { player, generation },
+            sequence,
+            talkspurt,
+            opus: r.0,
+        },
+        revision,
     })
 }

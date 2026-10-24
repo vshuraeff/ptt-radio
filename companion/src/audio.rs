@@ -101,6 +101,12 @@ pub struct Resampler {
 }
 
 impl Resampler {
+    /// output positions before this source offset, from the current interpolation phase.
+    pub fn prefix_samples(&self, source_samples: usize) -> usize {
+        ((source_samples as f64 - self.pos) / self.step)
+            .ceil()
+            .max(0.0) as usize
+    }
     pub fn new(from: u32, to: u32) -> Self {
         Resampler {
             step: from as f64 / to as f64,

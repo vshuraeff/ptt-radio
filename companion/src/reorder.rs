@@ -6,7 +6,7 @@
 //! frame) and a frame that fills it afterwards is late and dropped. of a long gap
 //! only the last MAX_CONCEAL frames are reported; the rest are skipped and late.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::transport::{
@@ -41,9 +41,20 @@ pub struct Reorder {
     /// bit i: sequence next - 1 - i was emitted as a frame, not as Missing
     emitted: u64,
     queue: BTreeMap<u32, (CompressedFrame, Instant)>,
+    pruned: BTreeSet<u32>,
 }
 
 impl Reorder {
+    pub fn retain(&mut self, mut allowed: impl FnMut(&CompressedFrame) -> bool) {
+        self.queue.retain(|sequence, (frame, _)| {
+            if allowed(frame) {
+                true
+            } else {
+                self.pruned.insert(*sequence);
+                false
+            }
+        });
+    }
     pub fn set_wait(&mut self, wait: Duration) {
         self.config.wait = wait.min(Duration::from_millis(200));
     }
@@ -56,6 +67,7 @@ impl Reorder {
             next: None,
             emitted: 0,
             queue: BTreeMap::new(),
+            pruned: BTreeSet::new(),
         }
     }
 
@@ -73,6 +85,7 @@ impl Reorder {
     fn advance(&mut self, next: u32, emitted: bool) {
         self.emitted = (self.emitted << 1) | u64::from(emitted);
         self.next = Some(next + 1);
+        self.pruned.retain(|sequence| *sequence > next);
     }
 }
 
@@ -86,6 +99,9 @@ impl PreDecodeOrder for Reorder {
             return InsertResult::WrongStream;
         }
         let seq = frame.id.sequence;
+        if self.pruned.contains(&seq) {
+            return InsertResult::Late;
+        }
         if self
             .newest
             .is_some_and(|newest| seq.abs_diff(newest) >= WINDOW)
@@ -124,34 +140,47 @@ impl PreDecodeOrder for Reorder {
     }
 
     fn poll(&mut self, now: Instant) -> Ordered {
-        let (Some(mut next), Some((&first, _))) = (self.next, self.queue.first_key_value()) else {
-            return Ordered::Wait;
-        };
-        if first == next {
-            let (frame, _) = self.queue.remove(&first).expect("first key");
-            self.advance(next, true);
-            return Ordered::Frame(frame);
-        }
-        let full = self.queue.len() >= self.config.max_frames;
-        if !full && self.deadline().is_some_and(|at| now < at) {
-            return Ordered::Wait;
-        }
-        let gap = first - next;
-        if gap > MAX_CONCEAL {
-            // skipped, never emitted: late from now on
-            let skipped = gap - MAX_CONCEAL;
-            self.emitted = self.emitted.checked_shl(skipped).unwrap_or(0);
-            next += skipped;
-        }
-        // in-band FEC of frame n travels in frame n + 1 only
-        let following = (first == next + 1).then(|| self.queue[&first].0.clone());
-        self.advance(next, false);
-        Ordered::Missing {
-            id: MediaId {
-                stream: self.stream,
-                sequence: next,
-            },
-            next: following,
+        loop {
+            let (Some(mut next), Some((&first, _))) = (self.next, self.queue.first_key_value())
+            else {
+                return Ordered::Wait;
+            };
+            if self.pruned.remove(&next) {
+                self.advance(next, false);
+                continue;
+            }
+            if first == next {
+                let (frame, _) = self.queue.remove(&first).expect("first key");
+                self.advance(next, true);
+                return Ordered::Frame(frame);
+            }
+            let full = self.queue.len() >= self.config.max_frames;
+            if !full && self.deadline().is_some_and(|at| now < at) {
+                return Ordered::Wait;
+            }
+            let gap = first - next;
+            if gap > MAX_CONCEAL {
+                // skipped, never emitted: late from now on
+                let skipped = gap - MAX_CONCEAL;
+                self.emitted = self.emitted.checked_shl(skipped).unwrap_or(0);
+                next += skipped;
+                self.next = Some(next);
+                self.pruned.retain(|sequence| *sequence >= next);
+                if self.pruned.remove(&next) {
+                    self.advance(next, false);
+                    continue;
+                }
+            }
+            // in-band FEC of frame n travels in frame n + 1 only
+            let following = (first == next + 1).then(|| self.queue[&first].0.clone());
+            self.advance(next, false);
+            return Ordered::Missing {
+                id: MediaId {
+                    stream: self.stream,
+                    sequence: next,
+                },
+                next: following,
+            };
         }
     }
 }
@@ -171,6 +200,7 @@ mod tests {
             id: order.media_id(seq).expect("in window"),
             talkspurt: 1,
             opus: vec![seq as u8],
+            revision: None,
         }
     }
 
