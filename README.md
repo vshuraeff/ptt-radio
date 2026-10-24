@@ -1,12 +1,14 @@
 # ptt-radio
 
-Push-to-talk рация для мультиплеера Factorio 2.1.23: голос идёт через сам мультиплеер игры (Lua UDP API), плашка «кто говорит» с именем в цвете игрока видна всем. Дизайн и обоснования: [DESIGN.md](DESIGN.md), замеры транспорта: [../udp-probe/README.md](../udp-probe/README.md).
+Push-to-talk рация для мультиплеера Factorio 2.1.23: голос идёт через сам мультиплеер игры (Lua UDP API), стопка «кто говорит» у правого края экрана с именами в цвете игрока видна всем. Дизайн и обоснования: [DESIGN.md](DESIGN.md), замеры транспорта: [../udp-probe/README.md](../udp-probe/README.md).
 
 Состояние: этап 1 из плана (мод v0.1 и эмулятор фиктивного голоса) готов и проверен. Компаньон v0.1 (`companion/`, Rust) собран и проверен на стенде тоном вместо микрофона; живой микрофон и PTT-клавиша в игре ещё не проверены.
 
 ## Состав
 
-- `mod/ptt-radio/`: мод. Пакеты HELLO/START/VOICE/STOP, пересылка компаньонам слушателей, плашка в `gui.left`, щелчки `utility/gui_click` и `utility/list_box_click`, таймаут говорящего по тикам с синтетическим STOP. С v0.2: кнопка открытого микрофона на панели быстрого доступа и клавиша `ALT + V` (MIC_STATE своему компаньону), heartbeat HELLO каждые 5 с и сообщения игроку, когда компаньон подключился или пропал. Настройки: `ptt-radio-companion-port`, `ptt-radio-echo` и `ptt-radio-half-duplex` (игрок; полудуплекс глушит динамики, пока держишь PTT, включён по умолчанию, в наушниках можно выключить), `ptt-radio-scope` (карта: `all` или `force`).
+- `mod/ptt-radio/`: мод. Пакеты HELLO/START/VOICE/STOP, пересылка компаньонам слушателей, HUD говорящих, щелчки `utility/gui_click` и `utility/list_box_click`, таймаут говорящего по тикам с синтетическим STOP. С v0.2: кнопка открытого микрофона на панели быстрого доступа и клавиша `ALT + V` (MIC_STATE своему компаньону), heartbeat HELLO каждые 5 с и сообщения игроку, когда компаньон подключился или пропал. Настройки: `ptt-radio-companion-port`, `ptt-radio-echo` и `ptt-radio-half-duplex` (игрок; полудуплекс глушит динамики, пока держишь PTT, включён по умолчанию, в наушниках можно выключить), `ptt-radio-scope` (карта: `all` или `force`).
+
+  HUD говорящих (`mod/ptt-radio/hud.lua`, вместо прежней рамки «Рация» в `gui.left`) — стопка строк в `gui.screen` у правого края, как в Dota 2. Первая строка стоит на 40 % высоты экрана, следующие ложатся ниже. Строка есть только у того, кто сейчас передаёт и кого зритель слышит по `ptt-radio-scope`. Новый говорящий встаёт в конец; строка пропадает на принятом STOP или по таймауту говорящего, остальные сдвигаются вверх. Повторы START и VOICE строки не трогают. В строке значок канала (пока у всех общий канал ANY, жёлтая звёздочка `signal-each`), ник в цвете игрока («Сервер» серым) и три деления качества связи. Пока качество не измерено, деления серые, а подсказка говорит «качество связи неизвестно». У источника эха вместо делений красная метка «эхо» с подсказкой «эхо от динамиков». Молчащий источник эха строки не получает, его личная панель в `gui.left` остаётся. Если строки не помещаются до 80 % высоты экрана, последняя видимая заменяется на «ещё N», а показаны самые ранние говорящие. Положение и вместимость пересчитываются при смене разрешения и масштаба интерфейса.
 - `tools/radio.py`: эмулятор компаньона без звука, `uv run -q tools/radio.py {hello|talk|listen}`; `talk --no-stop` изображает упавший компаньон.
 - `stand/`: headless-сервер 2.1.23 с модом, образ берётся из `../udp-probe/server`; по желанию рядом с ним хаб (`compose.hub.yaml`, `Dockerfile.hub`), чек-лист живой приёмки — `ACCEPTANCE.md`.
 - `client-mods/`: каталог модов для клиента (`--mod-directory`), чтобы не трогать основную установку.
@@ -45,7 +47,7 @@ cargo build --release && cargo test
 
 ### Сквозные сценарии без игры
 
-Контракт мода проверяется без Factorio: `lua mod/tests/control_test.lua mod/ptt-radio/control.lua` из `ptt-radio/`, синтаксис — `luac -p mod/ptt-radio/control.lua mod/tests/control_test.lua`. Проверка исполняет настоящие обработчики событий для SIGNAL/AUDIENCE, игрока 0 и плашек v2. UDP-проверки эмулятора: `cd companion && cargo test --lib relay:: -- --test-threads=1`. Это не заменяет приёмку входа игроков, паузы и GUI на живом стенде. Форматы и границы доверия описаны в [DESIGN.md](DESIGN.md#signaling-schema-and-trust).
+Контракт мода проверяется без Factorio: `lua mod/tests/control_test.lua mod/ptt-radio/control.lua` из `ptt-radio/`, синтаксис — `luac -p mod/ptt-radio/control.lua mod/ptt-radio/hud.lua mod/tests/control_test.lua`. Проверка исполняет настоящие обработчики событий для SIGNAL/AUDIENCE, игрока 0, плашек v2 и стопки HUD (порядок, сжатие, таймаут, «ещё N», пересчёт при смене экрана, запоздалый STOP). UDP-проверки эмулятора: `cd companion && cargo test --lib relay:: -- --test-threads=1`. Это не заменяет приёмку входа игроков, паузы и GUI на живом стенде. Форматы и границы доверия описаны в [DESIGN.md](DESIGN.md#signaling-schema-and-trust).
 
 Игру и мод заменяет эмулятор `relay`, каждый игрок — отдельный процесс компаньона с виртуальным звуком. Устройство, модель транспорта и замеры описаны в [DESIGN.md](DESIGN.md#сквозной-стенд-без-игры).
 
@@ -101,8 +103,8 @@ cd stand && docker compose up -d --build
 open -n -a /Applications/factorio.app --args \
   --mod-directory "$PWD/../client-mods" --enable-lua-udp 34556 --mp-connect 127.0.0.1:34197
 uv run -q ../tools/radio.py hello
-uv run -q ../tools/radio.py talk --seconds 3                                    # плашка с вашим именем
-docker exec ptt-radio-factorio uv run -q /tools/radio.py talk --seconds 3 --expect-silence   # плашка «Сервер»
+uv run -q ../tools/radio.py talk --seconds 3                                    # строка HUD с вашим именем
+docker exec ptt-radio-factorio uv run -q /tools/radio.py talk --seconds 3 --expect-silence   # строка HUD «Сервер»
 ```
 
 Индикатор эха без компаньона: байты `ECHO_STATE` кладутся в UDP-порт `--enable-lua-udp` того игрока, чей клиент запущен. Мод принимает их только от компаньона, приславшего HELLO, поэтому сначала `uv run -q ../tools/radio.py hello`, затем в течение 15 с включить: `printf '\x52\x01\x05\x00\x00\x01' | nc -u -w1 127.0.0.1 34556`, выключить: то же с `\x00` в конце. Без новых HELLO флаг снимется сам через 15 с вместе с «пропавшим» компаньоном. Компаньон на Rust шлёт `ECHO_STATE` сам, когда в нём включается эхо-гейт.

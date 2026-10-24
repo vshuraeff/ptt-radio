@@ -1,12 +1,24 @@
 local handlers, nth, sent, sounds, players
-local function element(root, name)
-  local item = { style = {}, valid = true, name = name }
-  item.add = function(spec)
-    local child = element(item, spec.name)
-    if spec.name then item[spec.name] = child end
+local control_path = arg[1] or "ptt-radio/mod/ptt-radio/control.lua"
+package.path = (control_path:gsub("[^/]*$", "?.lua")) .. ";" .. package.path
+-- a gui element keeps its add spec, its children in order and named children as fields
+local function element(parent, spec)
+  local item = { valid = true, children = {} }
+  for key, value in pairs(spec or {}) do item[key] = value end
+  item.style = {}
+  item.add = function(child_spec)
+    local child = element(item, child_spec)
+    if child.name then item[child.name] = child end
+    item.children[#item.children + 1] = child
     return child
   end
-  item.destroy = function() if name then root[name] = nil end end
+  item.destroy = function()
+    item.valid = false
+    if item.name then parent[item.name] = nil end
+    for i, child in ipairs(parent.children) do
+      if child == item then table.remove(parent.children, i) break end
+    end
+  end
   return item
 end
 
@@ -16,7 +28,9 @@ local function setup()
   settings = { global = { ["ptt-radio-scope"] = { value = "all" } } }
   defines = { events = setmetatable({}, { __index = function(_, key) return key end }) }
   script = {
-    on_event = function(event, handler) handlers[event] = handler end,
+    on_event = function(event, handler)
+      for _, name in ipairs(type(event) == "table" and event or { event }) do handlers[name] = handler end
+    end,
     on_nth_tick = function(tick, handler) nth[tick] = handler end,
     on_init = function(handler) script.init = handler end,
     on_configuration_changed = function(handler) script.configure = handler end,
@@ -28,12 +42,15 @@ local function setup()
   game = {
     tick = 0,
     connected_players = {},
+    players = players,
     get_player = function(index) assert(index ~= 0, "player zero is not a LuaPlayer"); return players[index] end,
   }
   for index = 1, 3 do
     players[index] = {
       index = index, connected = true, name = "p" .. index, force = { index = 1 },
-      chat_color = { r = 1, g = 0, b = 0 }, gui = { left = element({}, nil) },
+      chat_color = { r = 1, g = 0, b = 0 },
+      gui = { left = element({ children = {} }), screen = element({ children = {} }) },
+      display_resolution = { width = 1920, height = 1080 }, display_scale = 1,
       mod_settings = {
         ["ptt-radio-companion-port"] = { value = 34555 + index },
         ["ptt-radio-half-duplex"] = { value = true },
@@ -44,7 +61,8 @@ local function setup()
     }
   end
   game.connected_players = { players[3], players[1], players[2] }
-  dofile(arg[1] or "ptt-radio/mod/ptt-radio/control.lua")
+  package.loaded.hud = nil
+  dofile(control_path)
   script.init()
 end
 
@@ -343,4 +361,152 @@ expect_audience(1, "2,3", "0,2,3")
 handlers.on_player_joined_game({ player_index = 2 })
 assert(storage.v2 and storage.echo_sources and storage.talks and #storage.audience_revision == 8)
 
-print("control.lua: routing, audience, identity, plaque, bounds and 0.2.0 migration passed")
+-- speaker hud: a viewer's stack as row senders in screen order, «ещё N» as +N
+local function hud_root(index) return players[index].gui.screen.ptt_radio_hud end
+local function stack(index)
+  local root, out = hud_root(index), {}
+  for _, row in ipairs(root and root.children or {}) do
+    out[#out + 1] = row.name and row.name:sub(#"ptt_radio_hud_" + 1) or "+" .. row.content.children[1].caption[2]
+  end
+  return table.concat(out, ",")
+end
+local function content(viewer, sender) return hud_root(viewer)["ptt_radio_hud_" .. sender].content end
+local function tail(viewer, sender) return content(viewer, sender).tail end
+
+-- append order, a third talker, compaction, late STOPs and the timeout
+setup()
+emit(2, v2(7, gen, 1), 1)
+emit(1, v2(7, gen2, 1), 2)
+assert(stack(1) == "2,1" and stack(2) == "2,1" and stack(3) == "2,1")
+local root = hud_root(3)
+assert(root.location.x == 1920 - 248 and root.location.y == 432)
+local icon = content(3, 2).children[1]
+assert(icon.type == "sprite" and icon.sprite == "virtual-signal/signal-each")
+-- keepalives and a repeated START neither reorder nor rebuild
+emit(2, v2(8, gen, 1, "opus"), 3)
+emit(2, v2(7, gen, 1), 3)
+emit(1, v2(8, gen2, 1, "opus"), 3)
+assert(hud_root(3) == root and root.valid and stack(3) == "2,1")
+emit(3, packet(2, 5), 4)
+assert(stack(1) == "2,1,3" and stack(3) == "2,1,3")
+emit(2, v2(9, gen, 1), 5)
+assert(stack(1) == "1,3" and #hud_root(1).children == 2)
+assert(hud_root(1).location.y == 432)
+-- back with a new talkspurt: to the end; the late STOP2 of the old one is rejected
+emit(2, v2(7, gen, 2), 6)
+assert(stack(1) == "1,3,2")
+emit(2, v2(9, gen, 1), 7)
+-- a STOP2 of another generation and a v1 STOP from a v2 talker are rejected too
+emit(1, v2(9, gen, 1), 7)
+emit(1, packet(4), 7)
+assert(stack(1) == "1,3,2" and stack(3) == "1,3,2")
+-- the tick timeout drops a lost STOP: player 1 last spoke at 3, player 3 at 4, player 2 at 6
+game.tick = 34
+nth[15]({ tick = 34 })
+assert(stack(1) == "3,2")
+game.tick = 35
+nth[15]({ tick = 35 })
+assert(stack(1) == "2")
+emit(2, v2(9, gen, 2), 36)
+assert(hud_root(1) == nil and hud_root(2) == nil and #storage.hud.rows == 0)
+
+-- a new talkspurt or generation whose predecessor never closed moves the row to the end and resets its links
+setup()
+local hud_mod = require("hud")
+emit(1, v2(7, gen, 1), 1)
+emit(2, v2(7, gen2, 1), 2)
+assert(stack(3) == "1,2")
+hud_mod.set_link(players[3], 1, 2, 1, 1)
+hud_mod.set_link(players[3], 2, 2, 1, 1)
+hud_mod.set_link(players[1], 1, 2, 1, 1)
+local row_a, row_b = hud_root(3).ptt_radio_hud_1, hud_root(3).ptt_radio_hud_2
+-- identical START, START2 and VOICE of the same identity keep order and elements
+emit(1, v2(7, gen, 1), 3)
+emit(1, v2(8, gen, 1, "opus"), 3)
+emit(2, v2(7, gen2, 1), 3)
+assert(stack(3) == "1,2" and hud_root(3).ptt_radio_hud_1 == row_a and hud_root(3).ptt_radio_hud_2 == row_b)
+assert(storage.hud.links[3][1] and storage.hud.links[3][2])
+-- A's STOP is lost and a second talkspurt starts: order is B, A; only A's links reset
+emit(1, v2(7, gen, 2), 4)
+assert(stack(3) == "2,1" and stack(1) == "2,1" and stack(2) == "2,1")
+assert(storage.hud.links[3][1] == nil and storage.hud.links[1][1] == nil)
+assert(storage.hud.links[3][2] and hud_root(3).ptt_radio_hud_2.valid)
+assert(#storage.hud.rows == 2 and storage.speakers[1])
+-- a repeat of the new talkspurt again changes nothing
+local moved_a = hud_root(3).ptt_radio_hud_1
+emit(1, v2(8, gen, 2, "opus"), 5)
+emit(1, v2(7, gen, 2), 5)
+assert(stack(3) == "2,1" and hud_root(3).ptt_radio_hud_1 == moved_a)
+-- a new stream generation of B while its row exists moves it to the end as well
+hud_mod.set_link(players[3], 2, 2, 1, 1)
+emit(2, v2(7, gen2:sub(1, 7) .. "\2", 1), 6)
+assert(stack(3) == "1,2" and storage.hud.links[3][2] == nil)
+
+-- a viewer outside the scope gets no row
+setup()
+players[3].force = { index = 2 }
+settings.global["ptt-radio-scope"].value = "force"
+emit(1, v2(7, gen, 1), 1)
+assert(stack(1) == "1" and stack(2) == "1" and hud_root(3) == nil)
+
+-- overflow and reflow, with the server as a fourth talker
+setup()
+players[1].display_resolution = { width = 1280, height = 300 }
+emit(1, v2(7, gen, 1), 1)
+emit(2, v2(7, gen, 1), 1)
+emit(3, packet(2, 5), 1)
+emit(0, packet(2, 5), 1)
+assert(stack(1) == "1,2,+2" and stack(2) == "1,2,3,0")
+assert(hud_root(1).location.x == 1280 - 248 and hud_root(1).location.y == 120)
+local other = hud_root(2)
+players[1].display_resolution = { width = 1920, height = 1080 }
+handlers.on_player_display_resolution_changed({ player_index = 1 })
+assert(stack(1) == "1,2,3,0" and hud_root(1).location.x == 1672)
+assert(content(1, 0).children[2].caption[1] == "ptt-radio.server")
+players[1].display_scale = 2
+handlers.on_player_display_scale_changed({ player_index = 1 })
+assert(stack(1) == "1,2,3,0" and hud_root(1).location.x == 1920 - 496 and hud_root(1).location.y == 432)
+players[1].display_resolution = { width = 1920, height = 600 }
+handlers.on_player_display_resolution_changed({ player_index = 1 })
+assert(stack(1) == "1,2,+2" and hud_root(1).location.y == 240)
+-- reflowing one viewer leaves the others alone
+assert(hud_root(2) == other and other.valid)
+
+-- an idle echo source has no row; an active one shows the marker instead of the bars
+setup()
+emit(2, packet(1), 0)
+emit(2, packet(5, 0, "\1"), 1)
+assert(storage.echo_sources[2] and hud_root(1) == nil and hud_root(2) == nil)
+assert(players[2].gui.left.ptt_radio_echo_panel)
+emit(2, v2(7, gen, 1), 2)
+local marker = tail(1, 2)
+assert(marker.bars == nil and marker.children[1].tooltip[1] == "ptt-radio.echo-tooltip")
+emit(2, packet(5, 0, "\0"), 3)
+local bars = tail(1, 2).bars
+assert(#bars.children == 3 and players[2].gui.left.ptt_radio_echo_panel == nil)
+-- the bars stay grey and unknown until a link report, which repaints them in place
+assert(bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+for _, segment in ipairs(bars.children) do assert(segment.value == 1 and segment.style.color.r == 0.45) end
+local hud = require("hud")
+hud.set_link(players[1], 2, 2, 1, 1)
+assert(tail(1, 2).bars == bars and bars.tooltip[2][1] == "ptt-radio.hud-route-1")
+assert(bars.children[2].value == 1 and bars.children[3].value == 0 and bars.children[1].style.color.g == 0.75)
+assert(tail(3, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+handlers.on_player_display_scale_changed({ player_index = 1 })
+assert(tail(1, 2).bars.children[3].value == 0)
+emit(2, v2(9, gen, 1), 4)
+assert(storage.hud.links[1][2] == nil and hud_root(1) == nil)
+
+-- a 0.3.0 save: the gui.left badge goes, the echo panel stays, a saved speaker gets no row
+setup()
+storage = { speakers = { [1] = 0 }, companions = {}, open_mic = {}, v2 = {}, echo_sources = { [1] = true }, talks = {}, audience_revision = string.rep("\0", 8) }
+players[1].gui.left.add({ type = "frame", name = "ptt_radio_badge" })
+players[1].gui.left.add({ type = "frame", name = "ptt_radio_echo_panel" })
+script.configure({})
+assert(players[1].gui.left.ptt_radio_badge == nil and #players[1].gui.left.children == 1)
+assert(players[1].gui.left.ptt_radio_echo_panel and hud_root(1) == nil)
+game.tick = 31
+nth[15]({ tick = 31 })
+assert(storage.speakers[1] == nil and hud_root(2) == nil)
+
+print("control.lua: routing, audience, identity, plaque, hud, bounds and 0.2.0/0.3.0 migration passed")

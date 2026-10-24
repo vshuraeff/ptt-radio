@@ -10,6 +10,8 @@
 -- all state is driven by game.tick: ticks stop during saves and pauses, so a
 -- timeout cannot fire on a delivery stall.
 
+local hud = require("hud")
+
 local MAGIC = 0x52
 local VERSION = 1
 
@@ -34,13 +36,13 @@ local MAX_RETIRED_GENERATIONS = 16
 local STALE_TICKS = 30
 -- the companion sends HELLO every 5 s; three missed heartbeats mean it is gone
 local COMPANION_TIMEOUT_TICKS = 15 * 60
-local BADGE = "ptt_radio_badge"
+-- the gui.left speaker frame of 0.3.0 and earlier, removed on configuration change
+local OLD_BADGE = "ptt_radio_badge"
+-- every talkspurt is on the common channel until u4 passes the sender's tx key
+local CHANNEL = "ptt/any"
 local SHORTCUT = "ptt-radio-open-mic"
 local ECHO_PANEL = "ptt_radio_echo_panel"
 local ECHO_OFF_BUTTON = "ptt_radio_echo_open_mic_off"
-local ECHO_GLYPH = "[img=item/programmable-speaker] "
-local ECHO_COLOR = { r = 1, g = 0.25, b = 0.25, a = 1 }
-local SERVER_COLOR = { r = 0.8, g = 0.8, b = 0.8, a = 1 }
 local START_SOUND = "utility/gui_click"
 local STOP_SOUND = "utility/list_box_click"
 
@@ -78,53 +80,13 @@ local function in_scope(sender_index, viewer)
   return sender ~= nil and sender.force.index == viewer.force.index
 end
 
-local function render_badge(viewer)
-  local root = viewer.gui.left
-  if root[BADGE] then
-    root[BADGE].destroy()
-  end
-  local shown = {}
-  for index in pairs(storage.speakers) do
-    shown[index] = true
-  end
-  for index in pairs(storage.echo_sources) do
-    shown[index] = true
-  end
-  local speakers = {}
-  for index in pairs(shown) do
-    if in_scope(index, viewer) then
-      speakers[#speakers + 1] = index
-    end
-  end
-  if #speakers == 0 then
-    return
-  end
-  table.sort(speakers)
-  local frame = root.add({ type = "frame", name = BADGE, direction = "vertical", caption = { "ptt-radio.title" } })
-  for _, index in ipairs(speakers) do
-    local speaker = index ~= 0 and game.get_player(index) or nil
-    local echo = storage.echo_sources[index] ~= nil and speaker ~= nil
-    local caption = speaker and speaker.name or { "ptt-radio.server" }
-    if echo then
-      caption = { "", ECHO_GLYPH, caption }
-    end
-    local label = frame.add({ type = "label", caption = caption })
-    label.style.font = "default-bold"
-    if echo then
-      label.tooltip = { "ptt-radio.echo-tooltip" }
-      label.style.font_color = ECHO_COLOR
-    elseif speaker then
-      local c = speaker.chat_color
-      label.style.font_color = { r = c.r, g = c.g, b = c.b, a = 1 }
-    else
-      label.style.font_color = SERVER_COLOR
-    end
-  end
+hud.visible = function(sender_index, viewer_index)
+  return in_scope(sender_index, game.get_player(viewer_index))
 end
 
-local function render_all_badges()
+local function render_all_huds()
   for _, viewer in pairs(game.connected_players) do
-    render_badge(viewer)
+    hud.render(viewer)
   end
 end
 
@@ -140,7 +102,7 @@ local function render_echo_panel(player)
   local frame = root.add({ type = "frame", name = ECHO_PANEL, direction = "vertical" })
   local label = frame.add({ type = "label", caption = { "ptt-radio.echo-panel" } })
   label.style.font = "default-bold"
-  label.style.font_color = ECHO_COLOR
+  label.style.font_color = hud.ECHO_COLOR
   label.style.single_line = false
   label.style.maximal_width = 280
   local button = frame.add({ type = "button", name = ECHO_OFF_BUTTON, style = "red_button", caption = { "ptt-radio.echo-open-mic-off" } })
@@ -153,7 +115,8 @@ local function set_echo(player_index, on)
     return
   end
   storage.echo_sources[player_index] = on or nil
-  render_all_badges()
+  -- an idle echo source has no hud row; an active one swaps its bars for the marker
+  hud.refresh(player_index)
   local player = game.get_player(player_index)
   if player then
     render_echo_panel(player)
@@ -314,16 +277,20 @@ local function fan_out(sender_index, kind, payload, legacy_only)
   end
 end
 
-local function set_speaking(sender_index, speaking, quiet)
+local function set_speaking(sender_index, speaking, quiet, restart)
   local was = storage.speakers[sender_index] ~= nil
   if speaking then
     storage.speakers[sender_index] = game.tick
   else
     storage.speakers[sender_index] = nil
   end
+  -- only a transition touches the hud, so keepalives never reorder or rebuild rows
   if was ~= speaking then
-    render_all_badges()
+    if speaking then hud.start(sender_index, CHANNEL) else hud.stop(sender_index) end
     if not quiet then play_for_listeners(sender_index, speaking and START_SOUND or STOP_SOUND) end
+  elseif speaking and restart then
+    -- a new talkspurt or generation while the old one never closed
+    hud.start(sender_index, CHANNEL, true)
   end
 end
 
@@ -350,7 +317,7 @@ local function accept_v2(sender_index, kind, payload)
   end
   talk.last_tick = game.tick
   talk.closed = kind == STOP2
-  set_speaking(sender_index, not talk.closed, repeated and kind ~= STOP2)
+  set_speaking(sender_index, not talk.closed, repeated and kind ~= STOP2, not repeated)
   return true
 end
 
@@ -363,10 +330,18 @@ local function init_storage()
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
   storage.audience_revision = storage.audience_revision or string.rep(string.char(0), 8)
+  hud.init()
 end
 
 script.on_init(init_storage)
-script.on_configuration_changed(init_storage)
+script.on_configuration_changed(function()
+  init_storage()
+  for _, player in pairs(game.players) do
+    local badge = player.gui.left[OLD_BADGE]
+    if badge then badge.destroy() end
+  end
+  render_all_huds()
+end)
 
 script.on_event(defines.events.on_tick, function()
   helpers.recv_udp()
@@ -468,7 +443,7 @@ end)
 script.on_event(defines.events.on_player_joined_game, function(event)
   local player = game.get_player(event.player_index)
   player.set_shortcut_toggled(SHORTCUT, storage.open_mic[player.index] ~= nil)
-  render_badge(player)
+  hud.render(player)
   render_echo_panel(player)
   send_roster_to_all()
   audience_changed()
@@ -494,23 +469,27 @@ script.on_event(defines.events.on_player_left_game, function(event)
 end)
 
 script.on_event(defines.events.on_player_changed_force, function()
-  render_all_badges()
+  render_all_huds()
   audience_changed()
 end)
 
 script.on_event(defines.events.on_forces_merged, function()
-  render_all_badges()
+  render_all_huds()
   audience_changed()
 end)
 
-script.on_event(defines.events.on_player_color_changed, function()
-  render_all_badges()
+script.on_event(defines.events.on_player_color_changed, function(event)
+  hud.refresh(event.player_index)
   send_roster_to_all()
+end)
+
+script.on_event({ defines.events.on_player_display_resolution_changed, defines.events.on_player_display_scale_changed }, function(event)
+  hud.reflow(game.get_player(event.player_index))
 end)
 
 script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
   if event.setting == "ptt-radio-scope" then
-    render_all_badges()
+    render_all_huds()
     audience_changed()
   elseif event.setting == "ptt-radio-half-duplex" and event.player_index then
     local player = game.get_player(event.player_index)
