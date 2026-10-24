@@ -3,4 +3,5 @@
 **/saves/
 *.log
 /logs/
+/dist/
 /client-mods/mod-settings.dat

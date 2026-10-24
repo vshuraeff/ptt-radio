@@ -1,6 +1,6 @@
-FROM ghcr.io/astral-sh/uv:0.12.23 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.5 AS uv
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 ARG FACTORIO_VERSION=2.1.23
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
