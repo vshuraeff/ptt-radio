@@ -32,6 +32,7 @@ use ptt_radio_companion::jitter::SLICE;
 use ptt_radio_companion::mix::{self, Mixer, Mute, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
 use ptt_radio_companion::transport::lab::LabPath;
+use ptt_radio_companion::transport::wire::{self, Kind};
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
@@ -604,6 +605,25 @@ fn receive(shared: &Shared) -> RxStats {
             }
         };
         let now = Instant::now();
+        // v2 game media plays only for a player trusted signaling selected a stream for
+        if let Ok(media) = wire::decode_game(&buf[..len]) {
+            let taken = shared.mixer.lock().unwrap().game(media, now);
+            let s = stats.senders.entry(media.stream.player).or_default();
+            match media.kind {
+                Kind::Start => s.starts += 1,
+                Kind::Stop => s.stops += 1,
+                _ => {
+                    s.voice += 1;
+                    if taken {
+                        shared.trace(format_args!(
+                            "rx {} {}",
+                            media.stream.player, media.sequence
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
         let Some(incoming) = packet::parse(&buf[..len]) else {
             if stats.ignored == 0 {
                 eprintln!(
@@ -659,8 +679,9 @@ fn receive(shared: &Shared) -> RxStats {
                     stats.rtt_ms.push((now - at).as_secs_f64() * 1000.0);
                 }
                 drop(sent);
-                shared.mixer.lock().unwrap().voice(sender, seq, frame, now);
-                shared.trace(format_args!("rx {sender} {seq}"));
+                if shared.mixer.lock().unwrap().voice(sender, seq, frame, now) {
+                    shared.trace(format_args!("rx {sender} {seq}"));
+                }
             }
             Incoming::Stop { sender, .. } => {
                 stats.senders.entry(sender).or_default().stops += 1;
@@ -796,13 +817,15 @@ fn summary(frames_sent: u64, rx: &RxStats, mix: &mix::MixStats, recorded: u64) -
         )
     };
     format!(
-        "stats: sent {frames_sent} frames | received [{}] | decoded {} decode-errors {} dropped-late {} underruns {} \
-         | recorded {:.2} s | {rtt} | ignored packets {}",
+        "stats: sent {frames_sent} frames | received [{}] | discarded {} missing {} decoded {} decode-errors {} \
+         dropped-late {} underruns {} | recorded {:.2} s | {rtt} | ignored packets {}",
         if senders.is_empty() {
             "nothing".to_string()
         } else {
             senders.join("; ")
         },
+        mix.discarded,
+        mix.missing,
         mix.decoded,
         mix.decode_errors,
         mix.dropped_late,

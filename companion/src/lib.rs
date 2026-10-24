@@ -10,6 +10,7 @@ pub mod jitter;
 pub mod mix;
 pub mod packet;
 pub mod relay;
+pub mod reorder;
 pub mod transport;
 pub mod tx;
 pub mod virtual_audio;
