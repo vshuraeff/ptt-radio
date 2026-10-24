@@ -25,6 +25,7 @@ end
 local function setup()
   handlers, nth, sent, sounds, players = {}, {}, {}, {}, {}
   storage = {}
+  commands = { add_command = function(name, _, handler) commands[name] = handler end }
   settings = { global = { ["ptt-radio-scope"] = { value = "all" } } }
   defines = { events = setmetatable({}, { __index = function(_, key) return key end }) }
   script = {
@@ -40,6 +41,7 @@ local function setup()
     recv_udp = function() end,
   }
   game = {
+    print = function() end,
     tick = 0,
     connected_players = {},
     players = players,
@@ -521,4 +523,13 @@ storage.radio_policy.muted[2] = true
 script.configure({})
 assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
 
-print("control.lua: routing, audience, identity, plaque, hud, bounds and 0.2.0/0.3.0 migration passed")
+-- registered admin mutations reach the audience callback exactly once.
+setup()
+local revision = storage.audience_revision
+commands["radio-admin"]({ parameter = "mute 2" })
+assert(storage.radio_policy.muted[2] and storage.audience_revision ~= revision)
+revision = storage.audience_revision
+commands["radio-admin"]({ parameter = "mute 2" })
+assert(storage.audience_revision == revision)
+
+print("control.lua: routing, audience, identity, plaque, hud, admin wiring, bounds and 0.2.0/0.3.0 migration passed")
