@@ -1,6 +1,8 @@
 //! p2p contracts only; production still uses the game transport in packet.rs.
 
+pub mod hub;
 pub mod lab;
+pub mod relay;
 pub mod signaling;
 pub mod wire;
 

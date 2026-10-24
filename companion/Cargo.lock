@@ -1585,6 +1585,7 @@ dependencies = [
  "dtln-runtime-lab",
  "getrandom 0.3.4",
  "global-hotkey",
+ "hmac",
  "hound",
  "is",
  "objc2",
