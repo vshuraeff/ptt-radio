@@ -22,9 +22,18 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "netlab/lab.rs"]
+mod lab;
+#[path = "netlab/router.rs"]
+mod router;
+
+use lab::{Lab, LabPlayer};
 use ptt_radio_companion::packet::VOICE;
 use ptt_radio_companion::relay::{self, Relay, Stall};
+use ptt_radio_companion::transport::lab::{LabPath, decode_addr};
+use ptt_radio_companion::transport::{Path as LabRoute, Transport};
 use ptt_radio_companion::{percentile, virtual_audio};
+use router::{Edge, Filtering, Mapping, NatConfig, Verdict};
 
 const FS: usize = 48_000;
 // envelope hop: 1 ms
@@ -639,6 +648,78 @@ fn stall_burst_recovers() {
         settled < 1000.0,
         "latency still moving {settled:.0} ms after the stall"
     );
+}
+
+// the network lab beside the game path: the router starts with three NAT types, each companion
+// is pointed at it with --netlab, and the router trace is read back. no p2p runtime sends yet
+// (u17/u20), so the game path is what the companions do; u21 adds p2p traffic here.
+#[test]
+fn netlab_router_starts_with_three_nat_types() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let nat = |id, mapping, filtering| LabPlayer {
+        nat: NatConfig {
+            id,
+            mapping,
+            filtering,
+            ..NatConfig::default()
+        },
+        edge: Edge::default(),
+    };
+    let lab = Lab::start(
+        9,
+        vec![
+            nat(
+                1,
+                Mapping::EndpointIndependent,
+                Filtering::EndpointIndependent,
+            ),
+            nat(2, Mapping::EndpointDependent, Filtering::AddressDependent),
+            nat(
+                3,
+                Mapping::EndpointIndependent,
+                Filtering::AddressAndPortDependent,
+            ),
+        ],
+    );
+    let players = (0..3)
+        .map(|i| Talker::listener().with_args(&lab.companion_args(i)))
+        .collect();
+    Session {
+        name: "netlab".into(),
+        players,
+        stall: None,
+        seconds: 3.0,
+    }
+    .run();
+
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scenarios/netlab/aec-on");
+    for i in 0..3 {
+        let name = (b'a' + i as u8) as char;
+        let log = fs::read_to_string(dir.join(format!("{name}.log"))).unwrap();
+        let want = format!(
+            "netlab: path {} via router {}",
+            lab.locals[i], lab.pump.addr
+        );
+        assert!(log.contains(&want), "companion {name} log lacks {want:?}");
+    }
+    assert!(
+        lab.pump.trace().is_empty(),
+        "nothing sends through the lab path yet"
+    );
+
+    // the companions are gone, so their private addresses are free: probe the router from the
+    // third player's and read the labelled trace
+    let mut probe = LabPath::bind(lab.locals[2], lab.pump.addr).unwrap();
+    probe.set_route(0, LabRoute::Direct, lab.server_public);
+    probe.send(0, LabRoute::Direct, &[1, 0]).unwrap();
+    lab.server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let (len, _) = lab.server.recv_from(&mut buf).unwrap();
+    let seen = decode_addr(&buf[..len]).unwrap();
+    assert_eq!(*seen.ip(), lab::player_ip(2));
+    assert_eq!(lab.labelled(), [("STUN", Verdict::Forwarded)]);
 }
 
 // ---- the session: relay in this process, one companion process per player
