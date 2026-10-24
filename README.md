@@ -93,7 +93,7 @@ PTT Radio — рация с кнопкой «нажми и говори» для
 
 ## For developers
 
-The design, the wire formats, the trust boundaries and the measurements are in [DESIGN.md](DESIGN.md) (in Russian, with English sections for the v2 transport contracts). Build instructions are on the wiki's [Building from Source](https://github.com/vshuraeff/ptt-radio/wiki/Building-from-Source) page.
+The design, the wire formats, the trust boundaries and the measurements are in [DESIGN.md](DESIGN.md) (in Russian, with English sections for the v2 transport contracts). [ARCHITECTURE.md](ARCHITECTURE.md) maps the components, data flows, threads, build and tests. Build instructions are on the wiki's [Building from Source](https://github.com/vshuraeff/ptt-radio/wiki/Building-from-Source) page.
 
 - `mod/ptt-radio/` is the mod (Lua), `mod/tests/` its tests, which run without Factorio.
 - `companion/` is the Rust crate with three binaries: the companion `ptt-radio-companion`, the relay hub `ptt-radio-hub` and the `relay` game emulator for end-to-end tests. Building needs Rust, cmake and a C compiler; libopus is built from source and linked statically.
