@@ -10,6 +10,8 @@
 //! through the virtual device (src/virtual_audio.rs) for tests.
 
 mod ptt_key;
+#[cfg(feature = "self-update")]
+mod self_update;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
@@ -137,6 +139,10 @@ struct Args {
     /// test: private address of the lab path, as registered with the router (default 127.0.0.1:0)
     #[arg(long, value_name = "ADDR", requires = "netlab")]
     netlab_bind: Option<SocketAddr>,
+    /// do not update to the latest GitHub release at startup (also PTT_RADIO_NO_SELF_UPDATE=1)
+    #[cfg(feature = "self-update")]
+    #[arg(long)]
+    no_self_update: bool,
 }
 
 struct Shared {
@@ -226,7 +232,11 @@ impl Shared {
 }
 
 fn main() -> ExitCode {
-    match run(Args::parse()) {
+    let args = Args::parse();
+    // before any socket, audio device or hotkey: a newer release re-launches from here
+    #[cfg(feature = "self-update")]
+    self_update::at_startup(args.no_self_update);
+    match run(args) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err}");
