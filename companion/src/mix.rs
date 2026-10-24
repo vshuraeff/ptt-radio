@@ -23,6 +23,7 @@ use opusic_c::{Channels, Decoder, SampleRate};
 
 use crate::audio::OPUS_RATE;
 use crate::jitter::{Pull, SLICE, Stream};
+use crate::quality::{Continuity, Status};
 use crate::reorder::{self, Reorder};
 use crate::transport::wire::{GameMedia, Kind, MAX_OPUS};
 use crate::transport::{
@@ -180,6 +181,8 @@ pub struct Slice {
     pub seq: u16,
     pub offset: usize,
     pcm: [f32; SLICE_SAMPLES],
+    impaired: usize,
+    talkspurt: u16,
 }
 
 struct Speaker {
@@ -189,11 +192,16 @@ struct Speaker {
     order: Reorder,
     decoder: Decoder,
     /// decoded samples not yet a whole slice, each with its packet seq and offset
-    pending: VecDeque<(u16, usize, f32)>,
+    pending: VecDeque<(u16, usize, f32, bool, u16)>,
     /// recent rms level of this speaker's decoded packets
     level: f32,
     /// length of the last decoded packet: how long a missing one is concealed
     packet_samples: usize,
+    continuity: Continuity,
+    talkspurt: u16,
+    active: bool,
+    heard: bool,
+    late_samples: usize,
 }
 
 /// the stream trusted signaling selected for a player, and its newest talkspurt
@@ -246,6 +254,11 @@ impl Speaker {
             level: 0.0,
             // 20 ms, the default packet, until one is decoded
             packet_samples: OPUS_RATE as usize / 50,
+            continuity: Continuity::default(),
+            talkspurt: 0,
+            active: true,
+            heard: false,
+            late_samples: 0,
         }
     }
 
@@ -254,7 +267,8 @@ impl Speaker {
         loop {
             let dropped = match self.order.poll(now) {
                 Ordered::Frame(frame) => {
-                    let (ok, dropped) = self.decode(frame.id.sequence as u16, &frame.opus, now);
+                    let (ok, dropped) =
+                        self.decode(frame.id.sequence as u16, frame.talkspurt, &frame.opus, now);
                     if ok {
                         stats.decoded += 1;
                     } else {
@@ -269,11 +283,12 @@ impl Speaker {
                 Ordered::Wait => return,
             };
             stats.dropped_late += dropped as u64;
+            self.late_samples += dropped * SLICE_SAMPLES;
         }
     }
 
     /// decodes one packet into slices; false when it was not opus
-    fn decode(&mut self, seq: u16, packet: &[u8], now: Instant) -> (bool, usize) {
+    fn decode(&mut self, seq: u16, talkspurt: u16, packet: &[u8], now: Instant) -> (bool, usize) {
         let mut decoded = [0.0f32; MAX_DECODE];
         let (ok, n) = match self
             .decoder
@@ -288,7 +303,7 @@ impl Speaker {
                 (false, GARBAGE_SAMPLES)
             }
         };
-        (ok, self.queue(seq, &decoded[..n], now))
+        (ok, self.queue(seq, talkspurt, &decoded[..n], !ok, now))
     }
 
     /// a packet that never came: FEC from the one after it, or with none of that (or no
@@ -304,32 +319,45 @@ impl Speaker {
             .decoder
             .decode_float_to_slice(next.unwrap_or(&[]), &mut pcm[..n], next.is_some())
             .unwrap_or(n);
-        self.queue(seq, &pcm[..n], now)
+        self.queue(seq, self.talkspurt, &pcm[..n], true, now)
     }
 
     /// queues decoded samples of packet `seq` as slices; returns how many were dropped
-    fn queue(&mut self, seq: u16, pcm: &[f32], now: Instant) -> usize {
+    fn queue(
+        &mut self,
+        seq: u16,
+        talkspurt: u16,
+        pcm: &[f32],
+        impaired: bool,
+        now: Instant,
+    ) -> usize {
         let n = pcm.len();
         // per 20 ms of audio, whatever the packet duration
         let rms = (pcm.iter().map(|s| s * s).sum::<f32>() / n as f32).sqrt();
         let decay = LEVEL_DECAY.powf(n as f32 / 960.0);
         self.level = rms.max(self.level * decay);
-        self.pending
-            .extend(pcm.iter().enumerate().map(|(i, &s)| (seq, i, s)));
+        self.pending.extend(
+            pcm.iter()
+                .enumerate()
+                .map(|(i, &s)| (seq, i, s, impaired, talkspurt)),
+        );
         let mut dropped = 0;
         while self.pending.len() >= SLICE_SAMPLES {
-            let (seq, offset, _) = self.pending[0];
+            let (seq, offset, _, _, talkspurt) = self.pending[0];
             let mut slice = Slice {
                 seq,
                 offset,
                 pcm: [0.0; SLICE_SAMPLES],
+                impaired: 0,
+                talkspurt,
             };
-            for (out, (_, _, s)) in slice
+            for (out, (_, _, s, impaired, _)) in slice
                 .pcm
                 .iter_mut()
                 .zip(self.pending.drain(..SLICE_SAMPLES))
             {
                 *out = s;
+                slice.impaired += usize::from(impaired);
             }
             // audio of a selected stream after its pcm stream closed opens a new one
             dropped += self
@@ -390,6 +418,10 @@ impl Mixer {
         }
         self.start_stream(legacy(sender), now);
         let speaker = self.speakers.get_mut(&sender).expect("opened above");
+        speaker.continuity = Continuity::default();
+        speaker.heard = false;
+        speaker.active = true;
+        speaker.late_samples = 0;
         speaker.order = Reorder::new(legacy(sender), reorder::GAME_ONLY);
         if let Some(wait) = self.waits.get(&sender) {
             speaker.order.set_wait(*wait);
@@ -563,6 +595,13 @@ impl Mixer {
             }
         };
         selection.talkspurt = Some((media.talkspurt, true));
+        let history = if opens {
+            self.speakers
+                .get_mut(&player)
+                .map(|speaker| std::mem::take(&mut speaker.continuity))
+        } else {
+            None
+        };
         if opens
             && self
                 .speakers
@@ -575,6 +614,14 @@ impl Mixer {
         }
         if opens || media.kind == Kind::Start {
             self.start_stream(selected, now);
+        }
+        if opens {
+            let speaker = self.speakers.get_mut(&player).expect("opened above");
+            speaker.continuity = history.unwrap_or_default();
+            speaker.talkspurt = media.talkspurt;
+            speaker.active = true;
+            speaker.heard = false;
+            speaker.late_samples = 0;
         }
         if media.kind == Kind::Voice {
             return self.push(selected, media.talkspurt, media.sequence, media.opus, now);
@@ -640,6 +687,7 @@ impl Mixer {
     /// STOP: what waits behind a gap is released now, then the queue plays out and closes
     fn stop_stream(&mut self, player: u16) {
         if let Some(speaker) = self.speakers.get_mut(&player) {
+            speaker.active = false;
             while let Some(at) = speaker.order.deadline() {
                 speaker.drain(at, &mut self.stats);
             }
@@ -652,6 +700,25 @@ impl Mixer {
     /// no pcm stream left to play
     pub fn is_idle(&self) -> bool {
         self.speakers.values().all(|s| s.stream.is_none())
+    }
+
+    /// only v2 talkers whose current talkspurt actually reached this listener's playout.
+    pub fn hud_status(&self, now: Instant) -> Vec<Status> {
+        self.speakers
+            .iter()
+            .filter_map(|(&sender, speaker)| {
+                let selection = self.selected.get(&sender)?;
+                (speaker.active && speaker.heard && speaker.continuity.has_recent_playout(now))
+                    .then(|| Status {
+                        sender,
+                        generation: selection.generation,
+                        talkspurt: speaker.talkspurt,
+                        level: speaker.continuity.level(now),
+                        route: 0,
+                        delay_class: 0,
+                    })
+            })
+            .collect()
     }
 
     /// one SLICE of the mix at 48 kHz, or None when nobody is audible
@@ -678,6 +745,12 @@ impl Mixer {
                     selected.contains_key(&sender)
                 }
                 Pull::Silence => {
+                    if speaker.heard {
+                        let late = std::mem::take(&mut speaker.late_samples);
+                        speaker
+                            .continuity
+                            .record(now, SLICE_SAMPLES + late, SLICE_SAMPLES + late);
+                    }
                     stats.underruns += 1;
                     audible = true;
                     speaker.conceal(&mut pcm);
@@ -709,8 +782,18 @@ impl Mixer {
                             next.pcm[i] = slice.pcm[i] * (1.0 - w) + next.pcm[i] * w;
                         }
                         stats.shed += 1;
+                        if slice.talkspurt == speaker.talkspurt {
+                            speaker.late_samples += SLICE_SAMPLES;
+                        }
                         shed = Some((slice.seq, slice.offset));
                         slice = next;
+                    }
+                    if slice.talkspurt == speaker.talkspurt {
+                        speaker.heard = true;
+                        let late = std::mem::take(&mut speaker.late_samples);
+                        speaker
+                            .continuity
+                            .record(now, SLICE_SAMPLES + late, slice.impaired + late);
                     }
                     for (out, sample) in mix.iter_mut().zip(&slice.pcm) {
                         *out += sample;
@@ -771,6 +854,291 @@ impl Mute {
 mod tests {
     use super::*;
     use crate::tx::{Codec, Transmitter};
+
+    #[test]
+    fn hud_one_second_phrase_shows_measured_level_before_it_ends() {
+        let start = Instant::now();
+        let opus = opus_frames(10, 1);
+        let mut mixer = Mixer::default();
+        mixer.select(
+            StreamId {
+                player: 1,
+                generation: GEN_A,
+            },
+            start,
+        );
+        for n in 0..100u16 {
+            let now = start + SLICE * u32::from(n);
+            assert!(mixer.game(v2(Kind::Voice, GEN_A, 7, n, &opus[0]), now));
+            mixer.tick(now);
+            if n == 42 {
+                assert_eq!(mixer.hud_status(now)[0].level, 0);
+            }
+            if n == 60 {
+                assert_eq!(mixer.hud_status(now)[0].level, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn hud_history_survives_five_second_gap_but_resets_at_thirty_or_new_generation() {
+        let start = Instant::now();
+        let opus = opus_frames(10, 1);
+        for (idle_secs, generation, expected) in [(5, GEN_A, 3), (30, GEN_A, 0), (5, GEN_B, 0)] {
+            let mut mixer = Mixer::default();
+            mixer.select(
+                StreamId {
+                    player: 1,
+                    generation: GEN_A,
+                },
+                start,
+            );
+            for n in 0..55u16 {
+                let now = start + SLICE * u32::from(n);
+                assert!(mixer.game(v2(Kind::Voice, GEN_A, 7, n, &opus[0]), now));
+                mixer.tick(now);
+            }
+            assert_eq!(mixer.hud_status(start + SLICE * 54)[0].level, 3);
+            assert!(mixer.game(v2(Kind::Stop, GEN_A, 7, 54, &[]), start + SLICE * 55));
+            for n in 55..=65 {
+                mixer.tick(start + SLICE * n);
+            }
+            assert!(mixer.hud_status(start + SLICE * 65).is_empty());
+            let resumed = start + SLICE * 65 + Duration::from_secs(idle_secs);
+            if generation != GEN_A {
+                mixer.select(
+                    StreamId {
+                        player: 1,
+                        generation,
+                    },
+                    resumed,
+                );
+            }
+            assert!(mixer.game(v2(Kind::Voice, generation, 8, 55, &opus[0]), resumed));
+            assert!(mixer.hud_status(resumed).is_empty());
+            let played = resumed + crate::jitter::START_WAIT;
+            mixer.tick(played);
+            let records = mixer.hud_status(played);
+            assert_eq!(
+                (
+                    records[0].generation,
+                    records[0].talkspurt,
+                    records[0].level
+                ),
+                (generation, 8, expected)
+            );
+            let packet = crate::quality::Reporter::default()
+                .batch(&records, played)
+                .unwrap();
+            assert_eq!(packet[19], expected, "first report after {idle_secs}s");
+        }
+    }
+
+    #[test]
+    fn hud_continuity_measures_playout_loss_and_deduplicates_late_copies() {
+        let start = Instant::now();
+        for frame_ms in [10, 20] {
+            let opus = opus_frames(frame_ms, 1);
+            let frame_slices = frame_ms as u16 / 10;
+            let loss_start = 250 / frame_slices - 100;
+            for (losses, expected) in [(0, 3), (4, 2), (20, 1)] {
+                let mut mixer = Mixer::default();
+                mixer.select(
+                    StreamId {
+                        player: 1,
+                        generation: GEN_A,
+                    },
+                    start,
+                );
+                assert!(mixer.hud_status(start).is_empty());
+                for n in 0..=250u16 {
+                    let now = start + SLICE * u32::from(n);
+                    // losses occur in the final two seconds, separated to avoid a long gap.
+                    let seq = n / frame_slices;
+                    let lost = seq >= loss_start
+                        && (seq - loss_start) % 5 == 0
+                        && (seq - loss_start) / 5 < losses;
+                    if n % frame_slices == 0 && !lost {
+                        let voice = v2(Kind::Voice, GEN_A, 7, seq, &opus[0]);
+                        assert!(mixer.game(voice, now));
+                        assert_eq!(mixer.receive_game(voice, now), MediaOutcome::Duplicate);
+                    }
+                    mixer.tick(now);
+                    if n == 20 {
+                        assert_eq!(mixer.hud_status(now)[0].level, 0);
+                    }
+                    let prior = seq.saturating_sub(5);
+                    if n % frame_slices == 0
+                        && seq >= loss_start + 5
+                        && (prior - loss_start) % 5 == 0
+                        && (prior - loss_start) / 5 < losses
+                    {
+                        // inject each missing identity only after its gap deadline and playout.
+                        // it must not create another impaired sample or change continuity.
+                        let before = mixer.speakers[&1].continuity.level(now);
+                        let decoded = mixer.stats.decoded;
+                        let late = v2(Kind::Voice, GEN_A, 7, prior, &opus[0]);
+                        assert_eq!(mixer.receive_game(late, now), MediaOutcome::Dropped("late"));
+                        assert_eq!(mixer.receive_game(late, now), MediaOutcome::Dropped("late"));
+                        assert_eq!(mixer.stats.decoded, decoded);
+                        assert_eq!(mixer.speakers[&1].continuity.level(now), before);
+                    }
+                }
+                let now = start + SLICE * 250;
+                let status = mixer.hud_status(now);
+                assert_eq!(status.len(), 1);
+                assert_eq!((status[0].generation, status[0].talkspurt), (GEN_A, 7));
+                assert_eq!(status[0].level, expected, "{losses} induced losses");
+            }
+        }
+    }
+
+    #[test]
+    fn hud_ignores_old_queued_spurt_and_reordered_frames_keep_good_continuity() {
+        let start = Instant::now();
+        let opus = opus_frames(10, 1);
+        let mut mixer = Mixer::default();
+        mixer.select(
+            StreamId {
+                player: 1,
+                generation: GEN_A,
+            },
+            start,
+        );
+        for n in 0..=252u16 {
+            let now = start + SLICE * u32::from(n);
+            if n % 2 == 0 {
+                assert!(mixer.game(v2(Kind::Voice, GEN_A, 7, n + 1, &opus[0]), now));
+                // the first packet establishes the reorder reference, so start it in order.
+                if n == 0 {
+                    continue;
+                }
+                assert!(mixer.game(v2(Kind::Voice, GEN_A, 7, n, &opus[0]), now));
+            }
+            mixer.tick(now);
+        }
+        let now = start + SLICE * 252;
+        assert_eq!(mixer.hud_status(now)[0].level, 3);
+        assert!(mixer.game(v2(Kind::Voice, GEN_A, 8, 254, &opus[0]), now));
+        assert!(mixer.hud_status(now).is_empty());
+        let mut reported = false;
+        for n in 1..=10 {
+            mixer.tick(now + SLICE * n);
+            if let Some(status) = mixer.hud_status(now + SLICE * n).first() {
+                assert_eq!(status.talkspurt, 8);
+                if !reported {
+                    assert_eq!(status.level, 3);
+                }
+                reported = true;
+            }
+        }
+        assert_eq!(mixer.hud_status(now + SLICE * 10)[0].talkspurt, 8);
+    }
+
+    #[test]
+    fn hud_stale_stop_spurt_and_held_media() {
+        let start = Instant::now();
+        let opus = opus_frames(10, 1);
+        let mut mixer = Mixer::default();
+        for n in 0..=250u16 {
+            let now = start + SLICE * u32::from(n);
+            let voice = v2(Kind::Voice, GEN_A, 7, n, &opus[0]);
+            if n == 0 {
+                assert_eq!(mixer.receive_game(voice, now), MediaOutcome::Held);
+                assert!(mixer.hud_status(now).is_empty());
+                mixer.select(voice.stream, now);
+            } else {
+                assert!(mixer.game(voice, now));
+            }
+            mixer.tick(now);
+        }
+        let now = start + SLICE * 250;
+        assert_eq!(mixer.hud_status(now)[0].level, 3);
+        assert!(mixer.game(v2(Kind::Start, GEN_A, 7, 250, &[]), now));
+        assert_eq!(mixer.hud_status(now)[0].level, 3);
+        for n in 1..=70 {
+            mixer.tick(now + SLICE * n);
+        }
+        assert!(mixer.is_idle());
+        assert_eq!(mixer.hud_status(now + SLICE * 70)[0].level, 0);
+        let later = now + Duration::from_secs(1);
+        assert!(mixer.game(v2(Kind::Voice, GEN_A, 8, 251, &opus[0]), later));
+        assert!(mixer.hud_status(later).is_empty());
+        mixer.tick(later + crate::jitter::START_WAIT);
+        let status = mixer.hud_status(later + crate::jitter::START_WAIT);
+        assert_eq!((status[0].talkspurt, status[0].level), (8, 1));
+        assert!(!mixer.game(v2(Kind::Stop, GEN_A, 7, 251, &[]), later));
+        assert_eq!(mixer.hud_status(later).len(), 1);
+        assert!(mixer.game(v2(Kind::Stop, GEN_A, 8, 251, &[]), later));
+        assert!(mixer.hud_status(later).is_empty());
+        assert_eq!(
+            mixer.receive_game(v2(Kind::Voice, GEN_A, 8, 252, &opus[0]), later),
+            MediaOutcome::Dropped("talkspurt")
+        );
+        let held = v2(Kind::Voice, GEN_B, 1, 1, &opus[0]);
+        assert_eq!(mixer.receive_game(held, later), MediaOutcome::Held);
+        assert_eq!(
+            mixer.receive_game(v2(Kind::Stop, GEN_B, 1, 1, &[]), later),
+            MediaOutcome::Held
+        );
+        mixer.select(held.stream, later);
+        mixer.tick(later);
+        assert!(mixer.hud_status(later).is_empty());
+    }
+
+    #[test]
+    fn hud_idle_report_expires_and_same_or_new_spurt_resumes_retained_history() {
+        use crate::quality::Reporter;
+
+        let start = Instant::now();
+        let opus = opus_frames(10, 1);
+        for next_spurt in [7, 8] {
+            let mut mixer = Mixer::default();
+            let mut reporter = Reporter::default();
+            mixer.select(
+                StreamId {
+                    player: 1,
+                    generation: GEN_A,
+                },
+                start,
+            );
+            for n in 0..=250u16 {
+                let now = start + SLICE * u32::from(n);
+                assert!(mixer.game(v2(Kind::Voice, GEN_A, 7, n, &opus[0]), now));
+                mixer.tick(now);
+            }
+            let now = start + SLICE * 250;
+            assert!(reporter.batch(&mixer.hud_status(now), now).is_some());
+            for n in 1..=70 {
+                mixer.tick(now + SLICE * n);
+            }
+            let stale = now + SLICE * 70;
+            let records = mixer.hud_status(stale);
+            assert_eq!(records[0].level, 0);
+            let unknown = reporter
+                .batch(&records, stale)
+                .expect("bounded stale clear");
+            assert_eq!(unknown[19], 0);
+            // the last observation is at 300 ms: expiry is exactly two seconds later.
+            let expires = now + Duration::from_millis(2300);
+            assert_eq!(
+                mixer.hud_status(expires - Duration::from_millis(1)).len(),
+                1
+            );
+            for n in 0..=4 {
+                let at = expires + Duration::from_secs(n);
+                assert!(mixer.hud_status(at).is_empty());
+                assert!(reporter.batch(&mixer.hud_status(at), at).is_none());
+            }
+            let resumes = expires + Duration::from_secs(5);
+            assert!(mixer.game(v2(Kind::Voice, GEN_A, next_spurt, 251, &opus[0]), resumes));
+            mixer.tick(resumes + crate::jitter::START_WAIT);
+            let active_at = resumes + crate::jitter::START_WAIT;
+            let records = mixer.hud_status(active_at);
+            assert_eq!((records[0].talkspurt, records[0].level), (next_spurt, 1));
+            assert!(reporter.batch(&records, active_at).is_some());
+        }
+    }
 
     #[test]
     fn wait_before_first_frame_survives_idle_talkspurt_and_generation_reset() {

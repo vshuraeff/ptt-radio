@@ -1646,6 +1646,10 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    pub fn selected_path(&self, player: u16) -> Option<Path> {
+        self.peers.get(&player).and_then(|peer| peer.choice.active)
+    }
+
     pub fn new(sockets: Vec<SocketAddr>, config: RuntimeConfig) -> Result<Self> {
         let mut generation = [0; 8];
         getrandom::fill(&mut generation)?;

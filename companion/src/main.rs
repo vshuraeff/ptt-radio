@@ -33,6 +33,7 @@ use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
 use ptt_radio_companion::mix::{self, MediaOutcome, Mixer, Mute, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
+use ptt_radio_companion::quality::Reporter;
 use ptt_radio_companion::runtime::{Media, Output, Runtime, RuntimeConfig};
 use ptt_radio_companion::runtime_io::{Network, Resolver};
 use ptt_radio_companion::transport::wire::Kind;
@@ -243,7 +244,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
     let hello = packet::encode(
         HELLO,
         0,
-        format!("ptt-radio-companion {} v2", env!("CARGO_PKG_VERSION")).as_bytes(),
+        format!("ptt-radio-companion {} hud1 v2", env!("CARGO_PKG_VERSION")).as_bytes(),
     );
     send(&shared, &hello);
     send_echo_state(&shared, shared.echo.gate_state().engaged);
@@ -739,6 +740,7 @@ fn accept_media(shared: &Shared, media: Media, game: bool, stats: Option<&mut Rx
 
 fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
     let mut stats = RxStats::default();
+    let mut hud = Reporter::default();
     let mut open_mic: Option<bool> = None;
     let mut buf = [0u8; 65536];
     while !shared.done.load(Relaxed) {
@@ -783,6 +785,14 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
                 eprintln!("transport tick: {err}");
             }
             drain_runtime(shared, runtime, network, Some(&mut stats));
+            let now = Instant::now();
+            let mut active = shared.mixer.lock().unwrap().hud_status(now);
+            for record in &mut active {
+                record.selected_path(runtime.selected_path(record.sender));
+            }
+            if let Some(packet) = hud.batch(&active, now) {
+                send(shared, &packet);
+            }
         }
         let len = match shared.socket.recv_from(&mut buf) {
             Ok((len, sender)) if sender.ip() == shared.game.ip() => len,
