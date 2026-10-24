@@ -1,0 +1,14 @@
+{
+  "name": "ptt-radio test server",
+  "description": "Local multiplayer voice testing",
+  "visibility": { "public": false, "lan": true },
+  "require_user_verification": false,
+  "max_players": 4,
+  "game_password": "",
+  "auto_pause": false,
+  "auto_pause_when_players_connect": false,
+  "only_admins_can_pause_the_game": true,
+  "autosave_interval": 1,
+  "autosave_only_on_server": true,
+  "admins": []
+}
