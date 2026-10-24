@@ -4,10 +4,11 @@
 --
 -- storage.hud.rows is an array in activation order, so the array index is the
 -- activation ordinal and no pairs order ever reaches the screen. control.lua sets
--- hud.visible(sender_index, viewer_index) at load: in_scope today, channels.eligible
--- once channels go live. the echo marker reads control.lua's storage.echo_sources.
+-- hud.visible from channel eligibility and accepted per-listener talk membership.
+-- the echo marker reads control.lua's storage.echo_sources.
 
 local hud = {}
+local channels = require("channels")
 
 hud.ECHO_COLOR = { r = 1, g = 0.25, b = 0.25, a = 1 }
 
@@ -16,7 +17,6 @@ local ROOT = "ptt_radio_hud"
 local ROW = "ptt_radio_hud_"
 local CONTENT, TAIL, BARS = "content", "tail", "bars"
 local SERVER_COLOR = { r = 0.8, g = 0.8, b = 0.8, a = 1 }
-local CHANNEL_SPRITE = { ["ptt/any"] = "virtual-signal/signal-each" }
 
 -- sizes are gui units and scale with display_scale; the origin is a fraction of the
 -- screen height in pixels, and rows never reach below BOTTOM
@@ -43,9 +43,14 @@ local function find(sender)
   end
 end
 
--- u4 maps real channel keys through channels.sprite; today only ptt/any arrives
 local function channel_sprite(key)
-  return CHANNEL_SPRITE[key] or key
+  return channels.sprite(key)
+end
+
+local function channel_tooltip(key)
+  if key == channels.ANY then return { "ptt-radio-settings.name-any" } end
+  if key == channels.HERE then return { "ptt-radio-settings.name-here" } end
+  return key
 end
 
 local function paint(bars, link)
@@ -75,7 +80,7 @@ end
 local function add_row(root, viewer, row)
   local sender = row.sender
   local line = row_content(root, ROW .. sender)
-  local icon = line.add({ type = "sprite", sprite = channel_sprite(row.channel) })
+  local icon = line.add({ type = "sprite", sprite = channel_sprite(row.channel), tooltip = channel_tooltip(row.channel) })
   icon.style.size = ICON_SIZE
   icon.style.stretch_image_to_widget_size = true
   local speaker = sender ~= 0 and game.get_player(sender) or nil
@@ -163,6 +168,19 @@ function hud.start(sender, channel_key, restart)
   if i then
     if storage.hud.rows[i].channel == channel_key then return end
     storage.hud.rows[i].channel = channel_key
+    for _, viewer in pairs(game.connected_players) do
+      if hud.visible(sender, viewer.index) then
+        local root = viewer.gui.screen[ROOT]
+        local row = root and root[ROW .. sender]
+        local icon = row and row[CONTENT].children[1]
+        if icon and icon.valid then
+          icon.sprite, icon.tooltip = channel_sprite(channel_key), channel_tooltip(channel_key)
+        else
+          hud.render(viewer)
+        end
+      end
+    end
+    return
   else
     storage.hud.rows[#storage.hud.rows + 1] = { sender = sender, channel = channel_key }
   end

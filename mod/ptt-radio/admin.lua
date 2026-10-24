@@ -109,8 +109,9 @@ local function apply(actor, args)
   end
 end
 
-function admin.register()
+function admin.register(before_command)
   commands.add_command("radio-admin", { LOCALE .. "command-help" }, function(event)
+    if before_command then before_command() end
     apply(event.player_index or 0, tokens(event.parameter or ""))
   end)
 end

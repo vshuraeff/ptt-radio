@@ -107,6 +107,13 @@ assert(s.tx == ANY and #s.rx == 0 and s.off == false and #s.presets == 0)
 expect_heard(1, "0,1,2,3,4")
 assert(not channels.eligible(1, 0) and not channels.eligible(0, 0))
 assert(next(storage.radio) == nil, "reads never create records")
+assert(channels.tx_permitted(0) and channels.tx_permitted(1))
+assert(not channels.tx_permitted(99))
+ok(channels.policy_deny(1, 2, ANY, "rx"))
+assert(channels.tx_permitted(2) and channels.eligible(2, 1))
+assert(not channels.eligible(2, 2), "rx-only refusal must not disable tx to other listeners")
+ok(channels.policy_deny(1, 2, ANY, "both"))
+assert(not channels.tx_permitted(2))
 
 -- two quiet groups: 1,2 on iron and 3,4 on copper hear only their own group
 setup()

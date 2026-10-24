@@ -170,6 +170,16 @@ assert(gui.on_gui_click({ element = dead, player_index = 1 }) == false)
 assert(win() and changes == 0)
 audit_all()
 
+-- a connected old companion is excluded from live channels and gets an upgrade note.
+fresh()
+storage.companions, storage.pol1 = { [1] = 0 }, {}
+gui.open(players[1])
+assert(find_caption(win(), "ptt-radio-settings.upgrade-required"))
+audit_all()
+storage.pol1[1] = true
+gui.refresh(players[1])
+assert(not find_caption(win(), "ptt-radio-settings.upgrade-required"))
+
 -- tx: a valid pick, a rejected special signal, a lock, the ANY and HERE buttons
 fresh()
 gui.open(players[1])
@@ -489,6 +499,9 @@ assert(win() == nil and players[1].printed[#players[1].printed][1] == "ptt-radio
 handlers.on_lua_shortcut({ prototype_name = "something-else", player_index = 1 })
 assert(win() == nil)
 -- a gui click is consumed by the settings window, and an audience change follows a mutation
+handlers.on_udp_packet_received({ player_index = 1, tick = 0,
+  payload = string.char(0x52, 1, 1, 0, 0) .. "tester hud1 pol1 v2" })
+revision = storage.audience_revision
 handlers["ptt-radio-settings-open"]({ player_index = 1 })
 handlers.on_gui_click({ element = find(win(), PREFIX .. "tune-" .. HERE), player_index = 1 })
 assert(channels.tx(1) == HERE and storage.audience_revision ~= revision and #sent > 0)

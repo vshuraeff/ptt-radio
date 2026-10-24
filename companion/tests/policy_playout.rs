@@ -409,6 +409,289 @@ fn unrelated_join_and_retune_preserve_double_talk_on_direct_hub_and_game() {
     }
 }
 
+#[test]
+#[ignore = "real Lua-produced channel groups; requires the realtime lock"]
+fn lua_channel_groups_are_audible_internally_and_isolated_on_direct_and_game() {
+    let lua = Command::new("lua")
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join(".."))
+        .args([
+            "mod/tests/control_test.lua",
+            "mod/ptt-radio/control.lua",
+            "--groups",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        lua.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lua.stderr)
+    );
+    let mut policies = Vec::new();
+    for line in String::from_utf8(lua.stdout).unwrap().lines() {
+        if let Some(line) = line.strip_prefix("group-policy ") {
+            let (player, hex) = line.split_once(' ').unwrap();
+            assert_eq!(player.parse::<usize>().unwrap(), policies.len() + 1);
+            let bytes: Vec<_> = hex
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            policies.push((signaling::decode_policy(&bytes).unwrap(), bytes));
+        }
+    }
+    assert_eq!(policies.len(), 4);
+    let tones = [660.0_f64, 880.0, 1170.0, 1490.0];
+    let peers = [1, 0, 3, 2];
+    for mode in [network::Mode::Direct, network::Mode::Game] {
+        let dir = directory(&format!("channel-groups-{mode:?}"));
+        let mut network =
+            (mode == network::Mode::Direct).then(|| network::Network::new(mode, 4, None));
+        let mut players = Vec::new();
+        for (index, tone) in tones.iter().enumerate() {
+            assert_eq!(
+                policies[index].0.audience.send_to,
+                [peers[index] as u16 + 1]
+            );
+            assert_eq!(
+                policies[index].0.audience.receive_from,
+                [peers[index] as u16 + 1]
+            );
+            let args = network.as_ref().map_or_else(
+                || vec!["--game-only".into()],
+                |network| network.args(index, false),
+            );
+            players.push(start_with_args(
+                &dir.join((index + 1).to_string()),
+                &tone.to_string(),
+                "8.5",
+                &args,
+            ));
+        }
+        let refresh = |index: usize, players: &[(Process, UdpSocket, SocketAddr)]| {
+            let (_, game, companion) = &players[index];
+            game.send_to(
+                &packet::encode(
+                    packet::ROSTER,
+                    0,
+                    b"1\tA\t255,0,0\n2\tB\t0,255,0\n3\tC\t0,0,255\n4\tD\t255,255,0",
+                ),
+                companion,
+            )
+            .unwrap();
+            game.send_to(
+                &packet::encode(packet::MIC_STATE, index as u16 + 1, &[1]),
+                companion,
+            )
+            .unwrap();
+            game.send_to(&policies[index].1, companion).unwrap();
+        };
+        for (index, (_, game, _)) in players.iter().enumerate() {
+            refresh(index, &players);
+            game.set_nonblocking(true).unwrap();
+        }
+        let began = Instant::now();
+        let origin_us = unix_us();
+        let mut pending = Vec::new();
+        let mut buf = [0; 2048];
+        loop {
+            if let Some(network) = &mut network {
+                network.poll();
+            }
+            for (index, (_, game, _)) in players.iter().enumerate() {
+                while let Ok((len, _)) = game.recv_from(&mut buf) {
+                    let bytes = &buf[..len];
+                    if bytes[2] == packet::HELLO {
+                        refresh(index, &players);
+                    } else if bytes[2] == wire::SIGNAL_OUT {
+                        let (target, signal) = signaling::decode_game(bytes, false).unwrap();
+                        if let Some(player) = target
+                            .checked_sub(1)
+                            .and_then(|target| players.get(target as usize))
+                        {
+                            let delay = if matches!(signal, Signal::GameProbe { .. }) {
+                                Duration::from_millis(80)
+                            } else {
+                                Duration::ZERO
+                            };
+                            pending.push((
+                                Instant::now() + delay,
+                                player.2,
+                                signaling::encode_game(&signal, index as u16 + 1, true).unwrap(),
+                            ));
+                        }
+                    } else if matches!(
+                        bytes[2],
+                        wire::GAME_POLICY_START | wire::GAME_POLICY_VOICE | wire::GAME_POLICY_STOP
+                    ) {
+                        let mut forwarded = bytes[..3].to_vec();
+                        forwarded.extend_from_slice(&(index as u16 + 1).to_be_bytes());
+                        forwarded.extend_from_slice(&bytes[3..]);
+                        let media = wire::decode_policy_game(&forwarded).unwrap();
+                        assert_eq!(media.revision, policies[index].0.audience.revision);
+                        for target in &policies[index].0.audience.send_to {
+                            pending.push((
+                                Instant::now() + Duration::from_millis(80),
+                                players[*target as usize - 1].2,
+                                forwarded.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            pending.retain(|(at, to, bytes)| {
+                if Instant::now() < *at {
+                    true
+                } else {
+                    players[0].1.send_to(bytes, to).unwrap();
+                    false
+                }
+            });
+            let mut complete = true;
+            for (process, _, _) in &mut players {
+                if let Some(status) = process.0.try_wait().unwrap() {
+                    assert!(status.success(), "{}", dir.display());
+                } else {
+                    complete = false;
+                }
+            }
+            if complete {
+                break;
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(12),
+                "{}",
+                dir.display()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let traces: Vec<String> = (1..=4)
+            .map(|player| {
+                fs::read_to_string(dir.join(player.to_string()).join("companion.trace")).unwrap()
+            })
+            .collect();
+        for index in 0..4 {
+            let from = origin_us + 6_200_000;
+            let until = origin_us + 8_000_000;
+            let peer = (peers[index] + 1).to_string();
+            let words: Vec<Vec<_>> = traces[index]
+                .lines()
+                .map(|line| line.split_whitespace().collect())
+                .collect();
+            let in_window = |line: &&Vec<&str>| {
+                let at: u64 = line[0].parse().unwrap();
+                at >= from && at < until
+            };
+            let selected = words.iter().rfind(|line| {
+                line[1] == "switch" && line[2] == peer && line[0].parse::<u64>().unwrap() <= from
+            });
+            if mode == network::Mode::Direct || selected.is_some() {
+                assert_eq!(
+                    selected.map(|line| line[3]),
+                    Some(mode.route()),
+                    "{}",
+                    dir.display()
+                );
+            }
+            assert!(
+                words
+                    .iter()
+                    .filter(in_window)
+                    .filter(|line| line[1] == "switch" && line[2] == peer)
+                    .all(|line| line[3] == mode.route())
+            );
+            let sends = words
+                .iter()
+                .filter(in_window)
+                .filter(|line| {
+                    line[1] == "route_tx"
+                        && line[3] == mode.route()
+                        && line[2]
+                            == if mode == network::Mode::Game {
+                                "0"
+                            } else {
+                                &peer
+                            }
+                })
+                .count();
+            assert!(sends > 20, "{}", dir.display());
+            let tx: HashMap<u16, u64> = traces[peers[index]]
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    (fields[1] == "tx")
+                        .then(|| (fields[2].parse().unwrap(), fields[0].parse().unwrap()))
+                })
+                .collect();
+            let mut delays = Vec::new();
+            for line in words
+                .iter()
+                .filter(in_window)
+                .filter(|line| line[1] == "rx")
+            {
+                assert_eq!(line[2], peer, "cross-group receive, {}", dir.display());
+                let at: u64 = line[0].parse().unwrap();
+                if let Some(sent) = tx.get(&line[3].parse::<u16>().unwrap()) {
+                    delays.push((at - sent) as f64 / 1000.0);
+                }
+            }
+            assert!(delays.len() > 20, "no in-group delivery, {}", dir.display());
+            delays.sort_by(f64::total_cmp);
+            let median = delays[delays.len() / 2];
+            assert!(
+                network::delay_band(mode.route()).contains(&median),
+                "{median}ms, {}",
+                dir.display()
+            );
+            let device_us: u64 = words.iter().find(|line| line[1] == "device").unwrap()[2]
+                .parse()
+                .unwrap();
+            let mut wav =
+                hound::WavReader::open(dir.join((index + 1).to_string()).join("speaker.wav"))
+                    .unwrap();
+            let samples: Vec<f32> = wav.samples::<f32>().collect::<Result<_, _>>().unwrap();
+            let first = ((from - device_us) * u64::from(OPUS_RATE) / 1_000_000) as usize;
+            let end = ((until - device_us) * u64::from(OPUS_RATE) / 1_000_000) as usize;
+            let samples = &samples[first..end];
+            let amplitude = |hz: f64| {
+                let (mut real, mut imaginary) = (0.0, 0.0);
+                for (sample, value) in samples.iter().enumerate() {
+                    let phase = std::f64::consts::TAU * hz * sample as f64 / f64::from(OPUS_RATE);
+                    real += f64::from(*value) * phase.cos();
+                    imaginary += f64::from(*value) * phase.sin();
+                }
+                2.0 * real.hypot(imaginary) / samples.len() as f64
+            };
+            let wanted = amplitude(tones[peers[index]]);
+            assert!(
+                wanted > 0.03 && longest_zero(samples) < OPUS_RATE as usize / 100,
+                "inaudible in-group voice, {}",
+                dir.display()
+            );
+            let forbidden = tones
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other / 2 != index / 2)
+                .map(|(_, hz)| amplitude(*hz))
+                .fold(0.0_f64, f64::max);
+            let cross_db = 20.0 * (forbidden / wanted).max(1e-12).log10();
+            assert!(
+                cross_db < -40.0,
+                "cross-group tone {cross_db}dB, {}",
+                dir.display()
+            );
+            println!(
+                "channel-groups {mode:?} player={} peer={} selected={} actual-sends={sends} tx-rx-median={median:.3}ms wanted-amplitude={wanted:.5} forbidden={cross_db:.2}dB artifacts={}",
+                index + 1,
+                peer,
+                mode.route(),
+                dir.display()
+            );
+        }
+    }
+}
+
 fn scope(revision: u64, receive: &[u16], tx: bool) -> Vec<u8> {
     signaling::encode_policy(&Policy {
         audience: Audience {
