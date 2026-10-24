@@ -522,6 +522,55 @@ With two headphone talkers and a silent open microphone coupled at +6 dB, the co
 
 The e2e harness can put a NAT and link router between companions (`tests/netlab/router.rs`, test-support code; `tests/netlab/lab.rs` builds it for a few players and starts the pump). A companion started with `--netlab <router inside addr> [--netlab-bind <private addr>]` binds a `LabPath` (`src/transport/lab.rs`), a `Transport` for the direct and relay UDP routes that sends every datagram from one socket to the router with a 6-byte public destination prefix (IPv4 and port, big-endian) and strips the same prefix, the public source, from what it receives. The bind address must be the private address registered with the router, since the router delivers there. `LabPath` drops datagrams whose UDP sender is not the router, whole datagrams above 1506 bytes, and ones without an envelope; the stripped public source stays raw and untrusted in `last_source()`. When several routes share one public endpoint (relay sessions at one hub address), the relay wrapper's session picks the route, and `Direct` is reported if that does not single one out. Without the flag nothing changes. Router traces carry the first payload byte and `label` names it by the datagram types above (STUN, VOICE, START, STOP, PING, PONG, RELAY, BIND, BIND-ACK); the rest of the payload stays opaque. The router tests cover mapping/filtering and link behavior; the U21 process scenarios above exercise actual runtime ICE, encrypted media and relay traffic through it.
 
+### Listener HUD quality
+
+The companion advertises `ptt-radio-companion <version> hud1 v2`. Its `HUD_STATUS`
+packet has the v1 header `52 01 0A 00 00`, then body version 1, a one-byte count
+up to 32, and 15 bytes per record: sender BE16, opaque stream generation[8],
+talkspurt BE16, level, route and delay class. The largest packet is 487 bytes.
+The mod obtains the reporter from the input event, not the header's zero field.
+
+`mix.rs` measures each sender's last two seconds of measured playout, excluding
+idle time and weighted by audio samples rather than packet count. Missing
+packets mark their decoded PLC/FEC samples as impaired; undecodable samples and playout underruns
+also count. Jitter overflow and backlog cuts count their discarded audio once
+when the next slice plays. A late copy of an already concealed packet or a
+duplicate adds nothing: the packet-level missing/discard counters do not feed
+the metric. This measures continuity, including recovered audio, rather than
+Opus fidelity or network packet loss alone.
+
+Level 3 means less than 1% impaired audio, level 2 means 1% through 5%, and level 1
+means more than 5%. Level 0 covers fewer than 500 ms of measured playout and a
+playout observation stale by 300 ms. The 500 ms minimum counts rendered slices;
+discarded duration does not shortcut it. History survives same-generation
+talkspurt changes, but resets on a new generation or after 30 seconds without
+playout. Repeated START does not reset it. Only selected v2 talkspurts actually
+heard at playout are reported. STOP suppresses the record immediately. If a
+talkspurt idles out without STOP, its record becomes unknown so a previously
+green result cannot persist through the mod's expiry interval. The telemetry
+subject expires two seconds after its last playout observation, so a lost STOP
+cannot cause indefinite unknown heartbeats. Audio resuming within 30 seconds
+refreshes the retained estimate from its first played slice; after 30 seconds
+it starts another warmup window.
+
+The receiver sends changed records at most twice per second and refreshes
+unchanged records after two seconds. Batches favor the oldest report, including
+never-reported senders, so more than 32 active talkers rotate fairly. When the
+number of due talkers exceeds the four-batch capacity of a two-second interval,
+the per-talker heartbeat necessarily takes longer; the batch rate and size
+limits still hold. Route is the runtime's selected pair path (game/direct/hub/
+player relay), independent of continuity. It describes the local selected route,
+not the arrival path of every redundant media copy. Delay class remains 0:
+route RTT alone does not establish mouth-to-ear delay.
+
+The bands are product thresholds, not a perceptual calibration from the live
+network lab. Deterministic tests exercise clean, fair and poor induced playout loss
+with both 10 ms and 20 ms packets,
+the exact 1%/5% boundaries, bounded discard recovery, 400/500 ms warmup, five-second
+history retention, 30-second/generation reset, stale expiry, duplicates,
+late copies, talkspurt replacement, batching and the shared wire vector. No
+Internet or real-time lab measurement is implied by those tests.
+
 ### Noise pair sessions
 
 `companion/src/crypto/mod.rs` implements a pure pair-session state machine using Snow 0.10.0 `Noise_KK_25519_AESGCM_SHA256` or `Noise_KK_25519_ChaChaPoly_SHA256` and stateless transport encryption. Its production caller is the companion runtime (`companion/src/runtime.rs`), which owns one session per pair. Both selected ANNOUNCEs must advertise AES to select it; otherwise the pair selects common ChaChaPoly. The configured Snow resolver obtains generated static and ephemeral key material from the OS random source. Key-bearing types omit `Debug`; persistence belongs to runtime.
