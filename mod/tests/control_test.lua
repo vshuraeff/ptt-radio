@@ -1,9 +1,8 @@
+local control_path = arg[1] or "mod/ptt-radio/control.lua"
+package.path = control_path:gsub("[^/]*$", "?.lua") .. ";" .. package.path
 local handlers, nth, sent, sounds, players
-local control_path = arg[1] or "ptt-radio/mod/ptt-radio/control.lua"
-package.path = (control_path:gsub("[^/]*$", "?.lua")) .. ";" .. package.path
--- a gui element keeps its add spec, its children in order and named children as fields
 local function element(parent, spec)
-  local item = { valid = true, children = {} }
+  local item = { valid = true, children = {}, parent = parent, style = {} }
   for key, value in pairs(spec or {}) do item[key] = value end
   item.style = {}
   item.add = function(child_spec)
@@ -16,755 +15,586 @@ local function element(parent, spec)
     item.valid = false
     if item.name then parent[item.name] = nil end
     for i, child in ipairs(parent.children) do
-      if child == item then table.remove(parent.children, i) break end
+      if child == item then table.remove(parent.children, i); break end
     end
   end
   return item
 end
-
-local function setup()
+local function u16(n) return string.char(math.floor(n / 256) % 256, n % 256) end
+local function packet(kind, index, body) return string.char(0x52, 1, kind) .. u16(index or 0) .. (body or "") end
+local function emit(sender, payload, tick)
+  game.tick = tick or game.tick
+  handlers.on_udp_packet_received({ player_index = sender, payload = payload, tick = game.tick })
+end
+local function hello(index, body) emit(index, packet(1, 0, body or "tester hud1 pol1 v2")) end
+local function setup(count, cold, saved)
   handlers, nth, sent, sounds, players = {}, {}, {}, {}, {}
-  storage = {}
-  commands = { add_command = function(name, _, handler) commands[name] = handler end }
+  storage = saved or {}
   settings = { global = { ["ptt-radio-scope"] = { value = "all" } } }
+  prototypes = {
+    item = { ["iron-plate"] = {}, ["copper-plate"] = {}, ["parameter"] = { parameter = true } },
+    fluid = { water = {} }, virtual_signal = { ["signal-A"] = {} }, entity = {}, recipe = {},
+    space_location = { vulcanus = {} }, asteroid_chunk = {}, quality = {},
+  }
   defines = { events = setmetatable({}, { __index = function(_, key) return key end }) }
   script = {
-    on_event = function(event, handler)
-      for _, name in ipairs(type(event) == "table" and event or { event }) do handlers[name] = handler end
+    on_event = function(events, handler)
+      for _, event in ipairs(type(events) == "table" and events or { events }) do handlers[event] = handler end
     end,
     on_nth_tick = function(tick, handler) nth[tick] = handler end,
     on_init = function(handler) script.init = handler end,
     on_configuration_changed = function(handler) script.configure = handler end,
   }
-  helpers = {
-    send_udp = function(port, data, target) sent[#sent + 1] = { port = port, data = data, target = target } end,
-    recv_udp = function() end,
-  }
-  game = {
-    print = function() end,
-    tick = 0,
-    connected_players = {},
-    players = players,
-    get_player = function(index) assert(index ~= 0, "player zero is not a LuaPlayer"); return players[index] end,
-  }
-  for index = 1, 3 do
-    players[index] = {
-      index = index, connected = true, name = "p" .. index, force = { index = 1 },
-      chat_color = { r = 1, g = 0, b = 0 },
-      gui = { left = element({ children = {} }), screen = element({ children = {} }) },
+  commands = { add_command = function(name, _, handler) commands[name] = handler end }
+  helpers = { recv_udp = function() end, send_udp = function(port, data, target)
+    sent[#sent + 1] = { port = port, data = data, target = target }
+  end }
+  game = { tick = 0, players = players, connected_players = {}, print = function() end,
+    get_player = function(index) assert(index ~= 0); return players[index] end }
+  for index = 1, count or 3 do
+    local player = {
+      index = index, name = "p" .. index, connected = true, admin = index == 1,
+      force = { index = 1 }, physical_surface = { index = 1 }, chat_color = { r = 1, g = 0, b = 0 },
       display_resolution = { width = 1920, height = 1080 }, display_scale = 1,
-      mod_settings = {
-        ["ptt-radio-companion-port"] = { value = 34555 + index },
-        ["ptt-radio-half-duplex"] = { value = true },
-        ["ptt-radio-echo"] = { value = false },
-      },
-      print = function() end, set_shortcut_toggled = function() end,
-      play_sound = function(spec) sounds[#sounds + 1] = spec.path end,
+      gui = { screen = element({ children = {} }), left = element({ children = {} }) },
+      mod_settings = { ["ptt-radio-companion-port"] = { value = 34555 + index },
+        ["ptt-radio-echo"] = { value = false }, ["ptt-radio-half-duplex"] = { value = true } },
+      printed = {}, set_shortcut_toggled = function() end,
     }
+    player.print = function(message) player.printed[#player.printed + 1] = message end
+    player.play_sound = function(spec) sounds[#sounds + 1] = { index = index, path = spec.path } end
+    players[index] = player
+    table.insert(game.connected_players, 1, player)
   end
-  game.connected_players = { players[3], players[1], players[2] }
-  package.loaded.hud = nil
-  package.loaded.channels = nil
+  for _, name in ipairs({ "hud", "channels", "admin", "settings_gui" }) do package.loaded[name] = nil end
   dofile(control_path)
-  script.init()
+  if not saved then script.init() end
+  if not cold then for index = 1, #players do hello(index) end end
+  sent, sounds = {}, {}
 end
-
-local function u16(n) return string.char(math.floor(n / 256), n % 256) end
-local function packet(kind, peer, body) return string.char(0x52, 1, kind) .. u16(peer or 0) .. (body or "") end
-local function emit(sender, data, tick)
-  game.tick = tick or game.tick
-  handlers.on_udp_packet_received({ player_index = sender, payload = data, tick = game.tick })
-end
-local function clear() sent = {} end
-local function audience(index)
-  for i = #sent, 1, -1 do
-    local row = sent[i]
-    if row.target == index and row.data:byte(3) == 0x14 then
-      local data, at = row.data, 14
-      local function read()
-        local value = data:byte(at) * 256 + data:byte(at + 1)
-        at = at + 2
-        return value
-      end
-      local function set()
-        local out = {}
-        for _ = 1, read() do out[#out + 1] = read() end
-        return table.concat(out, ",")
-      end
-      local send_to, receive_from = set(), set()
-      assert(at == #data + 1)
-      return send_to, receive_from, data:sub(6, 13)
-    end
-  end
-  error("missing audience for " .. index)
-end
-local function expect_audience(index, send_to, receive_from)
-  local actual_send, actual_receive = audience(index)
-  assert(actual_send == send_to, actual_send .. " != " .. send_to)
-  assert(actual_receive == receive_from, actual_receive .. " != " .. receive_from)
-end
-local function v2(kind, generation, talkspurt, body)
-  return packet(kind, 42, generation .. u16(talkspurt) .. (body or ""))
-end
-
-setup()
-emit(1, packet(1))
-expect_audience(1, "2,3", "0,2,3")
-clear()
-emit(2, packet(1))
-expect_audience(2, "1,3", "0,1,3")
-assert(storage.companions[1] == 0)
-players[3].force.index = 2
-settings.global["ptt-radio-scope"].value = "force"
-handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" })
-expect_audience(1, "2", "0,2")
-expect_audience(3, "", "0")
-local _, _, revision = audience(1)
-players[2].force.index = 2
-handlers.on_player_changed_force({ player_index = 2 })
-expect_audience(1, "", "0")
-expect_audience(2, "3", "0,3")
-assert(select(3, audience(1)) ~= revision)
-players[2].force = players[1].force
-players[3].force = players[1].force
-handlers.on_forces_merged({ source_name = "invalidated" })
-expect_audience(1, "2,3", "0,2,3")
-players[2].connected = false
-game.connected_players = { players[3], players[1] }
-handlers.on_player_left_game({ player_index = 2 })
-expect_audience(1, "3", "0,3")
-players[2].connected = true
-game.connected_players = { players[3], players[1], players[2] }
-handlers.on_player_joined_game({ player_index = 2 })
-expect_audience(1, "2,3", "0,2,3")
-
-setup()
-players[3].force.index = 2
-settings.global["ptt-radio-scope"].value = "force"
-emit(1, packet(6, 3, "opaque\0signal"))
-assert(#sent == 1 and sent[1].target == 3 and sent[1].data == packet(0x13, 1, "opaque\0signal"))
-clear()
-emit(1, packet(6, 0, "hub"))
-assert(#sent == 0)
-emit(0, packet(1, 45678))
-expect_audience(0, "1,2,3", "")
-assert(sent[1].target == 0 and sent[1].port == 45678)
-clear()
-emit(1, packet(6, 0, "hub"))
-assert(#sent == 1 and sent[1].target == 0 and sent[1].data == packet(0x13, 1, "hub"))
-clear()
-emit(0, packet(6, 2, "from hub"))
-assert(#sent == 1 and sent[1].data == packet(0x13, 0, "from hub"))
-clear()
-emit(2, packet(6, 65535, string.rep("x", 1200)))
-assert(#sent == 4)
-for _, row in ipairs(sent) do assert(row.data:byte(3) == 0x13 and #row.data == 1205) end
-clear()
-for _, bad in ipairs({ "", "R", string.char(0x51, 1, 6, 0, 3), string.char(0x52, 2, 6, 0, 3), packet(6, 2, string.rep("x", 1201)), string.char(0x52, 1, 6, 0), packet(0x14, 2, "forged"), packet(0x13, 2, "forged"), packet(6, 42, "absent") }) do
-  emit(1, bad)
-end
-assert(#sent == 0)
-local nested = packet(0x14, 0, "forged audience")
-emit(1, packet(6, 3, nested))
-assert(#sent == 1 and sent[1].data == packet(0x13, 1, nested))
-clear()
-emit(0, packet(1, 0))
-assert(sent[1].port == 34555)
-clear()
-emit(0, packet(1, 100))
-emit(0, packet(1, 45678, "extra"))
-assert(#sent == 0 and storage.hub_port == 34555)
-game.tick = 900
-nth[60]({ tick = game.tick })
-emit(1, packet(6, 0, "boundary"))
-assert(#sent == 1 and sent[1].target == 0)
-clear()
-game.tick = 960
-nth[60]({ tick = game.tick })
-emit(1, packet(6, 0, "expired"))
-assert(#sent == 0)
-
-setup()
-local gen = string.char(255, 254, 253, 252, 251, 250, 249, 248)
-local gen2 = string.char(255, 254, 253, 252, 251, 250, 249, 249)
-emit(1, v2(9, gen, 1))
-assert(storage.talks[1] == nil and #sent == 0)
-emit(1, v2(7, gen, 1))
-assert(#sent == 2 and #sounds == 2 and storage.speakers[1] == 0)
--- no listener said v2 in HELLO: both get the legacy START
-assert(sent[1].data == packet(2, 1, u16(42)) and sent[2].data == sent[1].data)
-emit(1, v2(7, gen, 1), 15)
-assert(#sounds == 2 and storage.speakers[1] == 15)
-emit(1, packet(3, 43, "legacy"), 16)
-assert(storage.speakers[1] == 15)
-clear()
-game.tick = 60
-nth[15]({ tick = 60 })
-assert(storage.speakers[1] == nil and #sent == 2 and #sounds == 2)
-assert(not storage.talks[1].closed and storage.talks[1].talkspurt == 1)
-for _, row in ipairs(sent) do assert(row.data == packet(4, 1, u16(0))) end
-emit(1, v2(7, gen, 1), 61)
-assert(storage.speakers[1] == 61 and #sounds == 2)
-emit(1, v2(8, gen, 1, "opus"), 62)
-assert(storage.speakers[1] == 62)
-emit(1, v2(7, gen, 2), 63)
-clear()
-emit(1, v2(9, gen, 1), 64)
-emit(1, v2(7, gen, 1), 64)
-assert(#sent == 0 and storage.speakers[1] == 63)
-emit(1, packet(4), 65)
-assert(#sent == 2 and storage.speakers[1] == 63)
-emit(1, v2(9, gen, 2), 66)
-assert(storage.speakers[1] == nil)
-clear()
-emit(1, v2(7, gen, 2), 67)
-assert(#sent == 0)
-emit(1, v2(7, gen2, 1), 68)
-assert(storage.talks[1].generation == gen2)
-clear()
-emit(1, v2(8, gen, 3, "old"), 69)
-emit(1, v2(9, gen, 3), 69)
-assert(#sent == 0 and storage.talks[1].generation == gen2)
-for _, bad in ipairs({ v2(7, gen2, 2):sub(1, 14), v2(7, gen2, 2) .. "x", v2(9, gen2, 1) .. "x", v2(8, gen2, 1), v2(8, gen2, 1, string.rep("x", 1165)) }) do
-  emit(1, bad)
-end
-assert(#sent == 0)
-emit(1, v2(8, gen2, 1, string.rep("x", 1164)))
-assert(#sent == 2)
-
-setup()
-emit(1, v2(7, gen, 65535))
-emit(1, v2(7, gen, 0), 1)
-assert(storage.talks[1].talkspurt == 0 and storage.speakers[1] == 1)
-clear()
-emit(1, v2(9, gen, 65535), 2)
-emit(1, v2(7, gen, 65535), 2)
-assert(#sent == 0 and storage.talks[1].talkspurt == 0)
-
-setup()
-for i = 1, 17 do emit(1, v2(7, string.rep("\0", 7) .. string.char(i), 1), i) end
-assert(storage.talks[1].retired_count == 16)
-clear()
-emit(1, v2(7, string.rep("\0", 7) .. string.char(18), 1), 18)
-assert(#sent == 0)
-emit(1, packet(1), 3600)
-assert(storage.talks[1].retired_count == 16)
-game.tick = 3660
-nth[60]({ tick = 3660 })
-assert(storage.talks[1] == nil and storage.companions[1] == 3600)
-clear()
-emit(1, v2(7, string.rep("\0", 7) .. string.char(18), 1), 3661)
-assert(#sent == 2)
-
--- one representation per listener: player 1 and 2 say v2, player 3 is legacy
-setup()
-local function to(index)
-  local rows = {}
+local function clear() sent, sounds = {}, {} end
+local function to(index, kind)
+  local out = {}
   for _, row in ipairs(sent) do
-    if row.target == index then rows[#rows + 1] = row.data end
+    if row.target == index and (not kind or row.data:byte(3) == kind) then out[#out + 1] = row.data end
   end
-  return rows
+  return out
 end
-local function only(index, data)
-  local rows = to(index)
-  assert(#rows == 1 and rows[1] == data, "listener " .. index .. " got " .. #rows)
+local function policy(index)
+  local rows = to(index, 0x15)
+  local data = assert(rows[#rows], "missing policy " .. index)
+  assert(data:sub(1, 6) == string.char(0x52, 1, 0x15, 0, 0, 1))
+  local at = 16
+  local function read() local n = data:byte(at) * 256 + data:byte(at + 1); at = at + 2; return n end
+  local function list()
+    local values, previous = {}, -1
+    for _ = 1, read() do
+      local n = read(); assert(n > previous); previous = n; values[#values + 1] = n
+    end
+    assert(#values <= 256)
+    return table.concat(values, ",")
+  end
+  local send_to, receive = list(), list()
+  assert(at == #data + 1)
+  return send_to, receive, data:byte(15), data:sub(7, 14), data
 end
-for _, body in ipairs({ "", "0.4.0", "0.4.0v2", "0.4.0 V2" }) do
-  emit(1, packet(1, 0, body))
-  assert(storage.v2[1] == nil, body)
+local function expect(index, send_to, receive, flags)
+  local a, b, c = policy(index)
+  assert(a == send_to, a .. " != " .. send_to)
+  assert(b == receive, b .. " != " .. receive)
+  assert(c == flags, c .. " != " .. flags)
 end
--- the token is read from the body, not the header
-emit(1, packet(1, 32, "0.4.0"))
-assert(storage.v2[1] == nil)
-emit(1, packet(1, 0, " v2"))
-assert(storage.v2[1] == true)
-emit(1, packet(1, 0, "0.4.0"))
-assert(storage.v2[1] == nil)
-emit(0, packet(1, 45678))
-assert(storage.v2[0] == nil and storage.companions[0] == 0)
-emit(1, packet(1, 0, "ptt-radio-companion 0.4.0 v2"))
-emit(2, packet(1, 0, "ptt-radio-companion 0.4.0 v2"))
-emit(3, packet(1, 0, "ptt-radio-companion 0.4.0"))
-assert(storage.v2[1] and storage.v2[2] and storage.v2[3] == nil)
-clear()
-emit(1, v2(7, gen, 1))
-only(2, string.char(0x52, 1, 7, 0, 1, 0, 42) .. gen .. u16(1))
-only(3, string.char(0x52, 1, 2, 0, 1, 0, 42))
-assert(#to(1) == 0 and #to(0) == 0)
-clear()
-emit(1, v2(8, gen, 1, "opus"))
-only(2, string.char(0x52, 1, 8, 0, 1, 0, 42) .. gen .. u16(1) .. "opus")
-only(3, string.char(0x52, 1, 3, 0, 1, 0, 42) .. "opus")
-clear()
--- a v1 copy from a v2 sender reaches legacy listeners only
-emit(1, packet(3, 44, "copy"))
-assert(#to(2) == 0)
-only(3, packet(3, 1, u16(44) .. "copy"))
-clear()
--- a legacy sender reaches every listener unchanged
-emit(3, packet(3, 7, "legacy"))
-only(1, packet(3, 3, u16(7) .. "legacy"))
-only(2, packet(3, 3, u16(7) .. "legacy"))
-clear()
-emit(1, v2(9, gen, 1))
-only(2, string.char(0x52, 1, 9, 0, 1, 0, 42) .. gen .. u16(1))
-only(3, string.char(0x52, 1, 4, 0, 1, 0, 42))
-clear()
--- self-echo: a v2 sender hears its own v2 frame and no v1 copy; a legacy one hears v1
-players[1].mod_settings["ptt-radio-echo"].value = true
-players[3].mod_settings["ptt-radio-echo"].value = true
-emit(1, v2(7, gen, 2), 1)
-only(1, string.char(0x52, 1, 7, 0, 1, 0, 42) .. gen .. u16(2))
-only(3, packet(2, 1, u16(42)))
-clear()
-emit(1, packet(2, 45))
-assert(#to(1) == 0 and #to(2) == 0)
-only(3, packet(2, 1, u16(45)))
-clear()
-emit(3, v2(7, gen2, 1), 1)
-only(3, packet(2, 3, u16(42)))
-only(1, string.char(0x52, 1, 7, 0, 3, 0, 42) .. gen2 .. u16(1))
-clear()
--- the synthetic badge-timeout STOP goes to legacy listeners only, self-echo included
-game.tick = 60
-nth[15]({ tick = 60 })
-assert(storage.speakers[1] == nil and storage.speakers[3] == nil)
-assert(#to(1) == 0 and #to(2) == 0 and #sent == 2)
-local stops = { [to(3)[1]] = true, [to(3)[2]] = true }
-assert(stops[packet(4, 1, u16(0))] and stops[packet(4, 3, u16(0))])
--- capability goes with the companion record: on leave and on HELLO timeout
-players[2].connected = false
-game.connected_players = { players[3], players[1] }
-handlers.on_player_left_game({ player_index = 2 })
-assert(storage.v2[2] == nil and storage.v2[1])
-game.tick = 960
-nth[60]({ tick = game.tick })
-assert(storage.v2[1] == nil and storage.companions[1] == nil)
-
-setup()
-storage.audience_revision = string.rep("\0", 7) .. string.char(255)
-handlers.on_player_changed_force({ player_index = 1 })
-assert(select(3, audience(1)) == string.rep("\0", 6) .. string.char(1, 0))
-game.connected_players = {}
-for i = 1, 257 do
-  local player = setmetatable({ index = i }, { __index = players[1] })
-  game.connected_players[i] = player
-  players[i] = player
+local function gui(index, action, key, state)
+  local event = { player_index = index, element = { valid = true,
+    name = "ptt-radio-settings-" .. action, tags = { action = action, arg = key }, state = state } }
+  if action == "off" or action == "rx" then handlers.on_gui_checked_state_changed(event)
+  else handlers.on_gui_click(event) end
 end
-clear()
-emit(1, packet(1))
-expect_audience(1, "", "")
-
--- a 0.2.0 save holds only the old tables; the version bump runs on_configuration_changed
-setup()
-storage = { speakers = {}, companions = {}, open_mic = {} }
-script.configure({})
-emit(1, packet(1))
-expect_audience(1, "2,3", "0,2,3")
-handlers.on_player_joined_game({ player_index = 2 })
-assert(storage.v2 and storage.echo_sources and storage.talks and #storage.audience_revision == 8)
-assert(storage.radio and storage.radio_policy.deny)
-
--- speaker hud: a viewer's stack as row senders in screen order, «ещё N» as +N
-local function hud_root(index) return players[index].gui.screen.ptt_radio_hud end
+local function tune(index, key) gui(index, "tune", key) end
+local function off(index, value) gui(index, "off", nil, value) end
+local GEN, GEN2 = string.char(1, 2, 3, 4, 5, 6, 7, 8), string.char(1, 2, 3, 4, 5, 6, 7, 9)
+local function media(kind, revision, generation, talkspurt, opus)
+  return packet(kind, 42, (generation or GEN) .. u16(talkspurt or 1) .. (revision or storage.audience_revision) .. (opus or ""))
+end
+local function root(index) return players[index].gui.screen.ptt_radio_hud end
+local function row(index, sender) return root(index) and root(index)["ptt_radio_hud_" .. sender] end
 local function stack(index)
-  local root, out = hud_root(index), {}
-  for _, row in ipairs(root and root.children or {}) do
-    out[#out + 1] = row.name and row.name:sub(#"ptt_radio_hud_" + 1) or "+" .. row.content.children[1].caption[2]
+  local out = {}
+  for _, entry in ipairs(root(index) and root(index).children or {}) do
+    out[#out + 1] = entry.name and entry.name:sub(15) or "+" .. entry.content.children[1].caption[2]
   end
   return table.concat(out, ",")
 end
-local function content(viewer, sender) return hud_root(viewer)["ptt_radio_hud_" .. sender].content end
-local function tail(viewer, sender) return content(viewer, sender).tail end
-
--- append order, a third talker, compaction, late STOPs and the timeout
-setup()
-emit(2, v2(7, gen, 1), 1)
-emit(1, v2(7, gen2, 1), 2)
-assert(stack(1) == "2,1" and stack(2) == "2,1" and stack(3) == "2,1")
-local root = hud_root(3)
-assert(root.location.x == 1920 - 248 and root.location.y == 432)
-local icon = content(3, 2).children[1]
-assert(icon.type == "sprite" and icon.sprite == "virtual-signal/signal-each")
--- keepalives and a repeated START neither reorder nor rebuild
-emit(2, v2(8, gen, 1, "opus"), 3)
-emit(2, v2(7, gen, 1), 3)
-emit(1, v2(8, gen2, 1, "opus"), 3)
-assert(hud_root(3) == root and root.valid and stack(3) == "2,1")
-emit(3, packet(2, 5), 4)
-assert(stack(1) == "2,1,3" and stack(3) == "2,1,3")
-emit(2, v2(9, gen, 1), 5)
-assert(stack(1) == "1,3" and #hud_root(1).children == 2)
-assert(hud_root(1).location.y == 432)
--- back with a new talkspurt: to the end; the late STOP2 of the old one is rejected
-emit(2, v2(7, gen, 2), 6)
-assert(stack(1) == "1,3,2")
-emit(2, v2(9, gen, 1), 7)
--- a STOP2 of another generation and a v1 STOP from a v2 talker are rejected too
-emit(1, v2(9, gen, 1), 7)
-emit(1, packet(4), 7)
-assert(stack(1) == "1,3,2" and stack(3) == "1,3,2")
--- the tick timeout drops a lost STOP: player 1 last spoke at 3, player 3 at 4, player 2 at 6
-game.tick = 34
-nth[15]({ tick = 34 })
-assert(stack(1) == "3,2")
-game.tick = 35
-nth[15]({ tick = 35 })
-assert(stack(1) == "2")
-emit(2, v2(9, gen, 2), 36)
-assert(hud_root(1) == nil and hud_root(2) == nil and #storage.hud.rows == 0)
-
--- a new talkspurt or generation whose predecessor never closed moves the row to the end and resets its links
-setup()
-local hud_mod = require("hud")
-emit(1, v2(7, gen, 1), 1)
-emit(2, v2(7, gen2, 1), 2)
-assert(stack(3) == "1,2")
-hud_mod.set_link(players[3], 1, 2, 1, 1)
-hud_mod.set_link(players[3], 2, 2, 1, 1)
-hud_mod.set_link(players[1], 1, 2, 1, 1)
-local row_a, row_b = hud_root(3).ptt_radio_hud_1, hud_root(3).ptt_radio_hud_2
--- identical START, START2 and VOICE of the same identity keep order and elements
-emit(1, v2(7, gen, 1), 3)
-emit(1, v2(8, gen, 1, "opus"), 3)
-emit(2, v2(7, gen2, 1), 3)
-assert(stack(3) == "1,2" and hud_root(3).ptt_radio_hud_1 == row_a and hud_root(3).ptt_radio_hud_2 == row_b)
-assert(storage.hud.links[3][1] and storage.hud.links[3][2])
--- A's STOP is lost and a second talkspurt starts: order is B, A; only A's links reset
-emit(1, v2(7, gen, 2), 4)
-assert(stack(3) == "2,1" and stack(1) == "2,1" and stack(2) == "2,1")
-assert(storage.hud.links[3][1] == nil and storage.hud.links[1][1] == nil)
-assert(storage.hud.links[3][2] and hud_root(3).ptt_radio_hud_2.valid)
-assert(#storage.hud.rows == 2 and storage.speakers[1])
--- a repeat of the new talkspurt again changes nothing
-local moved_a = hud_root(3).ptt_radio_hud_1
-emit(1, v2(8, gen, 2, "opus"), 5)
-emit(1, v2(7, gen, 2), 5)
-assert(stack(3) == "2,1" and hud_root(3).ptt_radio_hud_1 == moved_a)
--- a new stream generation of B while its row exists moves it to the end as well
-hud_mod.set_link(players[3], 2, 2, 1, 1)
-emit(2, v2(7, gen2:sub(1, 7) .. "\2", 1), 6)
-assert(stack(3) == "1,2" and storage.hud.links[3][2] == nil)
-
--- a viewer outside the scope gets no row
-setup()
-players[3].force = { index = 2 }
-settings.global["ptt-radio-scope"].value = "force"
-emit(1, v2(7, gen, 1), 1)
-assert(stack(1) == "1" and stack(2) == "1" and hud_root(3) == nil)
-
--- overflow and reflow, with the server as a fourth talker
-setup()
-players[1].display_resolution = { width = 1280, height = 300 }
-emit(1, v2(7, gen, 1), 1)
-emit(2, v2(7, gen, 1), 1)
-emit(3, packet(2, 5), 1)
-emit(0, packet(2, 5), 1)
-assert(stack(1) == "1,2,+2" and stack(2) == "1,2,3,0")
-assert(hud_root(1).location.x == 1280 - 248 and hud_root(1).location.y == 120)
-local other = hud_root(2)
-players[1].display_resolution = { width = 1920, height = 1080 }
-handlers.on_player_display_resolution_changed({ player_index = 1 })
-assert(stack(1) == "1,2,3,0" and hud_root(1).location.x == 1672)
-assert(content(1, 0).children[2].caption[1] == "ptt-radio.server")
-players[1].display_scale = 2
-handlers.on_player_display_scale_changed({ player_index = 1 })
-assert(stack(1) == "1,2,3,0" and hud_root(1).location.x == 1920 - 496 and hud_root(1).location.y == 432)
-players[1].display_resolution = { width = 1920, height = 600 }
-handlers.on_player_display_resolution_changed({ player_index = 1 })
-assert(stack(1) == "1,2,+2" and hud_root(1).location.y == 240)
--- reflowing one viewer leaves the others alone
-assert(hud_root(2) == other and other.valid)
-
--- an idle echo source has no row; an active one shows the marker instead of the bars
-setup()
-emit(2, packet(1), 0)
-emit(2, packet(5, 0, "\1"), 1)
-assert(storage.echo_sources[2] and hud_root(1) == nil and hud_root(2) == nil)
-assert(players[2].gui.left.ptt_radio_echo_panel)
-emit(2, v2(7, gen, 1), 2)
-local marker = tail(1, 2)
-assert(marker.bars == nil and marker.children[1].tooltip[1] == "ptt-radio.echo-tooltip")
-emit(2, packet(5, 0, "\0"), 3)
-local bars = tail(1, 2).bars
-assert(#bars.children == 3 and players[2].gui.left.ptt_radio_echo_panel == nil)
--- the bars stay grey and unknown until a link report, which repaints them in place
-assert(bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-for _, segment in ipairs(bars.children) do assert(segment.value == 1 and segment.style.color.r == 0.45) end
-local hud = require("hud")
-hud.set_link(players[1], 2, 2, 1, 1)
-assert(tail(1, 2).bars == bars and bars.tooltip[2][1] == "ptt-radio.hud-route-1")
-assert(bars.children[2].value == 1 and bars.children[3].value == 0 and bars.children[1].style.color.g == 0.75)
-assert(tail(3, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-handlers.on_player_display_scale_changed({ player_index = 1 })
-assert(tail(1, 2).bars.children[3].value == 0)
-emit(2, v2(9, gen, 1), 4)
-assert(storage.hud.links[1][2] == nil and hud_root(1) == nil)
-
--- a 0.3.0 save: the gui.left badge goes, the echo panel stays, a saved speaker gets no row
-setup()
-storage = { speakers = { [1] = 0 }, companions = {}, open_mic = {}, v2 = {}, echo_sources = { [1] = true }, talks = {}, audience_revision = string.rep("\0", 8) }
-players[1].gui.left.add({ type = "frame", name = "ptt_radio_badge" })
-players[1].gui.left.add({ type = "frame", name = "ptt_radio_echo_panel" })
-script.configure({})
-assert(players[1].gui.left.ptt_radio_badge == nil and #players[1].gui.left.children == 1)
-assert(players[1].gui.left.ptt_radio_echo_panel and hud_root(1) == nil)
-game.tick = 31
-nth[15]({ tick = 31 })
-assert(storage.speakers[1] == nil and hud_root(2) == nil)
-
--- a 0.3.0 save has no radio tables; existing radio state survives a second configure
-setup()
-storage = { speakers = {}, companions = {}, v2 = {}, open_mic = {}, echo_sources = {}, talks = {}, audience_revision = string.rep("\0", 8) }
-script.configure({})
-assert(storage.radio and storage.radio_policy.muted and storage.radio_policy.publishers)
-storage.radio[1] = { tx = "item/iron-plate", rx = {}, presets = {} }
-storage.radio_policy.muted[2] = true
-script.configure({})
-assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
-
--- registered admin mutations reach the audience callback exactly once.
-setup()
-local revision = storage.audience_revision
-commands["radio-admin"]({ parameter = "mute 2" })
-assert(storage.radio_policy.muted[2] and storage.audience_revision ~= revision)
-revision = storage.audience_revision
-commands["radio-admin"]({ parameter = "mute 2" })
-assert(storage.audience_revision == revision)
-
-local function link_record(sender, generation, talkspurt, level, route, delay_class)
-  return u16(sender) .. generation .. u16(talkspurt) .. string.char(level, route, delay_class)
+local function status(sender, generation, talkspurt, level, route, delay)
+  return packet(0x0A, 0, string.char(1, 1) .. u16(sender) .. generation .. u16(talkspurt) .. string.char(level, route or 0, delay or 0))
 end
-local function status(...)
-  local records = { ... }
-  return packet(0x0A, 0, string.char(1, #records) .. table.concat(records))
-end
-local function byte_at(data, at, value) return data:sub(1, at - 1) .. string.char(value) .. data:sub(at + 1) end
 local function level(viewer, sender)
   local links = storage.hud.links[viewer]
   return links and links[sender] and links[sender].level
 end
-local vector_gen = string.char(1, 2, 3, 4, 5, 6, 7, 8)
-local good = link_record(2, vector_gen, 7, 3, 1, 1)
-local shared_vector = string.char(0x52, 1, 0x0A, 0, 0, 1, 1, 0, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 7, 3, 1, 1)
-assert(status(good) == shared_vector)
-
--- exact whitespace-delimited capability tokens, independent of order and future tokens
-for _, case in ipairs({
-  { "tester hud1 v2 pol1", true, true }, { "tester pol1 v2 hud1", true, true },
-  { "tester\tv2\nhud1", true, true }, { "tester v2", true, false },
-  { "tester hud1", false, true }, { "tester xv2 v20 hud10 xhud1", false, false },
-  { "", false, false },
-}) do
-  setup()
-  emit(1, packet(1, 0, case[1]))
-  assert((storage.v2[1] ~= nil) == case[2] and (storage.hud1[1] ~= nil) == case[3])
-end
-
--- no capability means unknown; the shared vector repaints only its actual reporter
-setup()
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
-assert(level(1, 2) == nil)
-emit(1, packet(1, 0, "tester v2"), 3)
-emit(1, shared_vector, 4)
-assert(level(1, 2) == nil and tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-emit(1, packet(1, 0, "tester hud1 v2 pol1"), 5)
-local own_root, other_root = hud_root(1), hud_root(3)
-local own_bars, other_bars = tail(1, 2).bars, tail(3, 2).bars
-emit(1, shared_vector, 6)
-assert(level(1, 2) == 3 and level(3, 2) == nil)
-emit(0, shared_vector, 6)
-emit(4, shared_vector, 6)
-assert(level(1, 2) == 3 and level(3, 2) == nil)
-assert(hud_root(1) == own_root and hud_root(3) == other_root and tail(1, 2).bars == own_bars)
-assert(own_bars.children[3].value == 1 and own_bars.children[1].style.color.g == 0.85)
-assert(other_bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-assert(own_bars.tooltip[2][1] == "ptt-radio.hud-route-1" and own_bars.tooltip[3][1] == "ptt-radio.hud-delay-1")
--- the reserved header field cannot select another reporter
-emit(1, packet(0x0A, 3, string.char(1, 1) .. good), 7)
-assert(level(1, 2) == 3 and level(3, 2) == nil)
-for route = 0, 3 do
-  for delay_class = 0, 3 do
-    local measured = (route + delay_class) % 4
-    emit(1, status(link_record(2, vector_gen, 7, measured, route, delay_class)), 8)
-    assert(level(1, 2) == measured)
-    assert(own_bars.tooltip[2][1] == "ptt-radio.hud-route-" .. route)
-    assert(own_bars.tooltip[3][1] == "ptt-radio.hud-delay-" .. delay_class)
-    if measured == 0 then
-      assert(own_bars.tooltip[1] == "ptt-radio.hud-link-unknown-details")
-      for _, segment in ipairs(own_bars.children) do assert(segment.style.color.r == 0.45) end
-    end
+local function find(node, name)
+  if node.name == name then return node end
+  for _, child in ipairs(node.children) do
+    local found = find(child, name)
+    if found then return found end
   end
 end
 
--- a later malformed record rejects the entire packet before the first can repaint
-emit(1, status(link_record(2, vector_gen, 7, 2, 0, 0)), 9)
-local before = storage.hud.links[1][2]
-for _, bad in ipairs({
-  "", "R", shared_vector:sub(1, 6), shared_vector:sub(1, -2), shared_vector .. "x",
-  byte_at(shared_vector, 1, 0x51), byte_at(shared_vector, 2, 2), byte_at(shared_vector, 6, 2),
-  byte_at(shared_vector, 7, 2), byte_at(shared_vector, 20, 4), byte_at(shared_vector, 21, 4), byte_at(shared_vector, 22, 4),
-  packet(0x0A, 0, string.char(1, 33) .. string.rep(good, 33)),
-  status(good, link_record(2, vector_gen, 7, 4, 0, 0)),
-  status(good, link_record(2, vector_gen, 7, 1, 4, 0)),
-  status(good, link_record(2, vector_gen, 7, 1, 0, 4)),
-}) do
-  emit(1, bad, 10)
-  assert(storage.hud.links[1][2] == before and level(1, 2) == 2)
+-- heartbeats preserve settings drafts, including unrelated capability/version changes.
+setup()
+handlers["ptt-radio-settings-open"]({ player_index = 1 })
+local window = players[1].gui.screen["ptt-radio-settings-window"]
+local target, picker = find(window, "ptt-radio-admin-target"), find(window, "ptt-radio-admin-signal")
+local kind, mode = find(window, "ptt-radio-admin-kind"), find(window, "ptt-radio-admin-deny-mode")
+target.text, picker.elem_value, kind.selected_index, mode.selected_index = "draft player", { type = "item", name = "iron-plate" }, 2, 1
+local pane = window.children[2]
+pane.vertical_scroll_position = 123
+players[1].opened = picker
+for _, body in ipairs({ "tester hud1 pol1 v2", "next-version pol1 v2", "next-version hud1 pol1" }) do
+  hello(1, body)
+  assert(players[1].gui.screen["ptt-radio-settings-window"] == window and window.valid)
+  assert(players[1].opened == picker and target.text == "draft player" and picker.elem_value.name == "iron-plate")
+  assert(kind.selected_index == 2 and mode.selected_index == 1 and pane.vertical_scroll_position == 123)
 end
-emit(1, status(), 11)
-assert(storage.hud.links[1][2] == before)
-local maximum = packet(0x0A, 0, string.char(1, 32) .. string.rep(good, 32))
-assert(#maximum == 487)
-emit(1, maximum, 12)
-assert(level(1, 2) == 3)
+hello(1, "old hud1 v2")
+assert(not window.valid and players[1].gui.screen["ptt-radio-settings-window"] ~= window)
 
--- mismatched records are ignored individually; only active current identities qualify
-emit(3, packet(2), 13)
-emit(1, status(link_record(1, vector_gen, 7, 1, 0, 0), link_record(2, gen, 7, 1, 0, 0),
-  link_record(3, vector_gen, 7, 3, 0, 0), link_record(2, vector_gen, 6, 1, 0, 0), link_record(2, vector_gen, 7, 2, 2, 0)), 13)
-assert(level(1, 1) == nil and level(1, 2) == 2 and level(1, 3) == nil)
-local current = storage.hud.links[1][2]
-emit(2, v2(9, vector_gen, 6), 14)
-assert(storage.hud.links[1][2] == current)
-emit(2, v2(7, vector_gen, 8), 15)
-assert(level(1, 2) == nil)
-emit(1, shared_vector, 16)
-assert(level(1, 2) == nil)
-emit(1, status(link_record(2, vector_gen, 8, 3, 3, 0)), 17)
-local current_row, current_link = hud_root(1).ptt_radio_hud_2, storage.hud.links[1][2]
-emit(2, v2(7, vector_gen, 8), 18)
-assert(hud_root(1).ptt_radio_hud_2 == current_row and storage.hud.links[1][2] == current_link)
-emit(2, v2(7, gen, 1), 19)
-assert(level(1, 2) == nil)
-emit(1, status(link_record(2, vector_gen, 8, 3, 0, 0)), 20)
-assert(level(1, 2) == nil)
-emit(1, status(link_record(2, gen, 1, 2, 2, 0)), 21)
-emit(2, v2(9, vector_gen, 8), 22)
-assert(level(1, 2) == 2)
-emit(2, v2(9, gen, 1), 23)
-assert(level(1, 2) == nil and stack(1) == "3")
-emit(1, status(link_record(2, gen, 1, 3, 0, 0)), 24)
-assert(level(1, 2) == nil and stack(1) == "3")
+-- an unchanged heartbeat uses cached policy, with zero eligibility work at each size.
+for _, count in ipairs({ 16, 32, 64 }) do
+  setup(count, true)
+  for index = 1, count do storage.companions[index], storage.pol1[index] = 0, true end
+  local channels, calls = require("channels"), 0
+  local eligible = channels.eligible
+  channels.eligible = function(...)
+    calls = calls + 1
+    return eligible(...)
+  end
+  handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" })
+  assert(calls >= count * count)
+  local snapshot, epoch = storage.policy_snapshot, storage.audience_revision
+  calls = 0
+  clear(); hello(1, "version-changed pol1")
+  assert(calls == 0 and storage.policy_snapshot == snapshot and storage.audience_revision == epoch)
+  assert(#to(1, 0x15) == 1 and #to(2, 0x15) == 0)
+  local _, _, _, _, cached = policy(1)
+  clear(); hello(1, "version-next hud1 pol1 v2")
+  assert(calls == 0 and select(5, policy(1)) == cached)
+  hello(1, "old v2")
+  assert(calls >= count * count and storage.audience_revision ~= epoch)
+  channels.eligible = eligible
+end
 
--- a repeat hello keeps identity/ui; capability loss and disconnect clear only that receiver
+-- capabilities are whole whitespace-delimited tokens, independent of order/version.
+for _, case in ipairs({
+  { "tester hud1 v2 pol1", true, true, true }, { "tester pol1 v2 hud1", true, true, true },
+  { "tester\tv2\nhud1\tpol1", true, true, true }, { "tester v2", true, false, false },
+  { "tester hud1", false, true, false }, { "tester xv2 v20 hud10 xhud1 pol10 xpol1", false, false, false },
+  { "", false, false, false },
+}) do
+  setup(3, true)
+  hello(1, case[1])
+  assert((storage.v2[1] == true) == case[2] and (storage.hud1[1] == true) == case[3] and (storage.pol1[1] == true) == case[4])
+end
+
+-- cold/old clients receive no policy or audio; signaling remains independent.
+setup(3, true)
+for _, body in ipairs({ "", "tester v2", "tester pol10 xpol1" }) do
+  hello(1, body); assert(not storage.pol1[1] and #to(1, 0x15) == 0)
+end
+emit(1, packet(6, 3, "opaque\0signal"))
+assert(to(3, 0x13)[1] == packet(0x13, 1, "opaque\0signal"))
+emit(0, packet(1, 45678))
+assert(storage.hub_port == 45678 and not storage.pol1[0])
+clear(); emit(1, packet(6, 0, "hub")); assert(sent[1].port == 45678 and sent[1].target == 0)
+clear(); emit(0, packet(6, 2, "from hub")); assert(to(2, 0x13)[1] == packet(0x13, 0, "from hub"))
+clear(); hello(1); expect(1, "", "", 1)
+hello(2); expect(1, "2", "2", 1); expect(2, "1", "1", 1)
+assert(#to(3, 0x15) == 0)
+clear(); emit(1, media(0x0B)); assert(#to(2, 0x0B) == 1 and #to(3) == 0)
+for _, old in ipairs({ packet(2), packet(3, 1, "opus"), packet(4), packet(7, 42, GEN .. u16(1)), packet(8, 42, GEN .. u16(1) .. "opus"), packet(9, 42, GEN .. u16(1)) }) do
+  clear(); emit(1, old); emit(0, old); assert(#sent == 0)
+end
+clear(); emit(0, media(0x0B)); assert(#sent == 0 and not storage.talks[0])
+clear(); emit(2, packet(6, 65535, string.rep("x", 1200))); assert(#sent == 4)
+for _, entry in ipairs(sent) do assert(#entry.data == 1205 and entry.data:byte(3) == 0x13) end
+clear()
+for _, bad in ipairs({ "", "R", string.char(0x51, 1, 6, 0, 2), string.char(0x52, 2, 6, 0, 2),
+  packet(6, 2, string.rep("x", 1201)), packet(6, 99, "absent"), packet(0x13, 2, "forged") }) do emit(1, bad) end
+assert(#sent == 0)
+emit(1, packet(6, 3, packet(0x15, 0, "nested")))
+assert(to(3, 0x13)[1] == packet(0x13, 1, packet(0x15, 0, "nested")))
+clear(); emit(0, packet(1, 100)); emit(0, packet(1, 45678, "body")); assert(#sent == 0 and storage.hub_port == 45678)
+emit(0, packet(1, 0)); assert(storage.hub_port == 34555)
+local epoch = storage.audience_revision
+clear(); hello(1, "next pol1 v2 hud1"); assert(storage.audience_revision == epoch and #to(2, 0x15) == 0)
+local talk = storage.talks[1]
+hello(1, "old v2"); assert(storage.audience_revision ~= epoch and not storage.speakers[1] and talk.closed)
+expect(2, "", "", 1)
+
+-- media capabilities do not hide game HUD/clicks from eligible old/offline viewers.
+setup(3, true)
+hello(1); hello(2, "tester v2")
+clear(); emit(1, media(0x0B))
+assert(row(2, 1) and row(3, 1) and #sounds == 2 and #to(2) == 0 and #to(3) == 0)
+tune(2, "item/iron-plate"); assert(not row(2, 1) and row(3, 1))
+local previous = storage.audience_revision
+tune(2, "ptt/any")
+clear(); emit(1, media(0x0B, previous))
+assert(not row(2, 1) and row(3, 1) and #sounds == 0)
+emit(1, media(0x0C, nil, GEN, 1, "opus"))
+assert(row(2, 1) and #sounds == 1 and sounds[1].index == 2 and #to(2) == 0)
+off(3, true); assert(not row(3, 1))
+off(3, false); assert(not row(3, 1))
+emit(1, media(0x0C, nil, GEN, 1, "opus")); assert(row(3, 1) and #to(3) == 0)
+
+-- real handlers publish a canonical shared vector and every global revision.
+setup(2)
+players[1].mod_settings["ptt-radio-echo"].value = true
+storage.audience_revision = string.rep("\0", 7) .. "\6"
+storage.policy_snapshot, storage.previous_policy = nil, nil
+clear(); hello(1)
+local _, _, _, _, vector = policy(1)
+assert(vector == string.char(0x52, 1, 0x15, 0, 0, 1) .. string.rep("\0", 7) .. "\7" .. string.char(3) .. u16(1) .. u16(2) .. u16(1) .. u16(2))
+local old = storage.audience_revision
+clear(); tune(1, "item/iron-plate")
+assert(storage.audience_revision ~= old and #to(1, 0x15) == 1 and #to(2, 0x15) == 1)
+expect(1, "", "", 3); expect(2, "", "", 1)
+clear(); commands["radio-admin"]({ parameter = "mute 1" }); expect(1, "", "", 0)
+assert(#to(2, 0x15) == 1)
+clear(); commands["radio-admin"]({ parameter = "mute 1" }); assert(#sent == 0)
+commands["radio-admin"]({ parameter = "unmute 1" })
+commands["radio-admin"]({ parameter = "deny 1 item/iron-plate rx" })
+expect(1, "", "", 1)
+assert(require("channels").tx_permitted(1))
+off(1, true); expect(1, "", "", 0)
+assert(not require("channels").eligible(0, 1))
+clear(); emit(1, media(0x0B)); assert(#sent == 0 and not storage.speakers[1])
+
+-- prior pair eligibility is immutable, including self flags and no future/skipped window.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(3, packet(1, 0, "tester v2 hud1 pol1"))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
-emit(3, status(link_record(2, vector_gen, 7, 1, 0, 0)), 3)
-local own, other = storage.hud.links[1][2], storage.hud.links[3][2]
-local row = hud_root(1).ptt_radio_hud_2
-emit(1, packet(1, 0, "tester-next pol1 v2 hud1"), 4)
-assert(storage.hud.links[1][2] == own and hud_root(1).ptt_radio_hud_2 == row)
-emit(1, packet(1, 0, "tester v2 pol1"), 5)
-assert(level(1, 2) == nil and storage.hud.links[3][2] == other)
-emit(1, shared_vector, 6)
-assert(level(1, 2) == nil)
-emit(1, packet(1, 0, "tester hud1 v2"), 7)
-emit(1, shared_vector, 8)
-players[1].connected = false
-emit(1, status(link_record(2, vector_gen, 7, 1, 0, 0)), 9)
-assert(level(1, 2) == 3)
-handlers.on_player_left_game({ player_index = 1 })
-assert(storage.hud1[1] == nil and level(1, 2) == nil and storage.hud.links[3][2] == other)
-
--- companion timeout clears reporter capability and its cached measurements
+local previous = storage.audience_revision
+tune(3, "item/iron-plate")
+clear(); emit(1, media(0x0B, previous)); assert(row(2, 1) and not row(3, 1) and #to(3) == 0)
+assert(#sounds == 1 and sounds[1].index == 2)
+local current = storage.audience_revision
+clear(); emit(1, media(0x0C, current, GEN, 1, "opus")); assert(#to(2, 0x0C) == 1)
+gui(3, "rx", "ptt/any", true)
+clear(); emit(1, media(0x0B, current)); assert(not row(3, 1) and #to(3) == 0)
+emit(1, media(0x0C, nil, GEN, 1, "opus")); assert(row(3, 1))
+local root3 = root(3)
+clear(); emit(1, media(0x0D, current)); assert(not row(2, 1) and row(3, 1) and root(3) == root3)
+assert(#to(2, 0x0D) == 1 and #to(3) == 0)
+emit(1, media(0x0D)); assert(not storage.speakers[1] and not row(3, 1))
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
-emit(2, v2(8, vector_gen, 7, "opus"), 960)
-nth[60]({ tick = 960 })
-assert(storage.hud1[1] == nil and storage.companions[1] == nil and level(1, 2) == nil)
-assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-emit(1, shared_vector, 961)
-assert(level(1, 2) == nil)
+players[1].mod_settings["ptt-radio-echo"].value = true
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-echo", player_index = 1 })
+previous = storage.audience_revision
+players[1].mod_settings["ptt-radio-echo"].value = false
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-echo", player_index = 1 })
+clear(); emit(1, media(0x0B, previous)); assert(#to(1) == 0 and #to(2, 0x0B) == 1)
+local state = storage.talks[1]
+for _, revision in ipairs({ string.rep("\255", 8), string.rep("\0", 8) }) do
+  clear(); emit(1, media(0x0B, revision, GEN2, 2)); assert(#sent == 0 and storage.talks[1] == state)
+end
+storage.audience_revision = string.rep("\0", 7) .. "\99"
+clear(); emit(1, media(0x0C, previous, GEN, 1, "opus")); assert(#sent == 0)
 
--- eligibility comes from the injected predicate, including future radio-off/denial state
+-- revocation discards membership and link state; regrant needs newly accepted media.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(3, packet(1, 0, "tester hud1 v2"))
-emit(2, v2(7, vector_gen, 7), 1)
-players[3].force.index = 2
+emit(1, media(0x0B)); emit(2, status(1, GEN, 1, 3))
+assert(row(2, 1) and level(2, 1) == 3)
+off(2, true); assert(not row(2, 1) and not level(2, 1))
+off(2, false); assert(not row(2, 1) and not storage.talks[1].visible[2] and row(3, 1))
+emit(1, media(0x0C, nil, GEN, 1, "opus")); assert(row(2, 1))
+
+-- validation completes before generation/talkspurt, row or sound mutation.
+setup()
+for _, bad in ipairs({ "", "R", media(0x0B):sub(1, 22), media(0x0B) .. "x", media(0x0D) .. "x", media(0x0C), media(0x0C, nil, GEN, 1, string.rep("x", 1157)), packet(0x15, 0, "forged") }) do
+  clear(); emit(1, bad); assert(#sent == 0 and not storage.talks[1] and #sounds == 0)
+end
+emit(1, media(0x0C, nil, GEN, 65535, string.rep("x", 1156))); assert(storage.talks[1])
+emit(1, media(0x0B, nil, GEN, 0)); assert(storage.talks[1].talkspurt == 0)
+local before = storage.talks[1]
+for _, bad in ipairs({ media(0x0D, nil, GEN, 65535), media(0x0B, nil, GEN, 65535), media(0x0D, nil, GEN2, 0), media(0x0D, nil, GEN, 1) }) do
+  clear(); emit(1, bad); assert(#sent == 0 and storage.talks[1] == before and not before.closed)
+end
+emit(1, media(0x0B, nil, GEN2, 1)); clear(); emit(1, media(0x0B, nil, GEN, 2)); assert(#sent == 0)
+emit(1, media(0x0D, nil, GEN2, 1)); assert(not storage.speakers[1])
+clear(); emit(1, media(0x0B, nil, GEN2, 1)); assert(#sent == 0)
+setup()
+for index = 1, 17 do emit(1, media(0x0B, nil, string.rep("\0", 7) .. string.char(index)), index) end
+assert(storage.talks[1].retired_count == 16)
+clear(); emit(1, media(0x0B, nil, string.rep("\0", 7) .. "\18"), 18); assert(#sent == 0)
+hello(1); game.tick = 3660; nth[60]({ tick = 3660 }); assert(not storage.talks[1])
+
+-- surface follows physical travel, not remote view; force remains the outer boundary.
+setup()
+tune(1, "ptt/here"); tune(2, "ptt/here")
+local epoch = storage.audience_revision
+clear(); handlers.on_player_changed_surface({ player_index = 2, surface_index = 90 })
+assert(storage.audience_revision == epoch and #sent == 0)
+players[2].physical_surface.index = 2
+handlers.on_player_changed_surface({ player_index = 2, surface_index = 90 })
+expect(1, "", "", 1); expect(2, "", "", 1)
+players[2].physical_surface.index = 1; handlers.on_player_changed_surface({ player_index = 2 })
+expect(1, "2", "2", 1)
+players[2].force.index = 2; settings.global["ptt-radio-scope"].value = "force"
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" }); expect(1, "", "", 1)
+settings.global["ptt-radio-scope"].value = "all"
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" }); expect(1, "2", "2", 1)
 settings.global["ptt-radio-scope"].value = "force"
-handlers.on_player_changed_force({ player_index = 3 })
-emit(3, shared_vector, 2)
-emit(1, shared_vector, 2)
-assert(level(3, 2) == nil and level(1, 2) == 3 and hud_root(3) == nil)
-local hud_links = require("hud")
-local visible = hud_links.visible
-hud_links.visible = function(sender, viewer) return viewer ~= 1 and visible(sender, viewer) end
-handlers.on_player_changed_force({ player_index = 1 })
-emit(1, shared_vector, 3)
-assert(level(1, 2) == nil and hud_root(1) == nil)
-hud_links.visible = visible
-handlers.on_player_changed_force({ player_index = 1 })
-assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-scope" })
+players[2].force.index = 1
+handlers.on_player_changed_force({ player_index = 2 }); expect(1, "2", "2", 1)
+players[2].force.index = 2
+handlers.on_player_changed_force({ player_index = 2 }); expect(1, "", "", 1)
+players[2].force.index = 1
+handlers.on_forces_merged({}); expect(1, "2", "2", 1)
+commands["radio-admin"]({ parameter = "channel fluid/water" })
+tune(2, "fluid/water"); expect(2, "", "", 0)
+commands["radio-admin"]({ parameter = "publisher add 2" }); expect(2, "1,3", "", 1)
+clear(); emit(2, media(0x0B)); assert(row(1, 2) and row(3, 2))
+commands["radio-admin"]({ parameter = "mute 2" }); clear(); emit(2, media(0x0C, nil, GEN, 1, "opus")); assert(#sent == 0 and not storage.speakers[2])
 
--- five-second expiry is exact, independent per receiver, and refreshed by a four-second heartbeat
+-- promotion and demotion immediately publish admin-channel authority and refresh controls.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(3, packet(1, 0, "tester hud1 v2"))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 10)
-emit(3, shared_vector, 20)
-local first_bars, third_bars = tail(1, 2).bars, tail(3, 2).bars
-game.tick = 309; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == 3 and level(3, 2) == 3)
-game.tick = 310; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == nil and level(3, 2) == 3 and tail(1, 2).bars == first_bars)
-assert(first_bars.tooltip[1] == "ptt-radio.hud-link-unknown")
-game.tick = 320; handlers.on_tick({ tick = game.tick })
-assert(level(3, 2) == nil and tail(3, 2).bars == third_bars)
-emit(1, shared_vector, 330)
-game.tick = 569; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == 3)
-emit(1, shared_vector, 570)
-game.tick = 630; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == 3)
-game.tick = 869; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == 3)
-game.tick = 870; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == nil)
+commands["radio-admin"]({ parameter = "channel fluid/water" })
+tune(2, "fluid/water"); expect(2, "", "", 0)
+handlers["ptt-radio-settings-open"]({ player_index = 2 })
+local window = players[2].gui.screen["ptt-radio-settings-window"]
+assert(not find(window, "ptt-radio-admin-section"))
+players[2].admin = true
+clear(); handlers.on_player_promoted({ player_index = 2 })
+expect(2, "1,3", "", 1)
+assert(#to(1, 0x15) == 1 and #to(3, 0x15) == 1 and not window.valid)
+window = players[2].gui.screen["ptt-radio-settings-window"]
+assert(find(window, "ptt-radio-admin-section"))
+emit(2, media(0x0B)); assert(row(1, 2))
+players[2].admin = false
+clear(); handlers.on_player_demoted({ player_index = 2 })
+expect(2, "", "", 0)
+expect(1, "3", "3", 1)
+assert(not storage.speakers[2] and not row(1, 2) and not window.valid)
+assert(not find(players[2].gui.screen["ptt-radio-settings-window"], "ptt-radio-admin-section"))
+clear(); emit(2, media(0x0C, nil, GEN, 1, "opus")); assert(#sent == 0)
 
--- echo still replaces the bars; hidden measurements expire before the bars return
+-- current media changes icons in place; previous media retains its original channel.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(2, packet(1))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
-emit(2, packet(5, 0, "\1"), 3)
-assert(tail(1, 2).bars == nil)
-emit(1, status(link_record(2, vector_gen, 7, 2, 1, 0)), 4)
-assert(level(1, 2) == 2 and tail(1, 2).bars == nil)
-game.tick = 304; handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == nil and tail(1, 2).bars == nil)
-emit(2, packet(5, 0, "\0"), 305)
-assert(tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+gui(2, "rx", "item/iron-plate", true); gui(3, "rx", "item/iron-plate", true)
+local previous = storage.audience_revision
+tune(1, "item/iron-plate")
+emit(1, media(0x0B, previous)); assert(storage.talks[1].channel == "ptt/any")
+emit(2, status(1, GEN, 1, 2, 1, 1))
+local old_row, old_root = row(2, 1), root(2)
+local icon, bars = old_row.content.children[1], old_row.content.tail.bars
+local link = storage.hud.links[2][1]
+emit(1, media(0x0C, nil, GEN, 1, "opus"))
+assert(row(2, 1) == old_row and root(2) == old_root and icon.sprite == "item/iron-plate" and icon.tooltip == "item/iron-plate")
+assert(old_row.content.tail.bars == bars and storage.hud.links[2][1] == link)
+local order = stack(2)
+emit(1, media(0x0B)); emit(1, media(0x0C, previous, GEN, 1, "opus"))
+assert(stack(2) == order and row(2, 1) == old_row and icon.sprite == "item/iron-plate")
+local previous = storage.audience_revision
+tune(1, "ptt/any")
+emit(1, media(0x0C, nil, GEN, 1, "opus")); assert(storage.talks[1].channel == "ptt/any")
+emit(1, media(0x0B, previous, GEN, 2)); assert(storage.talks[1].channel == "item/iron-plate")
 
--- the existing lost-stop timeout also clears quality and a stale report cannot reopen a row
+-- active identity, append/restart order, compaction, reflow and exact quality expiry.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
-game.tick = 32; nth[15]({ tick = game.tick })
-assert(level(1, 2) == nil and hud_root(1) == nil)
-emit(1, shared_vector, 33)
-assert(level(1, 2) == nil and hud_root(1) == nil)
+emit(2, media(0x0B), 1); emit(1, media(0x0B, nil, GEN2), 2)
+assert(stack(3) == "2,1")
+local old_row = row(3, 2)
+emit(2, media(0x0B), 3); assert(row(3, 2) == old_row and stack(3) == "2,1")
+local epoch = storage.audience_revision
+hello(3); assert(row(3, 2) == old_row and storage.audience_revision == epoch)
+emit(2, media(0x0B, nil, GEN, 2), 4); assert(stack(3) == "1,2")
+emit(3, status(2, GEN, 2, 3, 1, 1), 10); assert(level(3, 2) == 3)
+local bars = row(3, 2).content.tail.bars
+emit(3, status(2, GEN, 1, 1), 11); assert(level(3, 2) == 3)
+emit(3, status(2, GEN2, 2, 1), 11); assert(level(3, 2) == 3)
+local valid = status(2, GEN, 2, 2, 2, 1)
+for _, bad in ipairs({ valid:sub(1, -2), valid .. "x", status(2, GEN, 2, 4), status(2, GEN, 2, 2, 4), status(2, GEN, 2, 2, 0, 4), packet(0x0A, 0, string.char(2, 0)), packet(0x0A, 0, string.char(1, 33) .. string.rep(valid:sub(8), 33)), packet(0x0A, 0, string.char(1, 2) .. valid:sub(8) .. status(2, GEN, 2, 4):sub(8)) }) do
+  emit(3, bad, 12); assert(level(3, 2) == 3)
+end
+emit(3, valid, 20); assert(level(3, 2) == 2 and row(3, 2).content.tail.bars == bars)
+local maximum = packet(0x0A, 0, string.char(1, 32) .. string.rep(valid:sub(8), 32))
+assert(#maximum == 487); emit(3, maximum, 20); assert(level(3, 2) == 2)
+emit(0, status(2, GEN, 2, 1), 20); emit(99, status(2, GEN, 2, 1), 20); assert(level(3, 2) == 2)
+game.tick = 319; handlers.on_tick({ tick = 319 }); assert(level(3, 2) == 2)
+game.tick = 320; handlers.on_tick({ tick = 320 }); assert(not level(3, 2) and row(3, 2).content.tail.bars == bars)
+emit(3, valid, 321); emit(2, packet(5, 0, "\1"), 322); assert(not row(3, 2).content.tail.bars)
+emit(2, packet(5, 0, "\0"), 323); assert(row(3, 2).content.tail.bars)
+players[3].display_resolution = { width = 1280, height = 300 }
+handlers.on_player_display_resolution_changed({ player_index = 3 }); assert(root(3).location.x == 1032)
+emit(2, media(0x0D, nil, GEN, 1), 324); assert(row(3, 2))
+emit(2, media(0x0D, nil, GEN, 2), 325); assert(not row(3, 2) and not level(3, 2))
+game.tick = 356; nth[15]({ tick = 356 }); assert(not root(3))
 
--- configuration preserves dated reports, while an undated old cached link expires immediately
+-- overflow/reflow keeps earliest activation order; a later restart appends.
+setup(4)
+players[1].display_resolution = { width = 1280, height = 300 }
+for index = 1, 4 do emit(index, media(0x0B), index) end
+assert(stack(1) == "1,2,+2" and stack(2) == "1,2,3,4")
+players[1].display_resolution = { width = 1920, height = 1080 }
+handlers.on_player_display_resolution_changed({ player_index = 1 })
+assert(stack(1) == "1,2,3,4" and root(1).location.x == 1672)
+players[1].display_scale = 2; handlers.on_player_display_scale_changed({ player_index = 1 })
+assert(root(1).location.x == 1424 and stack(1) == "1,2,3,4")
+emit(2, media(0x0D)); assert(stack(3) == "1,3,4")
+
+-- microphone/half-duplex wiring and liveness remain independent of routing policy.
 setup()
-emit(1, packet(1, 0, "tester hud1 v2"))
-emit(2, v2(7, vector_gen, 7), 1)
-emit(1, shared_vector, 2)
+handlers.on_lua_shortcut({ prototype_name = "ptt-radio-open-mic", player_index = 1 })
+assert(storage.open_mic[1] and to(1, 0x11)[1]:byte(6) == 1)
+clear(); hello(1); assert(to(1, 0x11)[1]:byte(6) == 1)
+players[1].mod_settings["ptt-radio-half-duplex"].value = false
+handlers.on_runtime_mod_setting_changed({ setting = "ptt-radio-half-duplex", player_index = 1 })
+assert(to(1, 0x12)[#to(1, 0x12)]:byte(6) == 0)
+emit(1, packet(5, 0, "\1")); assert(storage.echo_sources[1] and players[1].gui.left.ptt_radio_echo_panel and not root(2))
+emit(1, packet(5, 0, "\2")); assert(storage.echo_sources[1])
+game.tick = 900; nth[60]({ tick = 900 }); assert(storage.companions[1] and storage.open_mic[1])
+game.tick = 960; nth[60]({ tick = 960 }); assert(not storage.companions[1] and not storage.open_mic[1] and not storage.hud1[1] and not storage.pol1[1] and not storage.echo_sources[1])
+clear(); emit(1, packet(6, 0, "expired hub")); assert(#sent == 0)
+
+-- capability loss, heartbeat expiry and malformed late reports never reopen rows.
+setup()
+emit(2, media(0x0B)); emit(1, status(2, GEN, 1, 3), 10); emit(3, status(2, GEN, 1, 2), 20)
+local other = storage.hud.links[3][2]
+hello(1, "tester pol1 v2"); assert(not level(1, 2) and storage.hud.links[3][2] == other)
+emit(1, status(2, GEN, 1, 3), 21); assert(not level(1, 2))
+hello(1); emit(1, status(2, GEN, 1, 3), 30)
+game.tick = 269; handlers.on_tick({ tick = 269 }); assert(level(1, 2) == 3)
+emit(1, status(2, GEN, 1, 3), 270)
+game.tick = 569; handlers.on_tick({ tick = 569 }); assert(level(1, 2) == 3)
+game.tick = 570; handlers.on_tick({ tick = 570 }); assert(not level(1, 2))
+game.tick = 571; nth[15]({ tick = 571 }); assert(not row(1, 2))
+emit(1, status(2, GEN, 1, 3), 572); assert(not level(1, 2) and not row(1, 2))
+
+-- route/delay tooltips cover every enum, including measured zero's grey unknown details.
+setup()
+emit(2, media(0x0B))
+local bars = row(1, 2).content.tail.bars
+assert(bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+for route = 0, 3 do
+  for delay = 0, 3 do
+    local measured = (route + delay) % 4
+    emit(1, status(2, GEN, 1, measured, route, delay))
+    assert(level(1, 2) == measured and row(1, 2).content.tail.bars == bars)
+    assert(bars.tooltip[2][1] == "ptt-radio.hud-route-" .. route and bars.tooltip[3][1] == "ptt-radio.hud-delay-" .. delay)
+    assert(bars.tooltip[1] == (measured == 0 and "ptt-radio.hud-link-unknown-details" or "ptt-radio.hud-link"))
+    if measured == 0 then
+      for _, segment in ipairs(bars.children) do
+        assert(segment.value == 1 and segment.style.color.r == 0.45 and segment.style.color.g == 0.45 and segment.style.color.b == 0.45)
+      end
+    end
+  end
+end
+clear(); emit(1, packet(0x0A, 3, status(2, GEN, 1, 3, 1, 1):sub(6)))
+assert(level(1, 2) == 3 and not level(3, 2))
+
+-- configure retains dated measurements and expires undated cached measurements.
+setup()
+emit(2, media(0x0B)); emit(1, status(2, GEN, 1, 3), 2)
+local link = storage.hud.links[1][2]
 script.configure({})
-assert(level(1, 2) == 3 and storage.hud1[1])
-storage.hud.next_expiry, storage.hud.links[1][2].tick = nil, nil
-script.configure({})
-handlers.on_tick({ tick = game.tick })
-assert(level(1, 2) == nil and tail(1, 2).bars.tooltip[1] == "ptt-radio.hud-link-unknown")
+assert(storage.hud.links[1][2] == link and link.tick == 2 and level(1, 2) == 3)
+storage.hud.next_expiry, link.tick = nil, nil
+script.configure({}); handlers.on_tick({ tick = game.tick })
+assert(not level(1, 2) and row(1, 2).content.tail.bars.tooltip[1] == "ptt-radio.hud-link-unknown")
 
-print("control.lua: routing, audience, identity, plaque, hud, hud quality, admin wiring, bounds, expiry and migration passed")
+-- bounds, unsigned carry/overflow rejection, capability loss, leave and save migration.
+setup(258, true)
+for index = 1, 258 do storage.companions[index], storage.pol1[index] = 0, true end
+clear(); hello(1); expect(1, "", "", 0)
+setup()
+storage.audience_revision = string.rep("\0", 7) .. "\255"
+clear(); tune(1, "item/iron-plate"); assert(storage.audience_revision == string.rep("\0", 6) .. "\1\0")
+storage.audience_revision = string.rep("\255", 8)
+local old_snapshot = storage.policy_snapshot
+clear(); local ok, err = pcall(tune, 1, "ptt/any")
+assert(not ok and tostring(err):find("revision exhausted", 1, true) and storage.audience_revision == string.rep("\255", 8) and storage.policy_snapshot == old_snapshot and #sent == 0)
+setup()
+emit(1, media(0x0B)); players[2].connected = false; table.remove(game.connected_players, 2)
+handlers.on_player_left_game({ player_index = 2 }); assert(not storage.pol1[2])
+players[2].connected = true; game.connected_players[#game.connected_players + 1] = players[2]
+handlers.on_player_joined_game({ player_index = 2 }); hello(2)
+expect(2, "1,3", "1,3", 1)
+game.tick = 960; nth[60]({ tick = 960 }); assert(not storage.pol1[1] and not storage.companions[1])
+setup()
+storage.radio[1] = { tx = "item/iron-plate", rx = {}, presets = {} }
+storage.channel_policy_active = nil
+storage.speakers[1], storage.talks[1] = 1, { generation = GEN }
+players[1].gui.left.add({ type = "frame", name = "ptt_radio_badge" })
+script.configure({}); assert(storage.radio[1].tx == "item/iron-plate" and not storage.speakers[1] and not storage.talks[1] and not players[1].gui.left.ptt_radio_badge)
+local epoch = storage.audience_revision
+storage.radio[1].tx = "ptt/any"
+script.configure({}); assert(storage.audience_revision ~= epoch and storage.policy_snapshot[1].channel == "ptt/any")
+
+-- 0.2.0 bare storage and 0.3.0 radio state migrate without reviving saved talks.
+for _, version in ipairs({ "0.2.0", "0.3.0" }) do
+  local saved = { speakers = { [1] = 0 }, companions = {}, open_mic = {} }
+  if version == "0.3.0" then
+    saved.v2, saved.echo_sources, saved.talks = {}, { [1] = true }, { [1] = { generation = GEN } }
+    saved.radio = { [1] = { tx = "item/iron-plate", rx = {}, presets = {} } }
+    saved.radio_policy = { muted = { [2] = true } }
+  end
+  setup(3, true, saved)
+  players[1].gui.left.add({ type = "frame", name = "ptt_radio_badge" })
+  local echo = version == "0.3.0" and players[1].gui.left.add({ type = "frame", name = "ptt_radio_echo_panel" })
+  script.configure({ mod_changes = { ["ptt-radio"] = { old_version = version, new_version = "0.4.0" } } })
+  assert(storage.channel_policy_active and storage.pol1 and storage.physical_surfaces and storage.policy_snapshot)
+  assert(storage.radio_policy.deny and not storage.speakers[1] and not storage.talks[1] and not root(1))
+  assert(not players[1].gui.left.ptt_radio_badge)
+  if echo then
+    assert(players[1].gui.left.ptt_radio_echo_panel == echo and echo.valid and storage.echo_sources[1])
+    assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
+  end
+  hello(1); assert(#to(1, 0x15) >= 1)
+end
+
+-- same-version stale saves initialize at their first writable event, without configure.
+for _, first in ipairs({ "hello", "surface", "tick", "nth", "admin" }) do
+  local saved = { speakers = {}, companions = {}, open_mic = {}, radio = {
+    [1] = { tx = "ptt/here", rx = {}, presets = {} }, [2] = { tx = "ptt/here", rx = {}, presets = {} },
+  }, radio_policy = { muted = { [3] = true } } }
+  setup(3, true, saved)
+  assert(storage == saved and storage.pol1 == nil and storage.channel_policy_active == nil)
+  if first == "hello" then hello(1)
+  elseif first == "surface" then
+    players[2].physical_surface.index = 2
+    handlers.on_player_changed_surface({ player_index = 2 })
+  elseif first == "tick" then handlers.on_tick({ tick = 0 })
+  elseif first == "admin" then
+    commands["radio-admin"]({ parameter = "mute 2" })
+    assert(storage.radio_policy.muted[2])
+  else nth[15]({ tick = 0 }) end
+  assert(storage.pol1 and storage.physical_surfaces[2] == players[2].physical_surface.index and storage.policy_snapshot)
+  assert(storage.radio[1].tx == "ptt/here" and storage.radio_policy.muted[3] and storage.channel_policy_active)
+  local snapshot, surfaces = storage.policy_snapshot, storage.physical_surfaces
+  hello(1); hello(2)
+  snapshot = storage.policy_snapshot
+  hello(1); handlers.on_tick({ tick = 1 })
+  assert(storage.policy_snapshot == snapshot and storage.physical_surfaces == surfaces)
+end
+
+setup(3, true, { speakers = {}, companions = {}, open_mic = {} })
+commands["radio-admin"]({ parameter = "mute 2" })
+assert(storage.channel_policy_active and storage.radio_policy.muted[2] and storage.policy_snapshot)
+local snapshot = storage.policy_snapshot
+commands["radio-admin"]({ parameter = "mute 2" })
+assert(storage.policy_snapshot == snapshot)
+
+-- exported bytes are generated by the real producer after real settings handlers.
+if arg[2] == "--groups" then
+  setup(4)
+  tune(1, "item/iron-plate"); tune(2, "item/iron-plate")
+  tune(3, "item/copper-plate"); tune(4, "item/copper-plate")
+  clear()
+  for index = 1, 4 do hello(index) end
+  for index = 1, 4 do
+    local _, _, _, _, data = policy(index)
+    local hex = data:gsub(".", function(byte) return string.format("%02x", byte:byte()) end)
+    print("group-policy " .. index .. " " .. hex)
+  end
+end
+print("control.lua: live channel policy, window, wire, hud, quality, events and migration passed")

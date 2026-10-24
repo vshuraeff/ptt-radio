@@ -21,8 +21,8 @@
 
 У мода нет часов, и он не должен их имитировать. Любые таймауты считаются через `game.tick`. Во время сохранения и паузы тики стоят, поэтому таймаут не сработает ложно на измеренной задержке в 600 мс.
 
-- `storage.speakers[player_index] = last_tick`: выставляется на `START` и на каждом `VOICE`, снимается на `END`.
-- `script.on_nth_tick(15)` снимает говорящего, если `game.tick - last_tick > 30` (0,5 с игрового времени), и рассылает синтетический STOP старым слушателям (без токена ` v2` в HELLO). Это страховка на случай, если компаньон упал посреди передачи: без неё у слушателей зависло бы воспроизведение. Замерено: STOP приходит через ~590 мс после последнего кадра.
+- `storage.speakers[player_index] = last_tick`: выставляется после принятого `START3`/`VOICE3`, снимается на `STOP3`.
+- `script.on_nth_tick(15)` снимает HUD говорящего, если `game.tick - last_tick > 30` (0,5 с игрового времени). Синтетический legacy STOP больше не рассылается: активные каналы требуют versioned policy media, а очередь компаньона сама закрывается при потере отправителя.
 
 ### Обработка пакета
 
@@ -40,12 +40,28 @@ end)
 
 `fan_out(sender, payload)` для каждого `q` из `game.connected_players` вызывает `helpers.send_udp(port_q, header(sender) .. body, q.index)`. Отправитель исключается, если у него не включён эхо-режим. `port_q` берётся из per-user настройки `ptt-radio-companion-port` (по умолчанию 34555). Настройки игроков синхронизированы, так что это детерминированно. Каждая машина фактически отправляет только одну копию, своему компаньону.
 
-Область вещания задаёт map-настройка `ptt-radio-scope`: `all` (по умолчанию) или `force` (только своя команда). Это тоже локальный фильтр в `fan_out`.
+Область вещания задаёт map-настройка `ptt-radio-scope`: `all` (по умолчанию) или `force` (только своя команда). Это внешняя граница для каналов, её прежний смысл и значение по умолчанию сохранены.
+
+### Каналы и политика воспроизведения
+
+`channels.eligible(sender, listener)` определяет игровые копии, HUD, щелчки и множества POLICY. ANY — общий канал по умолчанию, не wildcard. RX состоит из TX, дополнительных подписок и обязательного админ-канала, пока рация включена. «Здесь» сравнивает `physical_surface`; событие просмотра другой поверхности при неизменной физической поверхности не меняет ревизию. Обычный `SignalID`, включая сигнал планеты, задаёт статический канал. Серверная политика может запрещать передачу/приём, глушить передатчик и ограничивать выбор. Полудуплекс глушит весь вывод при удержанном PTT, включая админ-канал; исключения с приоритетным звуком нет.
+
+`channels.tx_permitted` отдельно проверяет присутствие, off, mute, TX-deny и право вещания на админ-канале. RX-only deny не выключает передачу другим слушателям. POLICY bit 0 приходит из этой проверки; bit 1 дополнительно требует собственное эхо и self eligibility. Пустой send set не означает mute. При off очищены оба множества и оба флага. Правило off для источника 0 сохранено, но нынешний хаб — только сигнализация и непрозрачный relay, он не производит звук. Его пятибайтовый HELLO не объявляет медиавозможность; серверному источнику звука в будущем нужен отдельный явный контракт регистрации.
+
+Живые каналы требуют токен `pol1` в HELLO. Старые компаньоны исключены из медиамножеств и не получают legacy/v2 копий; окно настроек предлагает обновление. При этом подходящие по каналам зрители видят HUD и слышат игровые щелчки даже без компаньона или со старой версией: для них сохраняется отдельный снимок eligibility. SIGNAL и регистрация хаба работают независимо от медиаправ. Каждая изменившаяся глобальная ревизия уходит всем подключённым `pol1` компаньонам, включая неизменившихся получателей. Ревизия хранится как восемь байт, перенос считается побайтно; переполнение отвергается. Идентичный HELLO не меняет ревизию или существующие HUD-элементы.
+
+Повторный HELLO при неизменных присутствии и `pol1` отправляет сохранённый POLICY без пересчёта пар игроков и не перестраивает открытое окно настроек: черновик, выбор сигнала и прокрутка остаются на месте. Изменение только `hud1`, `v2` или строки версии не затрагивает настройки и POLICY; потеря возможности HUD по-прежнему очищает измерения этого зрителя. Повышение и понижение администратора сразу пересчитывают права админ-канала и обновляют открытые элементы администрирования.
+
+Версия мода 0.4.0 мигрирует сохранения 0.2.0 и 0.3.0: сохраняет радио, политику и личную панель эха, но удаляет старые активные разговоры и заново строит снимок. Если сохранение без новых таблиц загружено без события конфигурации, первый доступ из записываемого обработчика выполняет ту же инициализацию. В `on_load` записей нет; последующие события проверяют только маркер инициализации, без повторного обхода игроков.
+
+Мод хранит неизменяемые снимки текущей и предыдущей политики. Предыдущая используется только при числовой смежности и разрешении пары в обеих политиках, self — с обоими наборами TX/self флагов. Будущие и пропущенные эпохи не угадываются. До изменения generation/talkspurt/HUD проверены формат, длина, capability, TX и ревизия. HUD хранит членство слушателей после принятых пакетов: старый START не открывает строку новому слушателю, старый STOP снимает её только для разрешённого пересечения. Отзыв удаляет это членство и link state; повторное разрешение ждёт нового принятого голоса. Значок канала меняется на месте первым текущим пакетом после смены TX, без перестановки строки и сброса качества.
+
+Каналы регулируют воспроизведение у честных клиентов, а не конфиденциальность: игровой Opus остаётся реплицированным input action и доступен изменённому клиенту. Границы лабораторных измерений и wire-схема приведены в Companion policy transitions ниже.
 
 ### Плашка, звуки, клавиши
 
-- **Плашка.** Фрейм в `player.gui.left` у каждого игрока, по одному `label` на говорящего, `style.font_color = speaker.color`. Перестраивается только из событий: смена набора говорящих, `on_player_joined_game`, `on_player_left_game`, `on_player_color_changed` (новое в 2.1). Себя тоже показывает, как в Dota. Говорящий с `player_index == 0` выводится как «Сервер»: так эмулятор на стороне Docker может проверять плашку, пока второго клиента нет.
-- **Источник эха.** Компаньон шлёт `ECHO_STATE` (`0x05`), когда его эхоподавитель включён на найденном пути динамики → микрофон этого игрока. Мод хранит флаг в `storage.echo_sources[player_index]` и показывает его только картинкой, в чат не пишет никогда (ни `print`, ни `game.print`, ни `player.print`). Плашка: пока флаг стоит, строка игрока есть у каждого зрителя (с учётом `in_scope`), даже если он молчит; она красная, с глифом `[img=item/programmable-speaker]` и подсказкой «эхо от динамиков». Личная панель в `gui.left` только у самого источника: красный текст «Микрофон слышит динамики…» и кнопка «Выключить открытый микрофон», которая вызывает тот же `set_open_mic(player, false)`, что и кнопка быстрого доступа; при уже выключенном открытом микрофоне кнопка скрыта (PTT-пользователь с динамиками тоже источник, панель остаётся без кнопки). Флаг и панель снимаются при `ECHO_STATE 0`, когда компаньон пропал (15 с без HELLO) и на `on_player_left_game`; на входе панель создаётся заново, если флаг стоит. Перестраивается только на смену флага и на события плашки.
+- **Плашка.** Стопка строк в `gui.screen` у правого края: значок TX-канала, имя в `chat_color`, качество или метка эха. Новый разговор получает место в конце, повторы его не переставляют; принятый STOP и таймаут убирают строку. Переполнение показывает «ещё N», разрешение и масштаб пересчитывают вместимость. Своя визуальная строка не требует self-monitor звука, но требует разрешённую передачу и channel eligibility.
+- **Источник эха.** Компаньон шлёт `ECHO_STATE` (`0x05`) при обнаруженном пути динамики → микрофон. Флаг `storage.echo_sources` заменяет качество меткой эха только в активной строке; молчащий источник не создаёт HUD-строку. Личная панель в `gui.left` показывает предупреждение и кнопку выключения открытого микрофона; при уже выключенном микрофоне кнопка скрыта. Флаг и панель снимаются при `ECHO_STATE 0`, потере компаньона или выходе игрока. В чат обнаружение эха не печатается.
 - **Щелчок рации.** `player.play_sound` на `START` и `END` у слушателей, без участия компаньона. Звуки задаются в `data.lua` как `SoundPrototype`. В v0.1 можно взять встроенные пути `utility/...`, свои `.ogg` добавить позже.
 - **Переключатель открытого микрофона.** Кнопка `ptt-radio-open-mic` на панели быстрого доступа (`shortcut`, `toggleable`) и клавиша `custom-input` `ptt-radio-toggle-mic`, по умолчанию `ALT + V`. В v0.1 стояла `ALT + T`, но в 2.1 она открывает экран технологий. Желаемое состояние хранится в `storage.open_mic` и показывается подсветкой кнопки (`set_shortcut_toggled`). Компаньону уходит `MIC_STATE` с явным байтом состояния, а не «переключи»: так перезапущенный компаньон не расходится с кнопкой. Удержание PTT ловит компаньон, потому что `custom-input` не сообщает об отпускании, а `associated_control_input` у кнопки только подписывает клавишу в подсказке.
 - **Присутствие компаньона.** Компаньон шлёт HELLO раз в 5 с всё время работы. Мод хранит тик последнего HELLO в `storage.companions`. На каждый HELLO он отвечает ростером, `MIC_STATE` и `HALF_DUPLEX`, а при первом HELLO пишет игроку «компаньон подключён». После 15 с игрового времени без HELLO мод считает компаньон пропавшим: снимает открытый микрофон и пишет об этом игроку. Нажатие кнопки без живого компаньона ничего не переключает и объясняет, что запустить. Отличить «компаньон не запущен» от «игра без `--enable-lua-udp`» мод не может: без флага `send_udp`/`recv_udp` молча ничего не делают.
@@ -65,7 +81,7 @@ Lua 5.2 в Factorio не имеет `string.pack`, поэтому заголов
 | 3–4 | номер кадра, u16 big-endian (для VOICE; в START/END — номер последнего; для ECHO_STATE `0`) |
 | 5… | тело: Opus-кадр для VOICE, версия компаньона для HELLO (с токеном ` v2` у компаньона с v2-медиа), один байт для ECHO_STATE |
 
-`HELLO`: тело — строка версии компаньона. Компаньон, который принимает игровые START2/VOICE2/STOP2, дописывает к ней токен ` v2` (пробел и `v2`), например `ptt-radio-companion 0.4.0 v2`. На каждый HELLO игрока мод заново выставляет флаг `storage.v2[player_index]`: он стоит, только если тело кончается этим токеном. Флаг снимается вместе с записью компаньона (15 с без HELLO, выход игрока). Пока HELLO с токеном не пришёл, компаньон считается старым. Регистрация хаба (игрок 0, ровно 5 байт) флаг не ставит.
+`HELLO`: тело — строка версии и отдельных whitespace-токенов возможностей. Текущий компаньон отправляет `ptt-radio-companion <ver> hud1 pol1 v2`; мод разбирает токены независимо от порядка. `pol1` разрешает участие в активном медиаконтракте, `hud1` — отчёты качества. Возможности обновляются каждым HELLO и снимаются при потере компаньона; их изменение пересчитывает политику. Пятибайтовая регистрация хаба (игрок 0) не объявляет эти возможности. Таблицы базовых legacy-пакетов здесь описывают сохранённую совместимость компаньона; активный мод принимает только START3/VOICE3/STOP3, чья полная схема приведена ниже.
 
 `ECHO_STATE`: тело — один байт, `0` эха нет, `1` эхоподавитель компаньона включён на найденном пути динамики → микрофон этого игрока. Компаньон шлёт его при каждой смене и вместе с каждым HELLO (раз в 5 с). Мод игнорирует тело иной длины и иные значения, а также `ECHO_STATE` от компаньона, не приславшего HELLO: снять такой флаг было бы нечему. Версия протокола остаётся `1`.
 
@@ -676,9 +692,28 @@ The same run measured A↔B double talk against a separate no-event control on D
 | Hub | 1 / 1 samples | 1 / 1 samples | 1 / 1 samples | 33.262 / 33.615 ms |
 | Game | 1 / 1 samples | 1 / 1 samples | 1 / 1 samples | 82.460 / 82.080 ms |
 
-The fixture checks each companion's installed revisions 8 and 9, selected route, more than 10 actual route sends during the measured interval, and correlated transmit/receive timestamps; this run observed 75 route sends per companion in every session. Its delayed Game copy cannot substitute for the Direct/Hub delivery bands. It reuses the existing network lab unchanged. These observations come from the three ignored process tests in `tests/policy_playout.rs`, run serially under the shared realtime lock; deterministic contracts remain in the debug suite.
+The fixture checks each companion's installed revisions 8 and 9, selected route, more than 10 actual route sends during the measured interval, and correlated transmit/receive timestamps; this run observed 75 route sends per companion in every session. Its delayed Game copy cannot substitute for the Direct/Hub delivery bands. It reuses the existing network lab unchanged. These observations come from the three ignored transition process tests in `tests/policy_playout.rs`, run serially under the shared realtime lock; deterministic contracts remain in the debug suite.
 
 The virtual callback's already consumed 10 ms chunk is outside the companion's control. The speaker WAV includes this chunk and silence; `--record-received` is before buffering and cannot measure this tail. These are virtual-device timeline measurements, not physical DAC latency. Physical output requests a 5 ms callback where supported, but host clamping/default buffers and hardware latency were not measured or accessed for this change.
+
+### Live channel group measurement
+
+On 2026-10-24, `lua_channel_groups_are_audible_internally_and_isolated_on_direct_and_game` ran four real companions with AEC off and virtual speaker output. The real Lua handler suite selected iron for players 1/2 and copper for 3/4, then exported the actual POLICY bytes. The fixture decoded those bytes, delivered them to the companions and used their send sets for Game-copy recipients. Lua forwarding is separately exercised by its real-handler tests; this process bridge does not run Factorio or invoke Lua for every live media packet.
+
+All four microphones transmitted distinct tones (660, 880, 1170 and 1490 Hz). Each 6.2–8.0 s steady-state speaker window needed its peer tone above amplitude 0.03, both foreign-group tones below −40 dB relative to that peer, and no silence run of 10 ms. Accepted `rx` records had to name only the in-group peer. Selected-route traces, more than 20 actual route sends and correlated delivery times had to agree with Direct or Game. The run observed:
+
+| Route | Listener ← peer | Peer amplitude | Stronger foreign tone | Delivery median | Route sends |
+| --- | --- | --- | --- | --- | --- |
+| Direct | 1 ← 2 | 0.29179 | −74.46 dB | 6.506 ms | 97 |
+| Direct | 2 ← 1 | 0.29120 | −74.24 dB | 6.604 ms | 97 |
+| Direct | 3 ← 4 | 0.29034 | −81.16 dB | 11.858 ms | 97 |
+| Direct | 4 ← 3 | 0.29109 | −71.92 dB | 11.972 ms | 97 |
+| Game | 1 ← 2 | 0.29179 | −74.02 dB | 82.245 ms | 97 |
+| Game | 2 ← 1 | 0.29122 | −73.89 dB | 82.290 ms | 96 |
+| Game | 3 ← 4 | 0.29041 | −82.20 dB | 82.366 ms | 97 |
+| Game | 4 ← 3 | 0.29109 | −73.46 dB | 82.479 ms | 97 |
+
+There were no cross-group accepted receives in those windows. This proves positive in-group playback and isolation for the tested honest-client policies and virtual routes, not physical DAC behavior or confidentiality against modified clients. Each process exits after 8.5 s with a 12 s fixture watchdog; the complete four-test playback run used the shared realtime lock and an outer deadline. A later Lua-only repair preserved HUD/click visibility for eligible viewers without a current companion; its exported group POLICY bytes were checked byte-for-byte unchanged from this measured run.
 
 ### Relay hub
 

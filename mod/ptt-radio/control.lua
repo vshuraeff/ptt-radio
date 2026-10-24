@@ -19,22 +19,18 @@ local MAGIC = 0x52
 local VERSION = 1
 
 local HELLO = 0x01
-local START = 0x02
-local VOICE = 0x03
-local STOP = 0x04
 local ROSTER = 0x10
 local MIC_STATE = 0x11
 local HALF_DUPLEX = 0x12
 local ECHO_STATE = 0x05
 local SIGNAL_OUT = 0x06
-local START2 = 0x07
-local VOICE2 = 0x08
-local STOP2 = 0x09
 local HUD_STATUS = 0x0A
+local START3, VOICE3, STOP3 = 0x0B, 0x0C, 0x0D
 local SIGNAL_IN = 0x13
-local AUDIENCE = 0x14
+local POLICY = 0x15
 local MAX_SIGNAL_BODY = 1200
 local MAX_OPUS = 1164
+local MAX_POLICY_OPUS = MAX_OPUS - 8
 local MAX_RETIRED_GENERATIONS = 16
 
 local STALE_TICKS = 30
@@ -42,14 +38,21 @@ local STALE_TICKS = 30
 local COMPANION_TIMEOUT_TICKS = 15 * 60
 -- the gui.left speaker frame of 0.3.0 and earlier, removed on configuration change
 local OLD_BADGE = "ptt_radio_badge"
--- every talkspurt is on the common channel until u4 passes the sender's tx key
-local CHANNEL = "ptt/any"
 local SHORTCUT = "ptt-radio-open-mic"
 local SETTINGS_SHORTCUT = "ptt-radio-settings"
 local ECHO_PANEL = "ptt_radio_echo_panel"
 local ECHO_OFF_BUTTON = "ptt_radio_echo_open_mic_off"
 local START_SOUND = "utility/gui_click"
 local STOP_SOUND = "utility/list_box_click"
+local set_speaking
+local ensure_storage
+
+local function on_event(events, handler)
+  script.on_event(events, function(event)
+    ensure_storage()
+    handler(event)
+  end)
+end
 
 local function u16(value)
   return string.char(math.floor(value / 256) % 256, value % 256)
@@ -77,16 +80,9 @@ local function send_to_companion(index, data)
   end
 end
 
-local function in_scope(sender_index, viewer)
-  if sender_index == 0 or settings.global["ptt-radio-scope"].value == "all" then
-    return true
-  end
-  local sender = game.get_player(sender_index)
-  return sender ~= nil and sender.force.index == viewer.force.index
-end
-
 hud.visible = function(sender_index, viewer_index)
-  return in_scope(sender_index, game.get_player(viewer_index))
+  local talk = storage.talks[sender_index]
+  return channels.eligible(sender_index, viewer_index) and talk and talk.visible and talk.visible[viewer_index] == true
 end
 
 local function render_all_huds()
@@ -128,9 +124,10 @@ local function set_echo(player_index, on)
   end
 end
 
-local function play_for_listeners(sender_index, path)
+local function play_for_listeners(sender_index, path, listeners)
   for _, viewer in pairs(game.connected_players) do
-    if viewer.index ~= sender_index and in_scope(sender_index, viewer) then
+    if viewer.index ~= sender_index and channels.eligible(sender_index, viewer.index)
+      and (not listeners or listeners[viewer.index]) then
       viewer.play_sound({ path = path })
     end
   end
@@ -159,52 +156,120 @@ local function send_roster_to_all()
   send_roster(0)
 end
 
-local function send_audience(index)
-  local player = index ~= 0 and game.get_player(index) or nil
-  local send_to, receive_from = {}, index == 0 and {} or { 0 }
-  for _, other in pairs(game.connected_players) do
-    if other.index ~= index then
-      if in_scope(index, other) then
-        send_to[#send_to + 1] = other.index
-      end
-      if player and in_scope(other.index, player) then
-        receive_from[#receive_from + 1] = other.index
+local function valid_index(index)
+  return type(index) == "number" and index >= 0 and index <= 65535 and index % 1 == 0
+end
+
+local function next_revision(revision)
+  local bytes = { string.byte(revision, 1, 8) }
+  for i = 8, 1, -1 do
+    if bytes[i] < 255 then
+      bytes[i] = bytes[i] + 1
+      return string.char(table.unpack(bytes))
+    end
+    bytes[i] = 0
+  end
+  return nil
+end
+
+local function media_ready(index)
+  return valid_index(index) and storage.companions[index] ~= nil and storage.pol1[index] == true
+end
+
+local function policy_snapshot()
+  local snapshot, indices = {}, { 0 }
+  for _, player in pairs(game.connected_players) do
+    if valid_index(player.index) then indices[#indices + 1] = player.index end
+  end
+  table.sort(indices)
+  for _, index in ipairs(indices) do
+    local ready = media_ready(index)
+    local row = { send_to = {}, receive_from = {}, receive = {}, hears = {}, tx = ready and channels.tx_permitted(index), channel = channels.tx(index) }
+    local player = index ~= 0 and game.get_player(index) or nil
+    row.self = row.tx and player ~= nil and player.mod_settings["ptt-radio-echo"].value
+      and channels.eligible(index, index) or false
+    local hud_members = {}
+    for _, other in ipairs(indices) do
+      if channels.eligible(other, index) then
+        row.hears[other] = true
+        hud_members[#hud_members + 1] = u16(other)
       end
     end
+    row.hud_body = table.concat(hud_members)
+    if ready then
+      for _, other in ipairs(indices) do
+        if other ~= index and media_ready(other) then
+          if channels.eligible(index, other) then row.send_to[#row.send_to + 1] = other end
+          if channels.eligible(other, index) then row.receive_from[#row.receive_from + 1] = other end
+        end
+      end
+    end
+    if #row.send_to > 256 or #row.receive_from > 256 then
+      row.send_to, row.receive_from, row.tx, row.self = {}, {}, false, false
+    end
+    local body = { string.char((row.tx and 1 or 0) + (row.self and 2 or 0)), u16(#row.send_to) }
+    for _, other in ipairs(row.send_to) do body[#body + 1] = u16(other) end
+    body[#body + 1] = u16(#row.receive_from)
+    for _, other in ipairs(row.receive_from) do
+      body[#body + 1] = u16(other)
+      row.receive[other] = true
+    end
+    row.body = table.concat(body)
+    snapshot[index] = row
   end
-  table.sort(send_to)
-  table.sort(receive_from)
-  -- fail closed if the roster exceeds the codec's canonical set bound
-  if #send_to > 256 or #receive_from > 256 then
-    send_to, receive_from = {}, {}
+  return snapshot
+end
+
+local function send_audience(index)
+  local row = storage.policy_snapshot and storage.policy_snapshot[index]
+  if media_ready(index) and row then
+    send_to_companion(index, header(POLICY, 0) .. string.char(1) .. storage.audience_revision .. row.body)
   end
-  local body = { storage.audience_revision, u16(#send_to) }
-  for _, index in ipairs(send_to) do body[#body + 1] = u16(index) end
-  body[#body + 1] = u16(#receive_from)
-  for _, index in ipairs(receive_from) do body[#body + 1] = u16(index) end
-  send_to_companion(index, header(AUDIENCE, 0) .. table.concat(body))
 end
 
 local function audience_changed()
-  local bytes = { string.byte(storage.audience_revision, 1, 8) }
-  for i = 8, 1, -1 do
-    bytes[i] = (bytes[i] + 1) % 256
-    if bytes[i] ~= 0 then break end
+  local snapshot, old = policy_snapshot(), storage.policy_snapshot
+  local changed = old == nil
+  for index, row in pairs(snapshot) do
+    local before = old and old[index]
+    changed = changed or not before or before.body ~= row.body or before.channel ~= row.channel
+      or before.hud_body ~= row.hud_body
   end
-  storage.audience_revision = string.char(table.unpack(bytes))
-  for _, player in pairs(game.connected_players) do
-    send_audience(player.index)
+  for index in pairs(old or {}) do changed = changed or snapshot[index] == nil end
+  if changed then
+    local revision = assert(next_revision(storage.audience_revision), "ptt-radio policy revision exhausted")
+    storage.previous_policy = old and { revision = storage.audience_revision, players = old } or nil
+    storage.policy_snapshot, storage.audience_revision = snapshot, revision
+    for index in pairs(storage.speakers) do
+      if not snapshot[index] or not snapshot[index].tx then
+        set_speaking(index, false, true)
+        if storage.talks[index] then storage.talks[index].closed = true end
+      end
+    end
+    for sender, talk in pairs(storage.talks) do
+      for viewer in pairs(talk.visible or {}) do
+        local row = snapshot[viewer]
+        local permitted = row and row.hears[sender]
+        if not permitted then
+          talk.visible[viewer] = nil
+          local links = storage.hud.links[viewer]
+          if links then links[sender] = nil end
+        end
+      end
+    end
+    -- every epoch reaches every capable companion, even when its own sets are unchanged.
+    for _, player in pairs(game.connected_players) do send_audience(player.index) end
+    send_audience(0)
+    render_all_huds()
   end
-  send_audience(0)
+  return changed
 end
 
 -- a policy change also re-derives every open settings window's disabled controls
 admin.configure(function()
-  render_all_huds()
   audience_changed()
   for _, player in pairs(game.connected_players) do settings_gui.refresh(player) end
 end)
-admin.register()
 settings_gui.configure(audience_changed, admin.render)
 
 local function forward_signal(sender_index, payload)
@@ -258,13 +323,13 @@ local function companion_seen(player, tick)
   send_roster(player.index)
   send_mic_state(player)
   send_half_duplex(player)
-  send_audience(player.index)
 end
 
 local function forget_companion(player_index)
   storage.companions[player_index] = nil
   storage.v2[player_index] = nil
   storage.hud1[player_index] = nil
+  storage.pol1[player_index] = nil
   storage.open_mic[player_index] = nil
   set_echo(player_index, false)
   storage.talks[player_index] = nil
@@ -275,15 +340,18 @@ local function forget_companion(player_index)
 end
 
 local function hello_capabilities(player, payload)
-  local v2, hud1
+  local v2, hud1, pol1
   for token in string.gmatch(string.sub(payload, 6), "%S+") do
     if token == "v2" then v2 = true end
     if token == "hud1" then hud1 = true end
+    if token == "pol1" then pol1 = true end
   end
-  if storage.v2[player.index] ~= v2 or storage.hud1[player.index] ~= hud1 then
+  if storage.v2[player.index] ~= v2 or storage.hud1[player.index] ~= hud1 or storage.pol1[player.index] ~= pol1 then
     hud.clear_links(player)
   end
-  storage.v2[player.index], storage.hud1[player.index] = v2, hud1
+  local policy_changed = storage.pol1[player.index] ~= pol1
+  storage.v2[player.index], storage.hud1[player.index], storage.pol1[player.index] = v2, hud1, pol1
+  return policy_changed
 end
 
 local function receive_hud_status(reporter, payload)
@@ -308,29 +376,25 @@ local function receive_hud_status(reporter, payload)
   end
 end
 
-local LEGACY_KIND = { [START2] = START, [VOICE2] = VOICE, [STOP2] = STOP }
+local function pair_allowed(snapshot, sender, listener)
+  local row = snapshot and snapshot[listener]
+  if not row then return false end
+  if sender == listener then return row.tx and row.self end
+  return row.receive[sender] == true
+end
 
--- each listener gets one representation of a sender: a v2 companion gets v2 frames
--- and never a v1 copy of a v2 sender; a legacy companion gets v2 frames as v1, with
--- sequence and opus kept and generation and talkspurt dropped
-local function fan_out(sender_index, kind, payload, legacy_only)
+local function fan_out(sender_index, kind, payload, previous)
   local out = header(kind, sender_index) .. string.sub(payload, 4)
-  local legacy_kind = LEGACY_KIND[kind]
-  local legacy = legacy_kind and header(legacy_kind, sender_index) .. string.sub(payload, 4, 5) .. string.sub(payload, 16) or out
-  local to_v2 = not legacy_only and (legacy_kind ~= nil or not storage.v2[sender_index])
   for _, listener in pairs(game.connected_players) do
-    local is_sender = listener.index == sender_index
-    if (not is_sender or listener.mod_settings["ptt-radio-echo"].value) and in_scope(sender_index, listener) then
-      if not storage.v2[listener.index] then
-        helpers.send_udp(companion_port(listener), legacy, listener.index)
-      elseif to_v2 then
-        helpers.send_udp(companion_port(listener), out, listener.index)
-      end
+    if channels.eligible(sender_index, listener.index)
+      and pair_allowed(storage.policy_snapshot, sender_index, listener.index)
+      and (not previous or pair_allowed(previous, sender_index, listener.index)) then
+      helpers.send_udp(companion_port(listener), out, listener.index)
     end
   end
 end
 
-local function set_speaking(sender_index, speaking, quiet, restart)
+set_speaking = function(sender_index, speaking, quiet, restart)
   local was = storage.speakers[sender_index] ~= nil
   if speaking then
     storage.speakers[sender_index] = game.tick
@@ -339,39 +403,78 @@ local function set_speaking(sender_index, speaking, quiet, restart)
   end
   -- only a transition touches the hud, so keepalives never reorder or rebuild rows
   if was ~= speaking then
-    if speaking then hud.start(sender_index, CHANNEL) else hud.stop(sender_index) end
+    if speaking then hud.start(sender_index, storage.talks[sender_index].channel) else hud.stop(sender_index) end
     if not quiet then play_for_listeners(sender_index, speaking and START_SOUND or STOP_SOUND) end
   elseif speaking and restart then
     -- a new talkspurt or generation while the old one never closed
-    hud.start(sender_index, CHANNEL, true)
+    hud.start(sender_index, storage.talks[sender_index].channel, true)
+  elseif speaking then
+    hud.start(sender_index, storage.talks[sender_index].channel)
   end
 end
 
-local function accept_v2(sender_index, kind, payload)
-  if (kind == VOICE2 and (#payload < 16 or #payload > 15 + MAX_OPUS))
-    or (kind ~= VOICE2 and #payload ~= 15) then return false end
+local function accept_policy(sender_index, kind, payload)
+  if not media_ready(sender_index) then return false end
+  if (kind == VOICE3 and (#payload < 24 or #payload > 23 + MAX_POLICY_OPUS))
+    or (kind ~= VOICE3 and #payload ~= 23) then return false end
+  local current = storage.policy_snapshot
+  local sender = current and current[sender_index]
+  if not sender or not sender.tx then return false end
+  local revision, previous = string.sub(payload, 16, 23), nil
+  if revision ~= storage.audience_revision then
+    local old = storage.previous_policy
+    if not old or old.revision ~= revision or next_revision(old.revision) ~= storage.audience_revision then return false end
+    previous = old.players
+    if not previous[sender_index] or not previous[sender_index].tx then return false end
+  end
   local generation = string.sub(payload, 6, 13)
   local talkspurt = read_u16(payload, 14)
   local talk = storage.talks[sender_index]
   local repeated = talk and talk.generation == generation and talk.talkspurt == talkspurt and not talk.closed
   if not talk or talk.generation ~= generation then
-    if kind == STOP2 or (talk and talk.retired[generation]) then return false end
+    if kind == STOP3 or (talk and talk.retired[generation]) then return false end
     local retired = talk and talk.retired or {}
     local count = talk and talk.retired_count or 0
     if talk and count >= MAX_RETIRED_GENERATIONS then return false end
     if talk then retired[talk.generation] = true end
-    talk = { generation = generation, talkspurt = talkspurt, retired = retired, retired_count = talk and count + 1 or 0, closed = false }
+    talk = { generation = generation, talkspurt = talkspurt, retired = retired, retired_count = talk and count + 1 or 0, closed = false, visible = {}, stopped = {} }
     storage.talks[sender_index] = talk
   else
     local delta = (talkspurt - talk.talkspurt) % 65536
     if delta >= 32768 or (delta == 0 and talk.closed) then return false end
-    if kind == STOP2 and delta ~= 0 then return false end
-    if delta > 0 then talk.talkspurt, talk.closed = talkspurt, false end
+    if kind == STOP3 and delta ~= 0 then return false end
+    if delta > 0 then
+      talk.talkspurt, talk.closed, talk.visible, talk.stopped, talk.channel = talkspurt, false, {}, {}, nil
+    end
+  end
+  local activated, stopped = {}, {}
+  for _, player in pairs(game.connected_players) do
+    local index = player.index
+    -- visual/click eligibility includes viewers without a voice-capable companion.
+    local allowed = current[index] and current[index].hears[sender_index]
+      and (not previous or previous[index] and previous[index].hears[sender_index])
+    if allowed then
+      if kind == STOP3 then
+        if talk.visible[index] then stopped[index] = true end
+        talk.visible[index], talk.stopped[index] = nil, true
+      elseif not talk.stopped[index] then
+        if not talk.visible[index] then activated[index] = true end
+        talk.visible[index] = true
+      end
+    end
+  end
+  if not previous or not talk.channel then
+    talk.channel = previous and previous[sender_index].channel or sender.channel
   end
   talk.last_tick = game.tick
-  talk.closed = kind == STOP2
-  set_speaking(sender_index, not talk.closed, repeated and kind ~= STOP2, not repeated)
-  return true
+  talk.closed = kind == STOP3 and next(talk.visible) == nil
+  set_speaking(sender_index, next(talk.visible) ~= nil, true, not repeated)
+  if next(activated) then play_for_listeners(sender_index, START_SOUND, activated) end
+  if next(stopped) then play_for_listeners(sender_index, STOP_SOUND, stopped) end
+  for _, player in pairs(game.connected_players) do
+    if activated[player.index] or stopped[player.index] then hud.render(player) end
+  end
+  return true, previous
 end
 
 local function init_storage()
@@ -380,15 +483,34 @@ local function init_storage()
   -- companions whose HELLO announced v2 game media; the rest are legacy
   storage.v2 = storage.v2 or {}
   storage.hud1 = storage.hud1 or {}
+  storage.pol1 = storage.pol1 or {}
   storage.open_mic = storage.open_mic or {}
   storage.echo_sources = storage.echo_sources or {}
   storage.talks = storage.talks or {}
   storage.audience_revision = storage.audience_revision or string.rep(string.char(0), 8)
+  if not storage.channel_policy_active then
+    storage.channel_policy_active = true
+    storage.speakers, storage.talks, storage.hud = {}, {}, nil
+    storage.policy_snapshot, storage.previous_policy = nil, nil
+  end
+  storage.physical_surfaces = storage.physical_surfaces or {}
+  for _, player in pairs(game.connected_players) do
+    storage.physical_surfaces[player.index] = player.physical_surface.index
+  end
   hud.init()
   channels.init()
   settings_gui.init()
 end
 
+ensure_storage = function()
+  if not storage.channel_policy_active then
+    init_storage()
+    render_all_huds()
+    audience_changed()
+  end
+end
+
+admin.register(ensure_storage)
 script.on_init(init_storage)
 script.on_configuration_changed(function()
   init_storage()
@@ -397,14 +519,15 @@ script.on_configuration_changed(function()
     if badge then badge.destroy() end
   end
   render_all_huds()
+  audience_changed()
 end)
 
-script.on_event(defines.events.on_tick, function(event)
+on_event(defines.events.on_tick, function(event)
   helpers.recv_udp()
   hud.expire(event.tick)
 end)
 
-script.on_event(defines.events.on_udp_packet_received, function(event)
+on_event(defines.events.on_udp_packet_received, function(event)
   local payload = event.payload
   local magic, version, kind = string.byte(payload, 1, 3)
   if #payload < 5 or magic ~= MAGIC or version ~= VERSION then
@@ -427,25 +550,18 @@ script.on_event(defines.events.on_udp_packet_received, function(event)
       end
     elseif sender_index ~= 0 then
       local player = game.get_player(sender_index)
-      hello_capabilities(player, payload)
+      local changed = hello_capabilities(player, payload) or not storage.companions[player.index]
       companion_seen(player, event.tick)
+      if not ((changed or not storage.policy_snapshot) and audience_changed()) then send_audience(player.index) end
+      if changed then settings_gui.refresh(player) end
     end
   elseif kind == HUD_STATUS then
     receive_hud_status(sender_index, payload)
   elseif kind == SIGNAL_OUT then
     forward_signal(sender_index, payload)
-  elseif kind == START2 or kind == VOICE2 or kind == STOP2 then
-    if accept_v2(sender_index, kind, payload) then fan_out(sender_index, kind, payload) end
-  elseif kind == START or kind == VOICE then
-    if not storage.talks[sender_index] then
-      set_speaking(sender_index, true)
-    end
-    fan_out(sender_index, kind, payload)
-  elseif kind == STOP then
-    if not storage.talks[sender_index] then
-      set_speaking(sender_index, false)
-    end
-    fan_out(sender_index, kind, payload)
+  elseif kind == START3 or kind == VOICE3 or kind == STOP3 then
+    local accepted, previous = accept_policy(sender_index, kind, payload)
+    if accepted then fan_out(sender_index, kind, payload, previous) end
   elseif kind == ECHO_STATE then
     -- header is 5 bytes; the body is exactly one byte, 0 or 1. only a companion that said
     -- HELLO counts: its timeout is what clears a flag nobody resets
@@ -461,17 +577,17 @@ end)
 -- a dead companion leaves a badge behind; legacy playback also needs a stop,
 -- while v2 audio may still be arriving on a path independent of game ticks
 script.on_nth_tick(15, function(event)
+  ensure_storage()
   for index, last_tick in pairs(storage.speakers) do
     if event.tick - last_tick > STALE_TICKS then
       local talk = storage.talks[index]
       set_speaking(index, false, talk ~= nil)
-      -- legacy listeners need a timeout stop; v2 listeners are not sent it
-      fan_out(index, STOP, string.char(MAGIC, VERSION, STOP, 0, 0), true)
     end
   end
 end)
 
 script.on_nth_tick(60, function(event)
+  ensure_storage()
   for index, talk in pairs(storage.talks) do
     if event.tick - talk.last_tick > 60 * 60 then
       storage.talks[index] = nil
@@ -485,23 +601,24 @@ script.on_nth_tick(60, function(event)
         player.set_shortcut_toggled(SHORTCUT, false)
         player.print({ "ptt-radio.companion-offline" })
       end
+      audience_changed()
     end
   end
 end)
 
-script.on_event("ptt-radio-toggle-mic", function(event)
+on_event("ptt-radio-toggle-mic", function(event)
   toggle_open_mic(game.get_player(event.player_index))
 end)
 
-script.on_event("ptt-radio-settings-open", function(event)
+on_event("ptt-radio-settings-open", function(event)
   settings_gui.toggle(game.get_player(event.player_index))
 end)
 
-script.on_event("ptt-radio-settings-cycle", function(event)
+on_event("ptt-radio-settings-cycle", function(event)
   settings_gui.cycle(game.get_player(event.player_index))
 end)
 
-script.on_event(defines.events.on_lua_shortcut, function(event)
+on_event(defines.events.on_lua_shortcut, function(event)
   if event.prototype_name == SHORTCUT then
     toggle_open_mic(game.get_player(event.player_index))
   elseif event.prototype_name == SETTINGS_SHORTCUT then
@@ -509,16 +626,17 @@ script.on_event(defines.events.on_lua_shortcut, function(event)
   end
 end)
 
-script.on_event(defines.events.on_player_joined_game, function(event)
+on_event(defines.events.on_player_joined_game, function(event)
   local player = game.get_player(event.player_index)
   player.set_shortcut_toggled(SHORTCUT, storage.open_mic[player.index] ~= nil)
   hud.render(player)
   render_echo_panel(player)
+  storage.physical_surfaces[player.index] = player.physical_surface.index
   send_roster_to_all()
   audience_changed()
 end)
 
-script.on_event(defines.events.on_gui_click, function(event)
+on_event(defines.events.on_gui_click, function(event)
   if admin.on_gui_click(event) or settings_gui.on_gui_click(event) then return end
   if event.element.valid and event.element.name == ECHO_OFF_BUTTON then
     local player = game.get_player(event.player_index)
@@ -529,13 +647,13 @@ script.on_event(defines.events.on_gui_click, function(event)
 end)
 
 -- one handler per event: a second script.on_event would replace the first
-script.on_event(defines.events.on_gui_elem_changed, function(event)
+on_event(defines.events.on_gui_elem_changed, function(event)
   if not admin.on_gui_elem_changed(event) then settings_gui.on_gui_elem_changed(event) end
 end)
-script.on_event(defines.events.on_gui_checked_state_changed, settings_gui.on_gui_checked_state_changed)
-script.on_event(defines.events.on_gui_closed, settings_gui.on_gui_closed)
+on_event(defines.events.on_gui_checked_state_changed, settings_gui.on_gui_checked_state_changed)
+on_event(defines.events.on_gui_closed, settings_gui.on_gui_closed)
 
-script.on_event(defines.events.on_player_left_game, function(event)
+on_event(defines.events.on_player_left_game, function(event)
   if storage.speakers[event.player_index] then
     set_speaking(event.player_index, false)
   end
@@ -545,28 +663,41 @@ script.on_event(defines.events.on_player_left_game, function(event)
   audience_changed()
 end)
 
-script.on_event(defines.events.on_player_changed_force, function()
-  render_all_huds()
+on_event(defines.events.on_player_changed_force, function()
   audience_changed()
 end)
 
-script.on_event(defines.events.on_forces_merged, function()
-  render_all_huds()
+on_event(defines.events.on_forces_merged, function()
   audience_changed()
 end)
 
-script.on_event(defines.events.on_player_color_changed, function(event)
+on_event(defines.events.on_player_changed_surface, function(event)
+  local player = game.get_player(event.player_index)
+  local surface = player.physical_surface.index
+  if storage.physical_surfaces[player.index] ~= surface then
+    storage.physical_surfaces[player.index] = surface
+    audience_changed()
+  end
+end)
+
+on_event({ defines.events.on_player_promoted, defines.events.on_player_demoted }, function()
+  audience_changed()
+  for _, player in pairs(game.connected_players) do settings_gui.refresh(player) end
+end)
+
+on_event(defines.events.on_player_color_changed, function(event)
   hud.refresh(event.player_index)
   send_roster_to_all()
 end)
 
-script.on_event({ defines.events.on_player_display_resolution_changed, defines.events.on_player_display_scale_changed }, function(event)
+on_event({ defines.events.on_player_display_resolution_changed, defines.events.on_player_display_scale_changed }, function(event)
   hud.reflow(game.get_player(event.player_index))
 end)
 
-script.on_event(defines.events.on_runtime_mod_setting_changed, function(event)
+on_event(defines.events.on_runtime_mod_setting_changed, function(event)
   if event.setting == "ptt-radio-scope" then
-    render_all_huds()
+    audience_changed()
+  elseif event.setting == "ptt-radio-echo" then
     audience_changed()
   elseif event.setting == "ptt-radio-half-duplex" and event.player_index then
     local player = game.get_player(event.player_index)

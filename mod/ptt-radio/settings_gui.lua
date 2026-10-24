@@ -259,6 +259,10 @@ local function build(player, focus)
   local s, known = channels.state(player.index), channels.known(player.index)
   local message = storage.settings_gui.message[player.index]
   if message then note(body, message, RED).name = STATUS end
+  if storage.companions and storage.companions[player.index]
+    and not (storage.pol1 and storage.pol1[player.index]) then
+    note(body, text("upgrade-required"), RED)
+  end
   off_section(body, s)
   tx_section(body, player, s)
   rx_section(body, player, s, known)

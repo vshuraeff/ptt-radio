@@ -242,4 +242,17 @@ admin.configure(function() notifications = notifications + 1; root.destroy() end
 click(root, "mute", 1, "applied")
 assert(not root.valid and storage.radio_policy.muted[2])
 
+-- the command boundary initializes stale storage before channel policy reads or writes.
+setup()
+storage = {}
+local before_calls = 0
+admin.register(function()
+  before_calls = before_calls + 1
+  channels.init()
+end)
+command({ parameter = "mute 2" })
+assert(before_calls == 1 and storage.radio_policy.muted[2] and notifications == 1)
+command({ parameter = "mute 2" })
+assert(before_calls == 2 and notifications == 1)
+
 print("admin.lua: command and gui operations, policy refusals, authority, rollback and callbacks passed")

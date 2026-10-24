@@ -144,23 +144,29 @@ end
 -- admin channel, when one is set, skips tx, rx, ban, deny and confinement on the
 -- listener, while its sender needs the publisher allowlist or player.admin instead of
 -- the ordinary tx checks.
+function channels.tx_permitted(sender_index)
+  if sender_index == 0 then return true end
+  local sender = game.get_player(sender_index)
+  if not sender or not sender.connected then return false end
+  local r = record(sender_index)
+  if r.off or storage.radio_policy.muted[sender_index] then return false end
+  if r.tx == storage.radio_policy.admin_channel then
+    return storage.radio_policy.publishers[sender_index] == true or sender.admin == true
+  end
+  return tx_refusal(sender_index, r.tx) == nil
+end
+
 function channels.eligible(sender_index, listener_index)
   if listener_index == 0 then return false end
   local listener = game.get_player(listener_index)
   if not listener or not listener.connected or record(listener_index).off then return false end
   if sender_index == 0 then return true end
+  if not channels.tx_permitted(sender_index) then return false end
   local sender = game.get_player(sender_index)
-  if not sender or not sender.connected then return false end
   if settings.global["ptt-radio-scope"].value == "force" and sender.force.index ~= listener.force.index then
     return false
   end
   local r = record(sender_index)
-  if r.off or storage.radio_policy.muted[sender_index] then return false end
-  if r.tx == storage.radio_policy.admin_channel then
-    if not (storage.radio_policy.publishers[sender_index] or sender.admin) then return false end
-  elseif tx_refusal(sender_index, r.tx) then
-    return false
-  end
   if not receives(listener_index, r.tx) then return false end
   if r.tx == channels.HERE then
     return sender.physical_surface.index == listener.physical_surface.index
