@@ -483,7 +483,7 @@ The e2e harness can put a NAT and link router between companions (`tests/netlab/
 
 ### Noise pair sessions
 
-`companion/src/crypto/mod.rs` implements a pure pair-session state machine using Snow 0.10.0 `Noise_KK_25519_AESGCM_SHA256` or `Noise_KK_25519_ChaChaPoly_SHA256` and stateless transport encryption. It has no production caller yet. Both selected ANNOUNCEs must advertise AES to select it; otherwise the pair selects common ChaChaPoly. The configured Snow resolver obtains generated static and ephemeral key material from the OS random source. Key-bearing types omit `Debug`; persistence belongs to runtime.
+`companion/src/crypto/mod.rs` implements a pure pair-session state machine using Snow 0.10.0 `Noise_KK_25519_AESGCM_SHA256` or `Noise_KK_25519_ChaChaPoly_SHA256` and stateless transport encryption. Its production caller is the companion runtime (`companion/src/runtime.rs`), which owns one session per pair. Both selected ANNOUNCEs must advertise AES to select it; otherwise the pair selects common ChaChaPoly. The configured Snow resolver obtains generated static and ephemeral key material from the OS random source. Key-bearing types omit `Debug`; persistence belongs to runtime.
 
 The snapshot hash is SHA-256 of ASCII `ptt-radio-v2 announce`, NUL and the canonical raw ANNOUNCE bytes. The combined `SessionContext.announce_hash` is SHA-256 of ASCII `ptt-radio-v2 pair`, NUL, lower player BE16, lower snapshot hash[32], higher player BE16, higher snapshot hash[32]. Initial credentials and candidates remain in that immutable snapshot; trickle does not change it.
 
