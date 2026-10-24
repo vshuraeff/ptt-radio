@@ -8,27 +8,39 @@
 //!   PTT_E2E_VOICE=talk.wav cargo test --test scenarios -- --nocapture
 //!
 //! PTT_E2E_VOICE replaces player A's synthetic voice with any WAV. the files
-//! of the last run stay in target/tmp/scenarios/<scenario>/ for listening.
+//! of the last run stay in target/tmp/scenarios/<mode>/<scenario>/ for listening.
 //!
 //! assertions pin today's baseline with a margin so a regression fails; they
 //! are not targets. the numbers are printed either way.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::UdpSocket;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[path = "netlab/lab.rs"]
 mod lab;
+#[path = "netlab/scenario.rs"]
+mod network;
 #[path = "netlab/router.rs"]
 mod router;
+use network::{Mode, Network};
+
+thread_local! { static MODE: Cell<Mode> = const { Cell::new(Mode::Game) }; }
+
+fn warmup_samples() -> usize {
+    (MODE.get().warmup() * FS as f64) as usize
+}
+fn warmup_us() -> u64 {
+    (MODE.get().warmup() * 1e6) as u64
+}
 
 use lab::{Lab, LabPlayer};
-use ptt_radio_companion::packet::VOICE;
 use ptt_radio_companion::relay::{self, Relay, Stall};
 use ptt_radio_companion::transport::lab::{LabPath, decode_addr};
 use ptt_radio_companion::transport::{Path as LabRoute, Transport};
@@ -84,9 +96,11 @@ struct Latency {
     /// jitter stage, mean ms
     jitter: f64,
     first_live: f64,
-    /// slices of A that B played, concealed, shed (live ones of them)
+    /// received slices of A that B played; synthesized slices are counted separately
     played: usize,
     silence: usize,
+    concealed: usize,
+    measured_concealed: usize,
     shed: usize,
     shed_live: usize,
     /// B's queue after a pull, median, ms
@@ -95,9 +109,18 @@ struct Latency {
 
 fn latency(run: &Outcome) -> Latency {
     let (a, b) = (&run.players[0], &run.players[1]);
-    let frames = frame_timings(a, A, &run.relay, b);
-    let live: Vec<&FrameTiming> = frames.iter().filter(|f| !f.preroll).collect();
-    let acoustic = acoustic_lag(a, b, None);
+    let frames = frame_timings(a, A, b);
+    let origin = a.trace.device_us + warmup_us();
+    let window = if MODE.get() == Mode::Game {
+        (0, u64::MAX)
+    } else {
+        (origin + 800_000, origin + 3_700_000)
+    };
+    let live: Vec<&FrameTiming> = frames
+        .iter()
+        .filter(|f| !f.preroll && f.mic_us >= window.0 as f64 && f.mic_us < window.1 as f64)
+        .collect();
+    let acoustic = acoustic_lag(a, b, (MODE.get() != Mode::Game).then_some(window));
     let shed = b.trace.shed_from(A);
     Latency {
         canceller_delay: mean(live.iter().map(|f| f.canceller_delay_ms)),
@@ -106,8 +129,18 @@ fn latency(run: &Outcome) -> Latency {
         total: mean(live.iter().map(|f| f.total_ms())),
         jitter: mean(live.iter().map(|f| (f.pull_us - f.rx_us) / 1000.0)),
         first_live: live.first().map_or(f64::NAN, |f| f.total_ms()),
-        played: b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count(),
+        played: b
+            .trace
+            .pulls_from(A)
+            .filter(|p| p.seq.is_some_and(|seq| b.trace.rx.contains_key(&(A, seq))))
+            .count(),
         silence: b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count(),
+        concealed: b
+            .trace
+            .pulls_from(A)
+            .filter(|p| p.seq.is_some_and(|seq| !b.trace.rx.contains_key(&(A, seq))))
+            .count(),
+        measured_concealed: concealed_in(a, A, b, window),
         shed_live: shed
             .iter()
             .filter(|(seq, _)| !a.trace.tx[seq].preroll)
@@ -172,6 +205,7 @@ fn quality_sweep() {
             l.silence,
             Path::new(env!("CARGO_TARGET_TMPDIR"))
                 .join("scenarios")
+                .join(format!("{:?}", MODE.get()))
                 .join(&name)
                 .join("aec-off")
                 .join("b-speaker.wav")
@@ -187,9 +221,7 @@ fn quality_sweep() {
     }
 }
 
-#[test]
 fn latency_a_talks_b_listens() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let run = latency_session("latency", &[], true);
     let (a, b) = (&run.players[0], &run.players[1]);
     let press = a.trace.first_ptt_us();
@@ -208,7 +240,7 @@ fn latency_a_talks_b_listens() {
                 row("first live frame, total", fmt_ms(l.first_live)),
                 row("B jitter queue after pull (median)", fmt_ms(l.depth_ms)),
                 row(
-                    "slices A sent / B played / shed (live of them)",
+                    "slices A sent / B received-played / shed (live of them)",
                     format!(
                         "{} / {} / {} ({})",
                         a.trace.sent_slices(),
@@ -222,6 +254,14 @@ fn latency_a_talks_b_listens() {
                     format!("{} / {}", b.trace.stats.dropped, l.silence),
                 ),
                 row("relay delay p50 / p95", relay_delay(&run.relay)),
+                row(
+                    "slices synthesized before decode (no logical rx)",
+                    l.concealed.to_string(),
+                ),
+                row(
+                    "PLC in measured latency window",
+                    l.measured_concealed.to_string(),
+                ),
             ],
         ]
         .concat(),
@@ -243,11 +283,18 @@ fn latency_a_talks_b_listens() {
         "acoustic {} ms vs frames {total:.1} ms + canceller {expected} ms",
         acoustic.lag_ms
     );
-    // complete: every slice A sent was played or shed as backlog, nothing dropped. with no
+    // account for received media, warmup plc and shed backlog separately. with no
     // margin kept until an underrun, a loaded machine can starve one pull (seen once in a debug
     // build beside parallel test runs, never in 5 release runs); the decoder conceals it and
     // the margin then holds, so one is allowed
-    assert_eq!((l.played + l.shed) as u64, a.trace.sent_slices());
+    assert_eq!(
+        (l.played + l.concealed + l.shed) as u64,
+        a.trace.sent_slices()
+    );
+    assert_eq!(
+        l.measured_concealed, 0,
+        "concealment in measured latency window"
+    );
     assert_eq!(b.trace.stats.dropped, 0);
     assert!(l.silence <= 1, "{} underruns at B", l.silence);
     // the pre-roll burst (120 ms) is shed: what stays after a pull is the margin plus what the
@@ -266,9 +313,7 @@ fn latency_a_talks_b_listens() {
     );
 }
 
-#[test]
 fn echo_return_b_has_speakers_and_open_mic() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = || Session {
         name: "echo".into(),
         players: vec![
@@ -287,10 +332,11 @@ fn echo_return_b_has_speakers_and_open_mic() {
     let baseline_return =
         energy_db(&baseline.players[0].speaker) - energy_db(&baseline.players[0].voice);
     // the return at A arrives another transport leg after B's gate switches
-    let acquisition_window = 5 * FS / 2..9 * FS / 2;
+    let offset = warmup_samples();
+    let acquisition_window = offset + 5 * FS / 2..offset + 9 * FS / 2;
     let acquisition_reduction = energy_db(&baseline.players[0].speaker[acquisition_window.clone()])
         - energy_db(&a.speaker[acquisition_window]);
-    let warm = 3 * FS..9 * FS / 2;
+    let warm = offset + 3 * FS..offset + 9 * FS / 2;
     let warm_reduction =
         energy_db(&baseline.players[0].speaker[warm.clone()]) - energy_db(&a.speaker[warm]);
     let coupling = coupling_db();
@@ -329,7 +375,7 @@ fn echo_return_b_has_speakers_and_open_mic() {
         "coupled microphone never engaged cancellation"
     );
     assert!(
-        b.trace.gate_samples[0] + ((FS / 5) as u64) < 3 * FS as u64,
+        b.trace.gate_samples[0] + ((FS / 5) as u64) < (offset + 3 * FS) as u64,
         "acquisition left no settling interval"
     );
     assert!(
@@ -338,11 +384,13 @@ fn echo_return_b_has_speakers_and_open_mic() {
             .iter()
             .any(|s| s.sender == 2 && s.engaged)
     );
+    let refreshed_at =
+        b.trace.device_us + (warmup_us() + 3_000_000).div_ceil(5_000_000) * 5_000_000;
     assert!(
         run.relay
             .echo_states
             .iter()
-            .any(|s| s.sender == 2 && s.engaged && s.received_us >= b.trace.device_us + 5_000_000),
+            .any(|s| s.sender == 2 && s.engaged && s.received_us >= refreshed_at),
         "HELLO did not refresh the engaged state"
     );
     assert!(
@@ -362,9 +410,7 @@ fn echo_return_b_has_speakers_and_open_mic() {
     );
 }
 
-#[test]
 fn double_talk_a_and_b_at_once() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = || Session {
         name: "double-talk".into(),
         players: vec![
@@ -377,18 +423,30 @@ fn double_talk_a_and_b_at_once() {
     let baseline = session().run_with_aec(false);
     let run = session().run();
     let (a, b) = (&run.players[0], &run.players[1]);
+    let (base_a, base_b) = (&baseline.players[0], &baseline.players[1]);
     // A's output holds B's voice plus A's echo; B's output holds A's voice
     let b_at_a = acoustic_lag(b, a, None);
-    let echo_at_a = acoustic_lag(a, a, None);
     let a_at_b = acoustic_lag(a, b, None);
-    let (b_gain, echo_gain) = fit_two(a, (b, b_at_a.lag_ms), (a, echo_at_a.lag_ms));
+    let baseline_b_lag = acoustic_lag(base_b, base_a, None).lag_ms;
+    let baseline_a_lag = acoustic_lag(base_a, base_b, None).lag_ms;
+    let baseline_echo_lag = acoustic_lag(base_a, base_a, None).lag_ms;
+    let echo_lag = corrected_echo_lag(
+        baseline_echo_lag,
+        a_at_b.lag_ms - baseline_a_lag,
+        b_at_a.lag_ms - baseline_b_lag,
+    );
+    let (b_gain, echo_gain) = fit_two(a, (b, b_at_a.lag_ms), (a, echo_lag));
     // B's echo setting is off, so B hears nothing but A
     let a_gain = energy_db(&b.speaker) - energy_db(&a.voice);
-    let (base_a, base_b) = (&baseline.players[0], &baseline.players[1]);
-    let (base_b_gain, _) = fit_two(
+    let (base_b_gain, base_echo_gain) = fit_two(
         base_a,
-        (base_b, acoustic_lag(base_b, base_a, None).lag_ms),
-        (base_a, acoustic_lag(base_a, base_a, None).lag_ms),
+        (base_b, baseline_b_lag),
+        (base_a, baseline_echo_lag),
+    );
+    assert!(
+        (base_echo_gain - coupling_db()).abs() <= 2.0,
+        "AEC-off echo gain {base_echo_gain:.3} dB differs from coupling {:.3} dB",
+        coupling_db()
     );
     let base_a_gain = energy_db(&base_b.speaker) - energy_db(&base_a.voice);
     print_table(
@@ -409,8 +467,17 @@ fn double_talk_a_and_b_at_once() {
             ),
             row(
                 "A's echo at A",
-                format!("{echo_gain:.1} dB (lag {})", fmt_ms(echo_at_a.lag_ms)),
+                format!("{echo_gain:.1} dB (control lag {})", fmt_ms(echo_lag)),
             ),
+            row(
+                "echo lag: off + A→B change + B→A change",
+                format!(
+                    "{baseline_echo_lag:.0} + {:.0} + {:.0} ms",
+                    a_at_b.lag_ms - baseline_a_lag,
+                    b_at_a.lag_ms - baseline_b_lag
+                ),
+            ),
+            row("AEC-off echo gain", format!("{base_echo_gain:.3} dB")),
             row(
                 "A's voice at B",
                 format!("{a_gain:.1} dB (lag {})", fmt_ms(a_at_b.lag_ms)),
@@ -441,9 +508,7 @@ fn double_talk_a_and_b_at_once() {
     assert!(echo_gain < coupling_db() + 3.0);
 }
 
-#[test]
 fn half_duplex_a_holds_ptt_while_b_talks() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let session = |on: bool| {
         Session {
             name: format!("half-duplex-{}", if on { "on" } else { "off" }),
@@ -477,11 +542,18 @@ fn half_duplex_a_holds_ptt_while_b_talks() {
     // the same hold without half-duplex, from A's PTT events on its device timeline
     let a_off = &off.players[0].trace;
     let slot = |us: u64| (us - a_off.device_us) * FS as u64 / 1_000_000;
-    let (pressed, released) = (slot(a_off.ptt[0].0), slot(a_off.ptt[1].0));
+    let (pressed, released) = (
+        slot(a_off.ptt[0].0).max(warmup_samples() as u64),
+        slot(a_off.ptt[1].0),
+    );
     // B's slices A kept decoding while its speakers were silent
     let pulled = a_on
         .pulls_from(2)
-        .filter(|p| p.seq.is_some() && p.slot >= muted_at && p.slot < unmuted_at)
+        .filter(|p| {
+            p.seq.is_some()
+                && p.slot >= muted_at.max(warmup_samples() as u64)
+                && p.slot < unmuted_at
+        })
         .count();
     let held = (ms(300), ms(10));
     let after = (unmuted_at + ms(20), unmuted_at + ms(1500));
@@ -532,9 +604,7 @@ fn half_duplex_a_holds_ptt_while_b_talks() {
     assert!(level(&off, pressed + held.0, released) > reference - 6.0);
 }
 
-#[test]
 fn stall_burst_recovers() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let stall = Stall {
         at: Duration::from_millis(4000),
         len: Duration::from_millis(500),
@@ -552,8 +622,11 @@ fn stall_burst_recovers() {
     .run();
     let (a, b) = (&run.players[0], &run.players[1]);
     let &(stall_start, stall_end) = run.relay.stalls.first().expect("the stall happened");
-    let frames = frame_timings(a, A, &run.relay, b);
-    let live: Vec<&FrameTiming> = frames.iter().filter(|f| !f.preroll).collect();
+    let frames = frame_timings(a, A, b);
+    let live: Vec<&FrameTiming> = frames
+        .iter()
+        .filter(|f| !f.preroll && f.mic_us >= (a.trace.device_us + warmup_us()) as f64)
+        .collect();
     let window = |from: f64, to: f64| {
         live.iter()
             .filter(move |f| f.mic_us >= from && f.mic_us < to)
@@ -574,13 +647,27 @@ fn stall_burst_recovers() {
     // settled: from this point after the stall every frame plays within 10 ms of `after`
     let settled = live
         .iter()
-        .filter(|f| f.play_us > stall_end as f64 && (f.total_ms() - after).abs() > 10.0)
+        .filter(|f| f.play_us > stall_end as f64 && outside_settled_band(f.total_ms(), after))
         .map(|f| (f.play_us - stall_end as f64 + f.frame_us) / 1000.0)
         .fold(0.0, f64::max);
-    let acoustic_before = acoustic_lag(a, b, Some((0, stall_start)));
+    let acoustic_before = acoustic_lag(a, b, Some((a.trace.device_us + warmup_us(), stall_start)));
     let acoustic_after = acoustic_lag(a, b, Some((stall_end + 1_000_000, u64::MAX)));
-    let played = b.trace.pulls_from(A).filter(|p| p.seq.is_some()).count() as u64;
+    let concealed = b
+        .trace
+        .pulls_from(A)
+        .filter(|p| p.seq.is_some_and(|seq| !b.trace.rx.contains_key(&(A, seq))))
+        .count();
+    let before_window = (a.trace.device_us + warmup_us(), stall_start - 300_000);
+    let after_window = (stall_end + 1_000_000, u64::MAX);
+    let before_concealed = concealed_in(a, A, b, before_window);
+    let after_concealed = concealed_in(a, A, b, after_window);
+    let played = b
+        .trace
+        .pulls_from(A)
+        .filter(|p| p.seq.is_some_and(|seq| b.trace.rx.contains_key(&(A, seq))))
+        .count() as u64;
     let silence = b.trace.pulls_from(A).filter(|p| p.seq.is_none()).count();
+    let shed = b.trace.shed_from(A).len() as u64;
     print_table(
         "stall: relay stops 500 ms mid-utterance, then bursts",
         &[
@@ -614,24 +701,32 @@ fn stall_burst_recovers() {
                 format!("{} / {}", fmt_ms(depth_before), fmt_ms(depth_after)),
             ),
             row(
-                "slices sent / played / dropped / concealed",
+                "slices sent / received-played / PLC / shed / dropped / silence",
                 format!(
-                    "{} / {played} / {} / {silence}",
+                    "{} / {played} / {concealed} / {shed} / {} / {silence}",
                     a.trace.sent_slices(),
                     b.trace.stats.dropped
                 ),
             ),
+            row(
+                "PLC in steady before / after windows",
+                format!("{before_concealed} / {after_concealed}"),
+            ),
         ],
     );
     // the stall starves B (silence) and the burst is trimmed, not played back to back
-    let shed = b.trace.shed_from(A).len() as u64;
     assert!(silence > 0, "the stall did not reach B");
     assert!(
         b.trace.stats.dropped + shed > 0,
         "the burst was played instead of trimmed"
     );
     // nothing lost besides what the jitter buffer dropped or shed on purpose
-    assert_eq!(played + b.trace.stats.dropped + shed, a.trace.sent_slices());
+    assert_eq!(
+        played + concealed as u64 + b.trace.stats.dropped + shed,
+        a.trace.sent_slices()
+    );
+    assert_eq!(before_concealed, 0, "concealment before the stall");
+    assert_eq!(after_concealed, 0, "concealment after the recovery window");
     // the burst after the stall is shed back to the depth before it; the underrun keeps 20 ms
     // of margin for a while, so allow that. 2026-10-24 with 20 ms slices: 0 / 0 frames queued,
     // 145 ms before and 142-143 ms after (3 runs); without shedding the trim left 2..10 frames
@@ -650,9 +745,203 @@ fn stall_burst_recovers() {
     );
 }
 
-// the network lab beside the game path: the router starts with three NAT types, each companion
-// is pointed at it with --netlab, and the router trace is read back. no p2p runtime sends yet
-// (u17/u20), so the game path is what the companions do; u21 adds p2p traffic here.
+macro_rules! transport_scenarios {
+    ($module:ident, $mode:expr) => {
+        mod $module {
+            use super::*;
+            fn run(check: fn()) {
+                let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+                struct Reset;
+                impl Drop for Reset {
+                    fn drop(&mut self) {
+                        MODE.set(Mode::Game);
+                    }
+                }
+                let _reset = Reset;
+                MODE.set($mode);
+                check();
+            }
+            #[test]
+            fn latency_a_talks_b_listens() {
+                run(super::latency_a_talks_b_listens);
+            }
+            #[test]
+            fn echo_return_b_has_speakers_and_open_mic() {
+                run(super::echo_return_b_has_speakers_and_open_mic);
+            }
+            #[test]
+            fn double_talk_a_and_b_at_once() {
+                run(super::double_talk_a_and_b_at_once);
+            }
+            #[test]
+            fn half_duplex_a_holds_ptt_while_b_talks() {
+                run(super::half_duplex_a_holds_ptt_while_b_talks);
+            }
+            #[test]
+            fn stall_burst_recovers() {
+                run(super::stall_burst_recovers);
+            }
+        }
+    };
+}
+
+fn corrected_echo_lag(off_echo: f64, forward_change: f64, return_change: f64) -> f64 {
+    off_echo + forward_change + return_change
+}
+
+#[test]
+fn echo_reference_tracks_both_changed_transport_legs() {
+    let talker = PlayerRun {
+        voice: speech(33, 167.0, 3.0),
+        speaker: Vec::new(),
+        trace: Trace {
+            device_us: 1_000_000,
+            ..Trace::default()
+        },
+    };
+    let observed_lag = |delay_ms: usize| {
+        let mut speaker = vec![0.0; delay_ms * FS / 1000];
+        speaker.extend_from_slice(&talker.voice);
+        speaker.resize(4 * FS, 0.0);
+        acoustic_lag(
+            &talker,
+            &PlayerRun {
+                voice: Vec::new(),
+                speaker,
+                trace: Trace {
+                    device_us: 1_000_000,
+                    ..Trace::default()
+                },
+            },
+            None,
+        )
+        .lag_ms
+    };
+    // forward 80→110 ms and return 120→140 ms move the echo 200→250 ms.
+    let corrected = corrected_echo_lag(
+        observed_lag(200),
+        observed_lag(110) - observed_lag(80),
+        observed_lag(140) - observed_lag(120),
+    );
+    assert_eq!(corrected, observed_lag(250));
+    assert_eq!(corrected, 250.0);
+}
+
+fn outside_settled_band(total_ms: f64, reference_ms: f64) -> bool {
+    // a mean's rounding error must not classify exactly 10 ms as outside the band.
+    ((total_ms - reference_ms).abs() * 1e6).round() > 10_000_000.0
+}
+
+#[test]
+fn settled_band_preserves_the_ten_ms_boundary_after_averaging() {
+    let reference = mean(std::iter::repeat_n(145.184, 100));
+    assert!(!outside_settled_band(155.184, reference));
+    assert!(outside_settled_band(155.184001, reference));
+}
+transport_scenarios!(game, Mode::Game);
+transport_scenarios!(direct, Mode::Direct);
+transport_scenarios!(hub, Mode::Hub);
+transport_scenarios!(player_relay, Mode::Player);
+transport_scenarios!(fallback, Mode::Fallback);
+
+#[test]
+fn hard_direct_cut_to_hub_and_game() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (mode, backup) in [
+        (Mode::CutHub, "Hub"),
+        (Mode::CutGame, "Game"),
+        (Mode::HubDown, "Game"),
+    ] {
+        MODE.set(mode);
+        let run = Session {
+            name: "hard-cut".into(),
+            players: vec![
+                Talker::ptt(place(0.8, talk(8.0), 10.0), 8.8),
+                Talker::listener(),
+            ],
+            stall: None,
+            seconds: 10.0,
+        }
+        .run_with_aec(false);
+        let (a, b) = (&run.players[0], &run.players[1]);
+        let voice_origin = a.trace.device_us + warmup_us();
+        assert!(
+            run.network.iter().any(|t| t.verdict == Verdict::Cut),
+            "no real datagrams hit the hard cut"
+        );
+        a.trace.assert_route(
+            2,
+            backup,
+            voice_origin + 6_000_000,
+            voice_origin + 8_000_000,
+        );
+        let delay = |from: u64, to: u64| {
+            median(b.trace.rx.iter().filter_map(|(&(sender, seq), &at)| {
+                let tx = a.trace.tx.get(&seq)?;
+                (sender == A && tx.sent_us >= voice_origin + from && tx.sent_us < voice_origin + to)
+                    .then_some((at - tx.sent_us) as f64 / 1000.0)
+            }))
+        };
+        let primary = delay(2_000_000, 3_500_000);
+        let secondary = delay(6_000_000, 8_000_000);
+        assert!(
+            network::delay_band(backup).contains(&secondary),
+            "backup {backup} delay {secondary:.2} ms outside configured route band"
+        );
+        let bound = (secondary - primary).max(0.0) + 20.0;
+        let cut_us = run.network_origin_us
+            + run
+                .network
+                .iter()
+                .find(|t| t.verdict == Verdict::Cut)
+                .unwrap()
+                .at
+                .as_micros() as u64;
+        let pulls: Vec<_> = b
+            .trace
+            .pulls_from(A)
+            .filter(|p| {
+                p.seq.is_some_and(|seq| b.trace.rx.contains_key(&(A, seq)))
+                    && p.at_us >= cut_us - 100_000
+                    && p.at_us <= voice_origin + 8_000_000
+            })
+            .collect();
+        assert!(pulls.len() > 30, "too few successful pulls around cut");
+        assert!(
+            pulls.first().unwrap().at_us < cut_us,
+            "no received pull brackets the beginning of the cut"
+        );
+        assert!(
+            pulls.last().unwrap().at_us > voice_origin + 7_900_000,
+            "received media never recovered during continuous speech"
+        );
+        assert!(
+            a.trace
+                .routes
+                .iter()
+                .filter(|(at, peer, route)| *at >= voice_origin + 3_000_000
+                    && *at < cut_us
+                    && *peer == if backup == "Game" { 0 } else { 2 }
+                    && route == backup)
+                .count()
+                > 10,
+            "backup was not carrying redundant media before cut"
+        );
+        let gap = pulls
+            .windows(2)
+            .map(|p| (p[1].slot - p[0].slot) as f64 * 1000.0 / FS as f64)
+            .fold(0.0, f64::max);
+        println!(
+            "{mode:?}: primary {primary:.2} ms, backup {secondary:.2} ms, pull gap {gap:.2} ms, bound {bound:.2} ms; scheduler tolerance 0 ms"
+        );
+        assert!(
+            gap <= bound,
+            "pull gap {gap:.2} ms exceeds path difference +20ms ({bound:.2} ms)"
+        );
+    }
+    MODE.set(Mode::Game);
+}
+
 #[test]
 fn netlab_router_starts_with_three_nat_types() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -692,7 +981,7 @@ fn netlab_router_starts_with_three_nat_types() {
     }
     .run();
 
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scenarios/netlab/aec-on");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("scenarios/Game/netlab/aec-on");
     for i in 0..3 {
         let name = (b'a' + i as u8) as char;
         let log = fs::read_to_string(dir.join(format!("{name}.log"))).unwrap();
@@ -800,6 +1089,33 @@ struct PlayerRun {
 struct Outcome {
     players: Vec<PlayerRun>,
     relay: relay::Report,
+    network: Vec<router::Trace>,
+    network_origin_us: u64,
+}
+
+struct Processes {
+    children: Vec<Child>,
+    relay: Option<Relay>,
+}
+
+impl Drop for Processes {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            if child.try_wait().ok().flatten().is_none() {
+                // best effort cleanup during unwinding; always reap every process below.
+                if let Err(error) = child.kill() {
+                    eprintln!("companion {} cleanup kill: {error}", child.id());
+                }
+            }
+            match child.wait() {
+                Ok(status) => println!("companion {} reaped: {status}", child.id()),
+                Err(error) => eprintln!("companion {} cleanup wait: {error}", child.id()),
+            }
+        }
+        if let Some(relay) = self.relay.take() {
+            relay.stop();
+        }
+    }
 }
 
 impl Session {
@@ -807,9 +1123,30 @@ impl Session {
         self.run_with_aec(true)
     }
 
-    fn run_with_aec(self, enabled: bool) -> Outcome {
+    fn run_with_aec(mut self, enabled: bool) -> Outcome {
+        let mode = MODE.get();
+        let warmup = mode.warmup();
+        if warmup > 0.0 {
+            for player in &mut self.players {
+                let mut voice = vec![0.0; warmup_samples()];
+                voice.append(&mut player.voice);
+                player.voice = voice;
+                player.auto_ptt = player.auto_ptt.map(|hold| hold + warmup);
+            }
+            self.seconds += warmup;
+            self.stall = self.stall.map(|mut stall| {
+                stall.at += Duration::from_secs_f64(warmup);
+                stall
+            });
+        }
+        if mode == Mode::Player {
+            self.players.push(Talker::listener());
+        }
+        let mut network = (mode != Mode::Game)
+            .then(|| Network::new(mode, self.players.len(), self.stall.map(|s| (s.at, s.len))));
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("scenarios")
+            .join(format!("{mode:?}"))
             .join(&self.name)
             .join(if enabled { "aec-on" } else { "aec-off" });
         // the previous run's files, if any; create_dir_all below reports real trouble
@@ -819,7 +1156,7 @@ impl Session {
         write_wav(&ir, &room_ir());
 
         let companion_ports: Vec<u16> = self.players.iter().map(|_| free_port()).collect();
-        let relay = Relay::start(
+        let relay = Relay::start_with_hub(
             relay::Config {
                 stall: self.stall,
                 ..relay::Config::default()
@@ -839,10 +1176,25 @@ impl Session {
                     (0, player)
                 })
                 .collect(),
+            mode.hub().then_some(0),
         )
         .unwrap();
+        let mut children = Processes {
+            children: Vec::new(),
+            relay: Some(relay),
+        };
+        if mode.hub() {
+            network
+                .as_mut()
+                .unwrap()
+                .attach_hub(children.relay.as_ref().unwrap().game_port(0));
+            let until = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < until {
+                network.as_mut().unwrap().poll();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
 
-        let mut children = Vec::new();
         for (i, talker) in self.players.iter().enumerate() {
             let name = (b'a' + i as u8) as char;
             let mic = dir.join(format!("{name}-mic.wav"));
@@ -850,7 +1202,14 @@ impl Session {
             let log = fs::File::create(dir.join(format!("{name}.log"))).unwrap();
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_ptt-radio-companion"));
             cmd.arg("--game-port")
-                .arg(relay.game_port(i as u16 + 1).to_string())
+                .arg(
+                    children
+                        .relay
+                        .as_ref()
+                        .unwrap()
+                        .game_port(i as u16 + 1)
+                        .to_string(),
+                )
                 .arg("--port")
                 .arg(companion_ports[i].to_string())
                 .args(["--ptt-key", "none", "--mic-wav"])
@@ -867,7 +1226,9 @@ impl Session {
                 cmd.arg("--auto-ptt").arg(hold.to_string());
             }
             cmd.args(["--aec", if enabled { "on" } else { "off" }]);
-            if !talker.args.iter().any(|arg| arg == "--netlab") {
+            if let Some(network) = &network {
+                cmd.args(network.args(i, mode.hub()));
+            } else if !talker.args.iter().any(|arg| arg == "--netlab") {
                 cmd.arg("--game-only");
             }
             cmd.args(&talker.args);
@@ -879,29 +1240,58 @@ impl Session {
                     .arg("--couple-ir")
                     .arg(&ir);
             }
-            children.push(cmd.spawn().expect("companion binary"));
+            children
+                .children
+                .push(cmd.spawn().expect("companion binary"));
         }
         let deadline = Instant::now() + Duration::from_secs_f64(self.seconds + 15.0);
-        for (i, child) in children.iter_mut().enumerate() {
-            let status = loop {
+        loop {
+            if let Some(network) = &mut network {
+                network.poll();
+            }
+            let mut complete = true;
+            for (i, child) in children.children.iter_mut().enumerate() {
                 if let Some(status) = child.try_wait().unwrap() {
-                    break status;
+                    assert!(
+                        status.success(),
+                        "companion {i}: {status}, see {}",
+                        dir.display()
+                    );
+                } else {
+                    complete = false;
                 }
-                if Instant::now() > deadline {
-                    // best effort before failing the test: a child that already exited cannot be killed
-                    let _ = child.kill();
-                    panic!("companion {i} did not exit, see {}", dir.display());
-                }
-                thread::sleep(Duration::from_millis(50));
-            };
+            }
+            if complete {
+                break;
+            }
             assert!(
-                status.success(),
-                "companion {i}: {status}, see {}",
+                Instant::now() < deadline,
+                "companion deadline, see {}",
                 dir.display()
             );
+            thread::sleep(Duration::from_millis(1));
         }
-        let relay = relay.stop();
-        let players = self
+        let relay = children.relay.take().unwrap().stop();
+        fs::write(
+            dir.join("session.trace"),
+            format!("stalls {:?}\n", relay.stalls),
+        )
+        .unwrap();
+        if let Some(network) = &network {
+            fs::write(
+                dir.join("network.trace"),
+                format!(
+                    "origin_us {}\nmode {mode:?}\nstall {:?}\nhub game received {} / sent {}\n{:#?}\n",
+                    network.origin_us,
+                    self.stall.map(|s| (s.at, s.len)),
+                    network.game_received,
+                    network.game_sent,
+                    network.pump.trace()
+                ),
+            )
+            .unwrap();
+        }
+        let players: Vec<PlayerRun> = self
             .players
             .into_iter()
             .enumerate()
@@ -916,7 +1306,62 @@ impl Session {
             })
             .collect();
         println!("files: {}", dir.display());
-        Outcome { players, relay }
+        if self.name != "netlab" {
+            for (i, player) in players.iter().take(2).enumerate() {
+                if player.trace.tx.is_empty() {
+                    continue;
+                }
+                println!(
+                    "startup {mode:?} player {}: {:?}",
+                    i + 1,
+                    player
+                        .trace
+                        .switches
+                        .iter()
+                        .map(|(at, peer, route)| (
+                            at.saturating_sub(player.trace.device_us) / 1000,
+                            peer,
+                            route
+                        ))
+                        .collect::<Vec<_>>()
+                );
+                let peer = if i == 0 { 2 } else { 1 };
+                let from = player.trace.device_us + warmup_us() + 800_000;
+                let until = if matches!(mode, Mode::CutHub | Mode::CutGame | Mode::HubDown) {
+                    warmup + 3.7
+                } else {
+                    self.seconds - 0.3
+                };
+                let to = player.trace.device_us + (until * 1e6) as u64;
+                player.trace.assert_route(peer, mode.route(), from, to);
+                let listener = &players[peer as usize - 1];
+                let delivered = median(player.trace.tx.iter().filter_map(|(&seq, tx)| {
+                    if tx.sent_us < from || tx.sent_us >= to {
+                        return None;
+                    }
+                    listener
+                        .trace
+                        .rx
+                        .get(&(i as u16 + 1, seq))
+                        .map(|at| (*at - tx.sent_us) as f64 / 1000.0)
+                }));
+                let band = network::delay_band(mode.route());
+                assert!(
+                    band.contains(&delivered),
+                    "{mode:?} actual tx-to-rx median {delivered:.2} ms outside {band:?}; selected route did not deliver media"
+                );
+                println!(
+                    "delivered {mode:?} player {} → {peer}: median {delivered:.2} ms",
+                    i + 1
+                );
+            }
+        }
+        Outcome {
+            players,
+            relay,
+            network_origin_us: network.as_ref().map_or(0, |n| n.origin_us),
+            network: network.as_ref().map_or_else(Vec::new, |n| n.pump.trace()),
+        }
     }
 }
 
@@ -1002,6 +1447,8 @@ struct Trace {
     /// (sender, seq, offset) slices skipped by the receiver to cut a backlog
     shed: HashSet<(u16, u16, usize)>,
     stats: Stats,
+    switches: Vec<(u64, u16, String)>,
+    routes: Vec<(u64, u16, String)>,
 }
 
 impl Trace {
@@ -1035,8 +1482,13 @@ impl Trace {
                 }
                 "aec_gate" => trace.gate_samples.push(num(5)),
                 "echo_state" => {}
-                "route" | "route_tx" | "network_rtt" | "switch" | "generation" | "key"
-                | "duplicate" | "drop" | "hold" => {}
+                "switch" => trace.switches.push((
+                    num(0),
+                    num(2) as u16,
+                    if f[3] == "game" { "Game" } else { f[3] }.into(),
+                )),
+                "route_tx" => trace.routes.push((num(0), num(2) as u16, f[3].into())),
+                "route" | "network_rtt" | "generation" | "key" | "duplicate" | "drop" | "hold" => {}
                 "codec" => trace.frame_samples = num(2) as usize,
                 "ptt" => trace.ptt.push((num(0), f[2] == "1")),
                 "mute" => trace.mute.push((num(3), f[2] == "1")),
@@ -1086,6 +1538,44 @@ impl Trace {
             .find(|(_, held)| *held)
             .expect("PTT pressed")
             .0
+    }
+
+    fn assert_route(&self, peer: u16, route: &str, from: u64, to: u64) {
+        let selected = self
+            .switches
+            .iter()
+            .rfind(|(at, p, _)| *p == peer && *at <= from);
+        if !self.switches.is_empty() || route != "Game" {
+            assert_eq!(
+                selected.map(|(_, _, r)| r.as_str()),
+                Some(route),
+                "route at measurement start: {:?}",
+                self.switches
+            );
+        }
+        assert!(
+            self.switches
+                .iter()
+                .filter(|(at, p, _)| *p == peer && *at > from && *at < to)
+                .all(|(_, _, r)| r == route),
+            "route changed during measurement: {:?}",
+            self.switches
+        );
+        let sent = self
+            .routes
+            .iter()
+            .filter(|(at, p, r)| {
+                *p == if route == "Game" { 0 } else { peer }
+                    && *at >= from
+                    && *at < to
+                    && r == route
+            })
+            .count();
+        assert!(
+            sent > 10,
+            "{route} carried only {sent} packets in measured speech interval"
+        );
+        println!("route asserted: peer {peer}, {route}, {sent} media sends in measured interval");
     }
 
     /// (seq, offset) of the slices of `sender` this listener shed
@@ -1148,8 +1638,6 @@ struct FrameTiming {
     mic_us: f64,
     ready_us: f64,
     sent_us: f64,
-    relay_in_us: f64,
-    relay_out_us: f64,
     rx_us: f64,
     pull_us: f64,
     play_us: f64,
@@ -1162,33 +1650,97 @@ impl FrameTiming {
     }
 }
 
-/// frames of `talker` (player `sender`) whose first slice `listener` played, in order
-fn frame_timings(
+fn concealed_in(
     talker: &PlayerRun,
     sender: u16,
-    relay: &relay::Report,
     listener: &PlayerRun,
-) -> Vec<FrameTiming> {
-    let relayed: HashMap<u16, &relay::Delivery> = relay
-        .deliveries
-        .iter()
-        .filter(|d| {
-            d.sender == sender
-                && matches!(
-                    d.kind,
-                    VOICE | ptt_radio_companion::transport::wire::GAME_VOICE
-                )
+    window: (u64, u64),
+) -> usize {
+    listener
+        .trace
+        .pulls_from(sender)
+        .filter(|pull| {
+            let Some(seq) = pull.seq else {
+                return false;
+            };
+            let tx = &talker.trace.tx[&seq];
+            let mic_us = talker.trace.device_us as f64 + tx.frame as f64 * talker.trace.frame_us();
+            !tx.preroll
+                && mic_us >= window.0 as f64
+                && mic_us < window.1 as f64
+                && !listener.trace.rx.contains_key(&(sender, seq))
         })
-        .map(|d| (d.seq, d))
-        .collect();
+        .count()
+}
+
+#[test]
+fn measured_delivery_detects_missing_rx_without_rejecting_warmup_plc() {
+    let mut talker = PlayerRun {
+        voice: Vec::new(),
+        speaker: Vec::new(),
+        trace: Trace {
+            device_us: 1_000_000,
+            frame_samples: 960,
+            ..Trace::default()
+        },
+    };
+    let mut listener = PlayerRun {
+        voice: Vec::new(),
+        speaker: Vec::new(),
+        trace: Trace::default(),
+    };
+    for (seq, frame) in [(1, 0), (2, 100)] {
+        talker.trace.tx.insert(
+            seq,
+            TxFrame {
+                frame,
+                preroll: false,
+                ready_us: 0,
+                sent_us: 0,
+                bytes: 0,
+            },
+        );
+        listener.trace.pulls.push(PullEvent {
+            at_us: 0,
+            sender: A,
+            seq: Some(seq),
+            offset: 0,
+            queued: 0,
+            slot: 0,
+        });
+    }
+    // both pulls have sequences, but neither has a received packet.
+    assert_eq!(
+        listener
+            .trace
+            .pulls_from(A)
+            .filter(|p| p.seq.is_some())
+            .count(),
+        2
+    );
+    assert_eq!(
+        concealed_in(&talker, A, &listener, (3_000_000, 4_000_000)),
+        1
+    );
+    listener.trace.rx.insert((A, 2), 3_000_000);
+    assert_eq!(
+        concealed_in(&talker, A, &listener, (3_000_000, 4_000_000)),
+        0
+    );
+    assert_eq!(concealed_in(&talker, A, &listener, (0, u64::MAX)), 1);
+}
+
+/// frames of `talker` (player `sender`) whose first slice `listener` played, in order
+fn frame_timings(talker: &PlayerRun, sender: u16, listener: &PlayerRun) -> Vec<FrameTiming> {
     listener
         .trace
         .pulls_from(sender)
         .filter(|pull| pull.offset == 0)
         .filter_map(|pull| {
             let seq = pull.seq?;
+            // plc/fec carries a sequence but has no received packet to time.
+            let rx_us = listener.trace.rx.get(&(sender, seq))?;
             let tx = &talker.trace.tx[&seq];
-            let d = relayed[&seq];
             let frame_us = talker.trace.frame_us();
             Some(FrameTiming {
                 canceller_delay_ms: talker
@@ -1199,9 +1751,7 @@ fn frame_timings(
                 mic_us: talker.trace.device_us as f64 + tx.frame as f64 * frame_us,
                 ready_us: tx.ready_us as f64,
                 sent_us: tx.sent_us as f64,
-                relay_in_us: d.received_us as f64,
-                relay_out_us: d.delivered_us as f64,
-                rx_us: listener.trace.rx[&(sender, seq)] as f64,
+                rx_us: *rx_us as f64,
                 pull_us: pull.at_us as f64,
                 play_us: listener.trace.play_us(pull),
                 queued: pull.queued,
@@ -1226,12 +1776,7 @@ fn stage_table(live: &[&FrameTiming], acoustic_ms: f64) -> Vec<(String, String)>
         stage("capture buffering", &|t| t.ready_us - t.mic_us - t.frame_us),
         stage("framing (one frame)", &|t| t.frame_us),
         stage("encode + send", &|t| t.sent_us - t.ready_us),
-        stage("udp loopback (both legs)", &|t| {
-            (t.relay_in_us - t.sent_us) + (t.rx_us - t.relay_out_us)
-        }),
-        stage("relay (game + server model)", &|t| {
-            t.relay_out_us - t.relay_in_us
-        }),
+        stage("transport (actual tx to rx)", &|t| t.rx_us - t.sent_us),
         stage("jitter buffer", &|t| t.pull_us - t.rx_us),
         stage("output queue + device", &|t| t.play_us - t.pull_us),
         stage("total, frame first sample", &|t| t.play_us - t.mic_us),
@@ -1287,34 +1832,47 @@ struct Lag {
 fn acoustic_lag(from: &PlayerRun, to: &PlayerRun, window: Option<(u64, u64)>) -> Lag {
     let origin = from.trace.device_us;
     let hops = to.speaker.len() / HOP;
-    let mut x = envelope(&from.voice, origin, origin, hops);
-    if let Some((start, end)) = window {
-        for (h, v) in x.iter_mut().enumerate() {
-            let at = origin + h as u64 * 1000;
-            if at < start || at >= end {
-                *v = 0.0;
-            }
-        }
-    }
+    let x = envelope(&from.voice, origin, origin, hops);
     let y = envelope(&to.speaker, to.trace.device_us, origin, hops);
     let center = |v: &[f32]| {
         let m = v.iter().sum::<f32>() / v.len() as f32;
         v.iter().map(|s| (s - m) as f64).collect::<Vec<f64>>()
     };
-    let (x, y) = (center(&x), center(&y));
     let norm = |v: &[f64]| v.iter().map(|s| s * s).sum::<f64>().sqrt();
-    let (nx, ny) = (norm(&x), norm(&y));
+    let full = window.is_none().then(|| {
+        let (x, y) = (center(&x), center(&y));
+        let denominator = norm(&x) * norm(&y);
+        (x, y, denominator)
+    });
+    let (start, end) = window.map_or((0, hops), |(start, end)| {
+        (
+            ((start.saturating_sub(origin) / 1000) as usize).min(hops),
+            ((end.saturating_sub(origin) / 1000) as usize).min(hops),
+        )
+    });
     let mut best = Lag {
         lag_ms: f64::NAN,
         peak: 0.0,
     };
     for lag in 0..1500.min(hops) {
-        let c: f64 = x[..hops - lag]
-            .iter()
-            .zip(&y[lag..])
-            .map(|(a, b)| a * b)
-            .sum();
-        let c = c / (nx * ny);
+        let until = end.min(hops - lag);
+        if until <= start {
+            continue;
+        }
+        let c = if let Some((x, y, denominator)) = &full {
+            x[..hops - lag]
+                .iter()
+                .zip(&y[lag..])
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+                / denominator
+        } else {
+            let (x, y) = (
+                center(&x[start..until]),
+                center(&y[start + lag..until + lag]),
+            );
+            x.iter().zip(&y).map(|(a, b)| a * b).sum::<f64>() / (norm(&x) * norm(&y))
+        };
         if c > best.peak {
             best = Lag {
                 lag_ms: lag as f64,
@@ -1323,6 +1881,35 @@ fn acoustic_lag(from: &PlayerRun, to: &PlayerRun, window: Option<(u64, u64)>) ->
         }
     }
     best
+}
+
+#[test]
+fn acoustic_window_tracks_a_known_delay_without_unrelated_output() {
+    let voice = speech(33, 167.0, 3.0);
+    let mut speaker = vec![0.0; FS / 10];
+    speaker.extend_from_slice(&voice);
+    speaker.resize(4 * FS, 0.0);
+    let talker = PlayerRun {
+        voice,
+        speaker: Vec::new(),
+        trace: Trace {
+            device_us: 1_000_000,
+            ..Trace::default()
+        },
+    };
+    let listener = PlayerRun {
+        voice: Vec::new(),
+        speaker,
+        trace: Trace {
+            device_us: 1_000_000,
+            ..Trace::default()
+        },
+    };
+    for window in [None, Some((1_400_000, 2_200_000))] {
+        let lag = acoustic_lag(&talker, &listener, window);
+        assert_eq!(lag.lag_ms, 100.0);
+        assert!(lag.peak > 0.99, "known delay correlation {}", lag.peak);
+    }
 }
 
 struct Quality {
@@ -1447,12 +2034,46 @@ fn fit_two(out: &PlayerRun, one: (&PlayerRun, f64), two: (&PlayerRun, f64)) -> (
         ))
     };
     let (r1, r2) = (lagged(one), lagged(two));
-    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-    let (a11, a12, a22) = (dot(&r1, &r1), dot(&r1, &r2), dot(&r2, &r2));
-    let (b1, b2) = (dot(&r1, &y), dot(&r2, &y));
-    let det = a11 * a22 - a12 * a12;
-    let (g1, g2) = ((b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det);
+    let (g1, g2) =
+        power_fit(&y, &r1, &r2).expect("power regressors are singular or ill-conditioned");
     (10.0 * g1.log10(), 10.0 * g2.log10())
+}
+
+fn power_fit(y: &[f64], r1: &[f64], r2: &[f64]) -> Option<(f64, f64)> {
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let (a11, a12, a22) = (dot(r1, r1), dot(r1, r2), dot(r2, r2));
+    let (b1, b2) = (dot(r1, y), dot(r2, y));
+    let det = a11 * a22 - a12 * a12;
+    if a11 <= 0.0 || a22 <= 0.0 || !det.is_finite() || a12.abs() / (a11 * a22).sqrt() > 99.0 / 101.0
+    {
+        return None;
+    }
+    let (g1, g2) = ((b1 * a22 - b2 * a12) / det, (a11 * b2 - a12 * b1) / det);
+    // power cannot be negative; refit the remaining regressor at the nnls boundary.
+    Some(if g1 < 0.0 {
+        (0.0, (b2 / a22).max(0.0))
+    } else if g2 < 0.0 {
+        ((b1 / a11).max(0.0), 0.0)
+    } else {
+        (g1, g2)
+    })
+}
+
+#[test]
+fn power_fit_recovers_a_mixture_refits_zero_echo_and_rejects_collinearity() {
+    let r1 = [1.0, 0.0, 1.0, 0.0];
+    let r2 = [0.0, 1.0, 0.0, 1.0];
+    assert_eq!(
+        power_fit(&[0.5, 0.25, 0.5, 0.25], &r1, &r2),
+        Some((0.5, 0.25))
+    );
+    let r1 = [1.0, 0.0, 1.0];
+    let r2 = [0.5, 1.0, 0.0];
+    let y = [0.49, 0.0, 0.51];
+    // the unconstrained echo coefficient is negative; the boundary refits near power.
+    assert_eq!(power_fit(&y, &r1, &r2), Some((0.5, 0.0)));
+    assert_eq!(power_fit(&y, &r1, &r1), None);
+    assert_eq!(power_fit(&y, &r1, &[1.0, 0.001, 1.0]), None);
 }
 
 // ---- test signal

@@ -474,6 +474,13 @@ pub struct Pump {
 
 impl Pump {
     pub fn start(core: Core) -> std::io::Result<Pump> {
+        Self::start_with_stalls(core, Vec::new())
+    }
+
+    pub fn start_with_stalls(
+        core: Core,
+        stalls: Vec<(Duration, Duration)>,
+    ) -> std::io::Result<Pump> {
         let socket = UdpSocket::bind("127.0.0.1:0")?;
         socket.set_read_timeout(Some(Duration::from_millis(1)))?;
         let addr = socket.local_addr()?;
@@ -481,7 +488,7 @@ impl Pump {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (core, stop) = (Arc::clone(&core), Arc::clone(&stop));
-            thread::spawn(move || run(socket, core, stop))
+            thread::spawn(move || run(socket, core, stop, stalls))
         };
         Ok(Pump {
             addr,
@@ -505,7 +512,12 @@ impl Drop for Pump {
     }
 }
 
-fn run(socket: UdpSocket, core: Arc<Mutex<Core>>, stop: Arc<AtomicBool>) {
+fn run(
+    socket: UdpSocket,
+    core: Arc<Mutex<Core>>,
+    stop: Arc<AtomicBool>,
+    stalls: Vec<(Duration, Duration)>,
+) {
     let start = Instant::now();
     // one byte more than the limit, so an oversize datagram is seen rather than truncated
     let mut buf = [0u8; MAX_DATAGRAM + 1];
@@ -519,6 +531,9 @@ fn run(socket: UdpSocket, core: Arc<Mutex<Core>>, stop: Arc<AtomicBool>) {
         let mut core = core.lock().unwrap();
         if let Some((len, from)) = received {
             core.send_raw(now, from, &buf[..len]);
+        }
+        if stalls.iter().any(|&(from, to)| now >= from && now < to) {
+            continue;
         }
         for delivery in core.due(now) {
             let _ = socket.send_to(&delivery.envelope(), delivery.to);
