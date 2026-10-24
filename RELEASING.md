@@ -11,11 +11,16 @@ A release is one tag, `v<version>`. Pushing it runs `.github/workflows/release.y
 | `ptt-radio-companion-<ver>-windows-x86_64.zip` | the companion for Windows x86_64, `LICENSE`, `README.md` |
 | `ptt-radio-companion-<ver>-macos-universal.zip` | the companion for macOS (Apple silicon and Intel in one binary), `LICENSE`, `README.md` |
 | `ptt-radio-hub-<ver>-linux-x86_64.tar.gz`, `ptt-radio-hub-<ver>-linux-aarch64.tar.gz` | the static hub, `LICENSE` |
+| `install.sh`, `install.ps1` | companion installers, also available through `releases/latest/download/` |
 | `SHA256SUMS` | the SHA-256 of every asset above |
 
 The Linux companion is built inside an Ubuntu 22.04 container, so it needs glibc 2.35 or newer and runs on Ubuntu 22.04, Debian 12 and later; the run fails if the binary would need a newer glibc. That container is a deliberate exception to keeping every image at its latest version, made to hold the glibc 2.35 floor that this check enforces.
 
 The README inside each companion archive is written by `tools/archive-readme.sh`, which turns its repository-relative links into links to the tagged files on GitHub, since the archive holds only the binary, `LICENSE` and `README.md`.
+
+The publication job copies both installers from the tagged checkout and includes them in `SHA256SUMS`. Players install with `curl -fsSL https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh | sh` on macOS/Linux, or `irm https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 | iex` in Windows PowerShell. The installers resolve the latest release without a token, verify its platform archive, and stage the binary, license, README and `install.json` before replacing the existing installation. They do not install the mod; players install that through Factorio or its mod zip.
+
+Before release, run `uv run -q tools/test-installers.py` on macOS, Linux and Windows. The fixture server publishes only temporary fake archives; the test installs, updates, rejects a bad checksum, rejects an unsafe archive layout and rejects a missing download without running any binary. It verifies that previous files and `mod-list.json` survive failures. Windows uses PowerShell 5.1 or `pwsh`; run PSScriptAnalyzer there when available. Also run `sh -n install.sh`, `shellcheck install.sh` and `actionlint`. `PTT_RADIO_INSTALL_TEST_RELEASE_URL` is a test-only release-root override for local fixtures (`latest` redirect to `tag/<tag>`, plus `download/<tag>/`); leave it unset for real installations.
 
 The same run also pushes the hub image `ghcr.io/vshuraeff/ptt-radio-hub` with the tags `<ver>`, `<major>.<minor>` and `latest`. The release notes are the section of `mod/ptt-radio/changelog.txt` for that version.
 

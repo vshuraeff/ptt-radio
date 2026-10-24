@@ -361,7 +361,9 @@ jobs:
           pattern: hub-linux-*
           path: assets
           merge-multiple: true
-      # exactly the six archives of the release contract, then their checksums; the list is what gets published
+      - name: stage installers
+        run: cp install.sh install.ps1 assets/
+      # the six archives and two installers, then their checksums; the list is what gets published
       - name: check assets and write checksums
         working-directory: assets
         run: |
@@ -372,12 +374,14 @@ jobs:
             "ptt-radio-companion-$VERSION-macos-universal.zip"
             "ptt-radio-hub-$VERSION-linux-x86_64.tar.gz"
             "ptt-radio-hub-$VERSION-linux-aarch64.tar.gz"
+            "install.sh"
+            "install.ps1"
           )
           ls -l
           printf '%s\n' "${expected[@]}" | sort > "$RUNNER_TEMP/expected.txt"
           find . -mindepth 1 -printf '%P\n' | sort > "$RUNNER_TEMP/found.txt"
           if ! diff "$RUNNER_TEMP/expected.txt" "$RUNNER_TEMP/found.txt"; then
-            echo "::error::the downloaded assets differ from the six release archives (diff above: < missing, > unexpected)"
+            echo "::error::the assets differ from the six archives and two installers (diff above: < missing, > unexpected)"
             exit 1
           fi
           sha256sum -- "${expected[@]}" > SHA256SUMS
