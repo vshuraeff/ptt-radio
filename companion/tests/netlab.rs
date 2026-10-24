@@ -2,10 +2,21 @@
 //! cuts and hole punching on injected time, plus one test through the real udp pump.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::thread;
 use std::time::Duration;
 
+#[path = "netlab/lab.rs"]
+mod lab;
 #[path = "netlab/router.rs"]
 mod router;
+
+use lab::{Lab, LabPlayer, labelled};
+use ptt_radio_companion::transport::lab::{self as lab_path, LabPath, label};
+use ptt_radio_companion::transport::wire::{
+    Datagram, Header, Kind, ReceiverHandle, encode_datagram,
+};
+use ptt_radio_companion::transport::{Path, Transport};
+use std::time::Instant;
 
 use router::{
     Core, Edge, Filtering, Link, MAX_DATAGRAM, Mapping, NatConfig, PREFIX, Pump, Verdict,
@@ -583,4 +594,290 @@ fn pump_relays_through_real_sockets() {
         .filter(|t| t.verdict == Verdict::Forwarded)
         .count();
     assert_eq!(forwarded, 2);
+}
+
+// ---- the companion's lab path through the real pump
+
+fn player(mapping: Mapping, filtering: Filtering) -> LabPlayer {
+    LabPlayer {
+        nat: nat(1, mapping, filtering),
+        edge: Edge::default(),
+    }
+}
+
+// the public address the server sees for a path, like a stun reply
+fn learn_public(lab: &Lab, path: &mut LabPath, peer: u16) -> SocketAddrV4 {
+    path.set_route(peer, Path::Direct, lab.server_public);
+    path.send(peer, Path::Direct, &[0, 1]).unwrap();
+    lab.server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    let (len, _) = lab.server.recv_from(&mut buf).unwrap();
+    decode_addr(&buf[..len]).unwrap()
+}
+
+fn poll(path: &mut LabPath, within: Duration) -> Option<(Vec<u8>, SocketAddrV4)> {
+    let deadline = Instant::now() + within;
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline {
+        if let Some(got) = path.receive(&mut buf).unwrap() {
+            assert_eq!(got.path, Path::Direct);
+            return Some((buf[..got.length].to_vec(), path.last_source().unwrap()));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    None
+}
+
+fn two_paths(lab: &Lab) -> (LabPath, LabPath) {
+    let bind = |i: usize| LabPath::bind(lab.locals[i], lab.pump.addr).unwrap();
+    (bind(0), bind(1))
+}
+
+#[test]
+fn lab_envelope_matches_the_router() {
+    let addr = public(9, 40123);
+    assert_eq!(lab_path::encode_addr(addr), encode_addr(addr));
+    assert_eq!(lab_path::PREFIX, PREFIX);
+    assert_eq!(lab_path::MAX_DATAGRAM, MAX_DATAGRAM);
+}
+
+#[test]
+fn lab_path_round_trips_through_the_pump_under_eim() {
+    let eim = || player(Mapping::EndpointIndependent, Filtering::EndpointIndependent);
+    let lab = Lab::start(1, vec![eim(), eim()]);
+    let (mut a, mut b) = two_paths(&lab);
+    let (a_pub, b_pub) = (learn_public(&lab, &mut a, 1), learn_public(&lab, &mut b, 0));
+    assert_eq!(*a_pub.ip(), lab::player_ip(0));
+    assert_eq!(*b_pub.ip(), lab::player_ip(1));
+    a.set_route(1, Path::Direct, b_pub);
+    b.set_route(0, Path::Direct, a_pub);
+
+    a.send(1, Path::Direct, &[Kind::Voice as u8, 9, 9]).unwrap();
+    let (payload, source) = poll(&mut b, Duration::from_secs(2)).expect("a reaches b");
+    assert_eq!(payload, [Kind::Voice as u8, 9, 9]);
+    assert_eq!(source, a_pub);
+
+    b.send(0, Path::Direct, &[Kind::Pong as u8]).unwrap();
+    let (payload, source) = poll(&mut a, Duration::from_secs(2)).expect("b reaches a");
+    assert_eq!(payload, [Kind::Pong as u8]);
+    assert_eq!(source, b_pub);
+}
+
+#[test]
+fn lab_path_is_filtered_by_a_strict_nat_until_it_punches() {
+    let lab = Lab::start(
+        2,
+        vec![
+            player(Mapping::EndpointIndependent, Filtering::EndpointIndependent),
+            player(
+                Mapping::EndpointIndependent,
+                Filtering::AddressAndPortDependent,
+            ),
+        ],
+    );
+    let (mut a, mut b) = two_paths(&lab);
+    let (a_pub, b_pub) = (learn_public(&lab, &mut a, 1), learn_public(&lab, &mut b, 0));
+    a.set_route(1, Path::Direct, b_pub);
+    b.set_route(0, Path::Direct, a_pub);
+
+    a.send(1, Path::Direct, &[Kind::Start as u8]).unwrap();
+    assert!(poll(&mut b, Duration::from_millis(300)).is_none());
+    assert_eq!(
+        lab.labelled().last().copied(),
+        Some(("START", Verdict::Filtered))
+    );
+
+    // b punches towards a, which opens its permission for a's address
+    b.send(0, Path::Direct, &[Kind::Ping as u8]).unwrap();
+    assert!(poll(&mut a, Duration::from_secs(2)).is_some());
+    a.send(1, Path::Direct, &[Kind::Voice as u8]).unwrap();
+    let (payload, _) = poll(&mut b, Duration::from_secs(2)).expect("punched");
+    assert_eq!(payload, [Kind::Voice as u8]);
+}
+
+#[test]
+fn router_traces_are_labelled_by_datagram_type() {
+    let lab = Lab::start(
+        3,
+        vec![player(
+            Mapping::EndpointIndependent,
+            Filtering::EndpointIndependent,
+        )],
+    );
+    let mut a = LabPath::bind(lab.locals[0], lab.pump.addr).unwrap();
+    a.set_route(0, Path::Direct, lab.server_public);
+    for first in [1u8, Kind::Voice as u8, 0x11] {
+        a.send(0, Path::Direct, &[first, 0]).unwrap();
+    }
+    let mut buf = [0u8; 16];
+    lab.server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for _ in 0..3 {
+        lab.server.recv_from(&mut buf).unwrap();
+    }
+    let seen = labelled(&lab.pump.trace());
+    assert_eq!(
+        seen,
+        [
+            ("STUN", Verdict::Forwarded),
+            ("VOICE", Verdict::Forwarded),
+            ("BIND", Verdict::Forwarded),
+        ]
+    );
+}
+
+#[test]
+fn labels_cover_every_type_byte() {
+    for byte in 0..=u8::MAX {
+        let want = match byte {
+            0..=3 => "STUN",
+            4 => "VOICE",
+            5 => "START",
+            6 => "STOP",
+            7 => "PING",
+            8 => "PONG",
+            0x10 => "RELAY",
+            0x11 => "BIND",
+            0x12 => "BIND-ACK",
+            _ => "UNKNOWN",
+        };
+        assert_eq!(label(Some(byte)), want, "byte {byte:#04x}");
+    }
+    assert_eq!(label(None), "EMPTY");
+    // the encoder's own first bytes agree with the labels
+    for (kind, name) in [
+        (Kind::Voice, "VOICE"),
+        (Kind::Start, "START"),
+        (Kind::Stop, "STOP"),
+        (Kind::Ping, "PING"),
+        (Kind::Pong, "PONG"),
+    ] {
+        let wire = encode_datagram(Datagram::Encrypted {
+            header: Header {
+                kind,
+                phase: false,
+                receiver: ReceiverHandle(1),
+                counter: 1,
+            },
+            ciphertext: &[0; 21],
+        })
+        .unwrap();
+        assert_eq!(label(wire.first().copied()), name);
+    }
+}
+
+// a LabPath whose router is a bare socket the test controls, and that socket's address
+fn bare_router() -> (LabPath, UdpSocket, SocketAddr) {
+    let router = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let path = LabPath::bind(
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+        router.local_addr().unwrap(),
+    )
+    .unwrap();
+    let local = path.local_addr().unwrap();
+    (path, router, local)
+}
+
+fn envelope(source: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let mut out = encode_addr(source).to_vec();
+    out.extend_from_slice(payload);
+    out
+}
+
+// receives for `within` and returns every (path, payload) seen
+fn drain(path: &mut LabPath, within: Duration) -> Vec<(Path, Vec<u8>)> {
+    let deadline = Instant::now() + within;
+    let mut buf = [0u8; 2048];
+    let mut seen = Vec::new();
+    while Instant::now() < deadline {
+        match path.receive(&mut buf).unwrap() {
+            Some(got) => seen.push((got.path, buf[..got.length].to_vec())),
+            None => thread::sleep(Duration::from_millis(2)),
+        }
+    }
+    seen
+}
+
+#[test]
+fn lab_path_drops_envelopes_not_sent_by_the_router() {
+    let (mut path, router, local) = bare_router();
+    let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let forged = public(7, 5000);
+    intruder.send_to(&envelope(forged, b"evil"), local).unwrap();
+    // the real router's datagram after it still arrives
+    let genuine = public(8, 6000);
+    router.send_to(&envelope(genuine, b"good"), local).unwrap();
+    let seen = drain(&mut path, Duration::from_millis(300));
+    assert_eq!(seen, [(Path::Direct, b"good".to_vec())]);
+    assert_eq!(path.last_source(), Some(genuine));
+
+    // a lone forgery leaves nothing behind
+    let (mut path, _router, local) = bare_router();
+    intruder.send_to(&envelope(forged, b"evil"), local).unwrap();
+    assert!(drain(&mut path, Duration::from_millis(200)).is_empty());
+    assert_eq!(path.last_source(), None);
+}
+
+#[test]
+fn lab_path_drops_an_oversize_envelope_from_the_router() {
+    let (mut path, router, local) = bare_router();
+    let source = public(7, 5000);
+    for size in [MAX_DATAGRAM + 1, 3 * 1000 + PREFIX] {
+        router
+            .send_to(&envelope(source, &vec![0xaa; size - PREFIX]), local)
+            .unwrap();
+    }
+    assert!(drain(&mut path, Duration::from_millis(300)).is_empty());
+    assert_eq!(path.last_source(), None);
+
+    // exactly at the cap still passes
+    router
+        .send_to(&envelope(source, &vec![0xbb; MAX_DATAGRAM - PREFIX]), local)
+        .unwrap();
+    let seen = drain(&mut path, Duration::from_millis(300));
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1.len(), MAX_DATAGRAM - PREFIX);
+}
+
+#[test]
+fn lab_path_tells_relay_sessions_at_one_endpoint_apart() {
+    let (mut path, router, local) = bare_router();
+    let hub = public(50, 3478);
+    path.set_route(1, Path::Hub { session: 11 }, hub);
+    path.set_route(1, Path::Hub { session: 22 }, hub);
+    let wrapped = |session: u32| {
+        let mut out = vec![0x10];
+        out.extend_from_slice(&session.to_be_bytes());
+        out.extend_from_slice(&[Kind::Voice as u8, 1, 2]);
+        out
+    };
+    for session in [11, 22, 22, 11, 33] {
+        router
+            .send_to(&envelope(hub, &wrapped(session)), local)
+            .unwrap();
+    }
+    // an unwrapped datagram cannot name a session either
+    router
+        .send_to(&envelope(hub, &[Kind::Ping as u8]), local)
+        .unwrap();
+    let paths: Vec<Path> = drain(&mut path, Duration::from_millis(400))
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            Path::Hub { session: 11 },
+            Path::Hub { session: 22 },
+            Path::Hub { session: 22 },
+            Path::Hub { session: 11 },
+            Path::Direct,
+            Path::Direct,
+        ]
+    );
+    // the raw public source stays visible for ICE
+    assert_eq!(path.last_source(), Some(hub));
 }

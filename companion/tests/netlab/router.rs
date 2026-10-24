@@ -92,6 +92,8 @@ pub struct Trace {
     pub from: Option<SocketAddrV4>,
     pub to: Option<SocketAddrV4>,
     pub verdict: Verdict,
+    // first payload byte, the u13 datagram type; the rest of the payload stays opaque
+    pub first: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -237,7 +239,7 @@ impl Core {
         match decode_addr(datagram) {
             // send enforces the size limit
             Some(to) => self.send(now, from_private, to, &datagram[PREFIX..]),
-            None => self.record(now, None, None, Verdict::Malformed),
+            None => self.record(now, None, None, Verdict::Malformed, None),
         }
     }
 
@@ -248,11 +250,12 @@ impl Core {
         to_public: SocketAddrV4,
         payload: &[u8],
     ) {
+        let first = payload.first().copied();
         if PREFIX + payload.len() > MAX_DATAGRAM {
-            return self.record(now, None, Some(to_public), Verdict::Oversize);
+            return self.record(now, None, Some(to_public), Verdict::Oversize, first);
         }
         let Some(ep) = self.endpoints.get(&from_private) else {
-            return self.record(now, None, Some(to_public), Verdict::UnknownSource);
+            return self.record(now, None, Some(to_public), Verdict::UnknownSource, first);
         };
         let (ep_ip, ep_nat, ep_server) = (ep.ip, ep.nat, ep.server);
         let from_public = match (ep_server, ep_nat) {
@@ -260,7 +263,13 @@ impl Core {
             (None, Some(nat)) => {
                 if *to_public.ip() == ep_ip && !nat.hairpin {
                     let unmapped = SocketAddrV4::new(ep_ip, 0);
-                    return self.record(now, Some(unmapped), Some(to_public), Verdict::Filtered);
+                    return self.record(
+                        now,
+                        Some(unmapped),
+                        Some(to_public),
+                        Verdict::Filtered,
+                        first,
+                    );
                 }
                 self.map_out(now, from_private, ep_ip, nat, to_public)
             }
@@ -289,10 +298,16 @@ impl Core {
             .iter()
             .any(|&(from, until)| now >= from && now < until)
         {
-            return self.record(now, Some(from_public), Some(to_public), Verdict::Cut);
+            return self.record(now, Some(from_public), Some(to_public), Verdict::Cut, first);
         }
         if link.loss > 0.0 && self.unit() < link.loss {
-            return self.record(now, Some(from_public), Some(to_public), Verdict::Lost);
+            return self.record(
+                now,
+                Some(from_public),
+                Some(to_public),
+                Verdict::Lost,
+                first,
+            );
         }
         let jitter = link.jitter.as_secs_f64();
         let offset = (self.unit() * 2.0 - 1.0) * jitter;
@@ -330,7 +345,8 @@ impl Core {
         for p in ready {
             let from = p.delivery.from;
             let verdict = self.admit(p.at, p.to_public, from);
-            self.record(p.at, Some(from), Some(p.to_public), verdict);
+            let first = p.delivery.payload.first().copied();
+            self.record(p.at, Some(from), Some(p.to_public), verdict, first);
             if verdict == Verdict::Forwarded {
                 let mut delivery = p.delivery;
                 if let Some(private) = self.servers.get(&p.to_public) {
@@ -426,12 +442,14 @@ impl Core {
         from: Option<SocketAddrV4>,
         to: Option<SocketAddrV4>,
         verdict: Verdict,
+        first: Option<u8>,
     ) {
         self.trace.push(Trace {
             at,
             from,
             to,
             verdict,
+            first,
         });
     }
 

@@ -31,6 +31,7 @@ use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
 use ptt_radio_companion::mix::{self, Mixer, Mute, SLICE_SAMPLES};
 use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
+use ptt_radio_companion::transport::lab::LabPath;
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
@@ -111,6 +112,12 @@ struct Args {
     /// test: append per-frame timestamps to this file for the end-to-end scenarios
     #[arg(long, value_name = "FILE")]
     trace: Option<PathBuf>,
+    /// test: bind a network-lab path (src/transport/lab.rs) to this router inside address; nothing sends through it yet
+    #[arg(long, value_name = "ADDR")]
+    netlab: Option<SocketAddr>,
+    /// test: private address of the lab path, as registered with the router (default 127.0.0.1:0)
+    #[arg(long, value_name = "ADDR", requires = "netlab")]
+    netlab_bind: Option<SocketAddr>,
 }
 
 struct Shared {
@@ -190,6 +197,20 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         args.port,
         args.game_port
     );
+
+    // held until exit so the router keeps a live endpoint for this player
+    let _lab = match args.netlab {
+        Some(router) => {
+            let local = args
+                .netlab_bind
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+            let path = LabPath::bind(local, router)
+                .map_err(|err| format!("--netlab-bind {local}: {err}"))?;
+            println!("netlab: path {} via router {router}", path.local_addr()?);
+            Some(path)
+        }
+        None => None,
+    };
 
     let ptt_key = match args.ptt_key.as_str() {
         "none" => None,
