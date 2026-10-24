@@ -196,11 +196,14 @@ impl OutputHistory {
                 .iter()
                 .any(|(_, senders)| senders.iter().any(|(sender, _)| players.contains(sender)));
         let carry = all || self.carry.iter().any(|sender| players.contains(sender));
+        // silence keeps the queue's length: the echo reference already holds these samples,
+        // and shrinking the queue would let playout refill ahead of the device timeline
         let dropped = if queued {
-            let dropped = queue.len();
-            queue.clear();
-            self.queued.clear();
-            dropped
+            queue.iter_mut().for_each(|sample| *sample = 0.0);
+            for (_, senders) in &mut self.queued {
+                senders.clear();
+            }
+            queue.len()
         } else {
             0
         };
@@ -1455,11 +1458,20 @@ mod tests {
         };
         assert_eq!(queued, 1439);
         remove(&shared, &[2]);
-        assert!(samples.lock().unwrap().is_empty());
-        assert!(shared.output_history.lock().unwrap().carry.is_empty());
+        // silenced in place: the device timeline the echo reference follows keeps its length
+        assert_eq!(samples.lock().unwrap().len(), queued);
+        assert!(samples.lock().unwrap().iter().all(|sample| *sample == 0.0));
+        let history = shared.output_history.lock().unwrap();
+        assert!(history.carry.is_empty());
+        assert!(history.queued.iter().all(|(_, senders)| senders.is_empty()));
+        assert_eq!(
+            history.queued.iter().map(|entry| entry.0).sum::<usize>(),
+            queued
+        );
+        drop(history);
         assert_eq!(shared.output_reset.load(Relaxed), 1);
         println!(
-            "mixed output cut: {queued} -> 0 samples ({:.6} ms at {OPUS_RATE} Hz)",
+            "mixed output silenced: {queued} samples ({:.6} ms at {OPUS_RATE} Hz)",
             queued as f64 * 1000.0 / OPUS_RATE as f64
         );
         let mut resampler = Some(Resampler::new(OPUS_RATE, OPUS_RATE));
@@ -1515,6 +1527,7 @@ mod tests {
         drop(queue);
         assert!(renderer.join().unwrap().audible);
         revoker.join().unwrap();
-        assert!(samples.lock().unwrap().is_empty());
+        let queue = samples.lock().unwrap();
+        assert!(!queue.is_empty() && queue.iter().all(|sample| *sample == 0.0));
     }
 }
