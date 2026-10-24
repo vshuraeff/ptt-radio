@@ -59,7 +59,7 @@ fn check(opt_out: bool) -> Result<String, String> {
     if option_env!("PTT_RADIO_RELEASE_BUILD") != Some("1") {
         return Ok("disabled (not a release build)".into());
     }
-    if opt_out || env::var_os(OPT_OUT_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
+    if opt_out || env_flag(OPT_OUT_ENV) {
         return Ok("disabled (opted out)".into());
     }
     let current = Version::parse(env!("CARGO_PKG_VERSION")).map_err(|err| err.to_string())?;
@@ -100,6 +100,11 @@ fn check(opt_out: bool) -> Result<String, String> {
     let exe = env::current_exe().map_err(|err| format!("current executable: {err}"))?;
     install(&exe, &binary)?;
     Err(relaunch(&exe, &latest))
+}
+
+/// an opt-out variable is on when set to anything but empty or "0"
+pub fn env_flag(name: &str) -> bool {
+    env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 fn agent() -> ureq::Agent {

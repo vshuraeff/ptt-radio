@@ -937,3 +937,245 @@ fn open_mic_mute_and_reenable_uses_a_fresh_talkspurt_with_an_empty_send_set() {
         dir.display()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn launch_mode_runs_the_game_and_exits_with_its_status_after_a_clean_shutdown() {
+    let dir = directory("launch");
+    fs::create_dir_all(&dir).unwrap();
+    let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = game.local_addr().unwrap().port().to_string();
+    let argv = dir.join("argv");
+    let script = format!(
+        "printf '%s\\n' \"$@\" > '{}'; sleep 1; exit 3",
+        argv.display()
+    );
+    let log = fs::File::create(dir.join("companion.log")).unwrap();
+    let mut process = Process(
+        Command::new(env!("CARGO_BIN_EXE_ptt-radio-companion"))
+            .args(["--port", "0", "--game-port", &port])
+            .args([
+                "--ptt-key",
+                "none",
+                "--aec",
+                "off",
+                "--tone",
+                "660",
+                "--game-only",
+            ])
+            .args(["--exit-after", "20", "--speaker-wav"])
+            .arg(dir.join("speaker.wav"))
+            .args([
+                "--launch",
+                "/bin/sh",
+                "-c",
+                &script,
+                "game",
+                "--mp-connect",
+                "host",
+            ])
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let began = Instant::now();
+    let status = loop {
+        if let Some(status) = process.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{}",
+            dir.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let log = fs::read_to_string(dir.join("companion.log")).unwrap();
+    assert_eq!(status.code(), Some(3), "{log}");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "ends with the game, {log}"
+    );
+    assert_eq!(
+        fs::read_to_string(&argv).unwrap(),
+        format!("--mp-connect\nhost\n--enable-lua-udp\n{port}\n")
+    );
+    assert!(
+        log.contains("game exited") && log.contains("stats: "),
+        "{log}"
+    );
+}
+
+fn self_monitor(revision: u64, tx: bool) -> Vec<u8> {
+    signaling::encode_policy(&Policy {
+        audience: Audience {
+            revision,
+            send_to: vec![],
+            receive_from: vec![],
+        },
+        tx_permitted: tx,
+        self_monitor: tx,
+    })
+    .unwrap()
+}
+
+/// plays the game for player 1 until the RESULT of `id`: its policy media go back to it
+/// 60 ms later when `echo` is set. returns the result and the talkspurt of each echoed VOICE
+fn self_test_result(
+    game: &UdpSocket,
+    companion: SocketAddr,
+    id: u16,
+    echo: bool,
+) -> (packet::SelfTestResult, Vec<u16>) {
+    game.send_to(
+        &[
+            packet::MAGIC,
+            packet::VERSION,
+            packet::SELF_TEST,
+            0,
+            0,
+            (id >> 8) as u8,
+            id as u8,
+        ],
+        companion,
+    )
+    .unwrap();
+    game.set_read_timeout(Some(Duration::from_millis(1)))
+        .unwrap();
+    let began = Instant::now();
+    let mut pending: Vec<(Instant, Vec<u8>)> = Vec::new();
+    let mut talkspurts = Vec::new();
+    let mut buf = [0; 2048];
+    loop {
+        assert!(began.elapsed() < Duration::from_secs(15), "no RESULT {id}");
+        pending.retain(|(at, bytes)| {
+            if Instant::now() < *at {
+                return true;
+            }
+            game.send_to(bytes, companion).unwrap();
+            false
+        });
+        let Ok((len, _)) = game.recv_from(&mut buf) else {
+            continue;
+        };
+        let bytes = &buf[..len];
+        if let Some(result) = packet::decode_self_test_result(bytes) {
+            assert_eq!(result.test_id, id);
+            return (result, talkspurts);
+        }
+        if echo
+            && matches!(
+                bytes[2],
+                wire::GAME_POLICY_START | wire::GAME_POLICY_VOICE | wire::GAME_POLICY_STOP
+            )
+        {
+            let mut forwarded = bytes[..3].to_vec();
+            forwarded.extend_from_slice(&1u16.to_be_bytes());
+            forwarded.extend_from_slice(&bytes[3..]);
+            if bytes[2] == wire::GAME_POLICY_VOICE {
+                talkspurts.push(
+                    wire::decode_policy_game(&forwarded)
+                        .unwrap()
+                        .media
+                        .talkspurt,
+                );
+            }
+            pending.push((Instant::now() + Duration::from_millis(60), forwarded));
+        }
+    }
+}
+
+fn amplitude(samples: &[f32], hz: f64) -> f64 {
+    let (mut real, mut imaginary) = (0.0, 0.0);
+    for (index, value) in samples.iter().enumerate() {
+        let phase = std::f64::consts::TAU * hz * index as f64 / f64::from(OPUS_RATE);
+        real += f64::from(*value) * phase.cos();
+        imaginary += f64::from(*value) * phase.sin();
+    }
+    2.0 * real.hypot(imaginary) / samples.len() as f64
+}
+
+#[test]
+#[ignore = "real companion process with the virtual device; requires the realtime lock"]
+fn self_test_plays_its_tone_and_the_returned_recording_through_half_duplex() {
+    let dir = directory("self-test");
+    let (mut process, game, companion) =
+        start_with_args(&dir, "660", "16", &["--game-only".into()]);
+    for bytes in [
+        packet::encode(packet::ROSTER, 0, b"1\tself\t255,0,0"),
+        packet::encode(packet::MIC_STATE, 1, &[1]),
+        packet::encode(packet::HALF_DUPLEX, 1, &[1]),
+        self_monitor(7, true),
+    ] {
+        game.send_to(&bytes, companion).unwrap();
+    }
+    let (busy, _) = self_test_result(&game, companion, 1, false);
+    assert_eq!(busy.outcome, packet::Outcome::Busy, "open mic is on");
+    game.send_to(&packet::encode(packet::MIC_STATE, 1, &[0]), companion)
+        .unwrap();
+    game.send_to(&self_monitor(8, false), companion).unwrap();
+    let (denied, _) = self_test_result(&game, companion, 2, false);
+    assert_eq!(denied.outcome, packet::Outcome::TxNotPermitted);
+    game.send_to(&self_monitor(9, true), companion).unwrap();
+    // the POLICY is installed before the request: both travel the same socket in order
+    let started_us = unix_us();
+    let (result, talkspurts) = self_test_result(&game, companion, 0x1234, true);
+    let finished_us = unix_us();
+    assert!(process.0.wait().unwrap().success());
+    println!(
+        "self-test {result:?} in {} ms, artifacts={}",
+        (finished_us - started_us) / 1000,
+        dir.display()
+    );
+    assert_eq!(result.outcome, packet::Outcome::Ok, "{}", dir.display());
+    assert_eq!(result.tone, 1);
+    // --tone plays at 0.3, about -10 dBFS
+    assert!((-12..=-9).contains(&result.mic_peak_dbfs), "{result:?}");
+    assert_eq!(result.frames_sent, 150, "3 s of 20 ms frames, no pre-roll");
+    assert_eq!(talkspurts.len(), 150);
+    assert!(
+        talkspurts.iter().all(|t| *t == talkspurts[0]),
+        "one talkspurt"
+    );
+    assert_eq!(result.frames_returned, result.frames_sent);
+    assert!((60..300).contains(&result.first_return_ms), "{result:?}");
+    // the RESULT follows the last frame by 2 s: tone, capture, send and wait
+    let elapsed_ms = (finished_us - started_us) / 1000;
+    assert!((8_400..10_000).contains(&elapsed_ms), "{elapsed_ms} ms");
+
+    let trace = fs::read_to_string(dir.join("companion.trace")).unwrap();
+    let device_us: u64 = trace
+        .lines()
+        .find_map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .filter(|w| *w == "device")
+                .map(|_| line)
+        })
+        .and_then(|line| line.split_whitespace().nth(2))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut wav = hound::WavReader::open(dir.join("speaker.wav")).unwrap();
+    let samples: Vec<f32> = wav.samples::<f32>().collect::<Result<_, _>>().unwrap();
+    let at = |us: u64| ((us - device_us) * u64::from(OPUS_RATE) / 1_000_000) as usize;
+    let tone = &samples[at(started_us + 50_000)..at(started_us + 450_000)];
+    assert!(
+        amplitude(tone, 440.0) > 0.2,
+        "local tone {}",
+        amplitude(tone, 440.0)
+    );
+    assert!(
+        amplitude(tone, 660.0) < 0.01,
+        "the input is not played before it is sent"
+    );
+    // the returned copy plays while half-duplex is on: the test never holds PTT
+    let echo = &samples[at(started_us + 4_000_000)..at(started_us + 6_500_000)];
+    assert!(
+        amplitude(echo, 660.0) > 0.1,
+        "returned copy {}",
+        amplitude(echo, 660.0)
+    );
+    assert!(amplitude(echo, 440.0) < 0.01, "the tone is never sent");
+}

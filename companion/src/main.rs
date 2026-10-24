@@ -9,18 +9,23 @@
 //! everything OS-specific is in ptt_key.rs; audio goes through cpal, or
 //! through the virtual device (src/virtual_audio.rs) for tests.
 
+mod launch;
 mod ptt_key;
+mod self_test;
+#[cfg(feature = "self-update")]
+mod self_uninstall;
 #[cfg(feature = "self-update")]
 mod self_update;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Child, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -34,7 +39,9 @@ use ptt_radio_companion::audio::{self, OPUS_RATE, Resampler, Samples};
 use ptt_radio_companion::echo::{self, EchoPath};
 use ptt_radio_companion::jitter::SLICE;
 use ptt_radio_companion::mix::{self, MediaOutcome, Mixer, Mute, SLICE_SAMPLES};
-use ptt_radio_companion::packet::{self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, VOICE};
+use ptt_radio_companion::packet::{
+    self, ECHO_STATE, HELLO, Incoming, RosterEntry, START, SelfTestResult, VOICE,
+};
 use ptt_radio_companion::quality::Reporter;
 use ptt_radio_companion::runtime::{Media, Output, Runtime, RuntimeConfig};
 use ptt_radio_companion::runtime_io::{Network, Resolver};
@@ -42,6 +49,7 @@ use ptt_radio_companion::transport::wire::Kind;
 use ptt_radio_companion::tx::{Codec, Transmitter};
 use ptt_radio_companion::virtual_audio::{self, Coupling, VirtualDevice};
 use ptt_radio_companion::{percentile, unix_us};
+use self_test::{Fence, Frame, SelfTest};
 
 /// audio kept queued ahead of the output device
 const OUTPUT_AHEAD: Duration = Duration::from_millis(20);
@@ -144,6 +152,22 @@ struct Args {
     #[cfg(feature = "self-update")]
     #[arg(long)]
     no_self_update: bool,
+    /// keep the install directory when the ptt-radio mod is gone (also PTT_RADIO_NO_SELF_UNINSTALL=1)
+    #[cfg(feature = "self-update")]
+    #[arg(long)]
+    no_self_uninstall: bool,
+    /// start the game with this command line and exit with it (Steam: --launch %command%);
+    /// everything after it is the game's, and --enable-lua-udp <game-port> is appended
+    /// unless present
+    #[arg(
+        long,
+        value_name = "GAME",
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_parser = clap::value_parser!(OsString)
+    )]
+    launch: Vec<OsString>,
 }
 
 struct Shared {
@@ -166,6 +190,8 @@ struct Shared {
     output: OnceLock<(Samples, u32)>,
     output_history: Mutex<OutputHistory>,
     output_reset: AtomicU64,
+    // a leaf lock: never held while taking another
+    self_test: Mutex<SelfTest>,
 }
 
 #[derive(Default)]
@@ -236,11 +262,30 @@ impl Shared {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    // before any socket, audio device or hotkey: a newer release re-launches from here
+    // before any socket, audio device or hotkey: a newer release re-launches from here,
+    // with the same arguments, --launch and the game's command line included
     #[cfg(feature = "self-update")]
     self_update::at_startup(args.no_self_update);
+    #[cfg(feature = "self-update")]
+    if self_uninstall::check(args.no_self_uninstall) {
+        // the game the player started through --launch still starts, without the companion
+        return if args.launch.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            launch::run_alone(&args.launch, args.game_port)
+        };
+    }
+    #[cfg(feature = "self-update")]
+    let (launched, no_self_uninstall) = (!args.launch.is_empty(), args.no_self_uninstall);
     match run(args) {
-        Ok(code) => code,
+        Ok(code) => {
+            // the game has exited: the mod may have been removed from its own mod manager
+            #[cfg(feature = "self-update")]
+            if launched {
+                self_uninstall::check(no_self_uninstall);
+            }
+            code
+        }
         Err(err) => {
             eprintln!("error: {err}");
             ExitCode::FAILURE
@@ -316,6 +361,7 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         output: OnceLock::new(),
         output_history: Mutex::new(OutputHistory::default()),
         output_reset: AtomicU64::new(0),
+        self_test: Mutex::default(),
     });
     let hello = packet::encode(
         HELLO,
@@ -461,6 +507,14 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         codec.complexity,
         codec.fec as u8
     ));
+    // the companion is ready before the game starts; a spawn failure ends it here
+    let mut game = if args.launch.is_empty() {
+        None
+    } else {
+        let child = launch::spawn(&args.launch, args.game_port)?;
+        println!("game started (pid {})", child.id());
+        Some(child)
+    };
     let tx_thread = {
         let shared = shared.clone();
         thread::spawn(move || transmit(&shared, source, codec))
@@ -495,9 +549,28 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         if exit_at.is_some_and(|at| now >= at) {
             break;
         }
+        // the usual shutdown below sends STOP before the device closes
+        match game.as_mut().map(Child::try_wait) {
+            None | Some(Ok(None)) => {}
+            Some(Ok(Some(status))) => {
+                println!("game exited ({status})");
+                code = launch::exit_code(status);
+                break;
+            }
+            Some(Err(err)) => {
+                eprintln!("--launch: cannot watch the game: {err}");
+                code = ExitCode::FAILURE;
+                break;
+            }
+        }
         if let Some(microphone) = &mut microphone {
             microphone.update(&shared, now, audio::open_input);
         }
+        drive_self_test(
+            &shared,
+            now,
+            microphone.as_ref().is_none_or(|m| m.stream.is_some()),
+        );
         // heartbeat for the whole lifetime: the mod marks the companion offline after 15 s without HELLO
         if now >= next_hello {
             send(&shared, &hello);
@@ -590,6 +663,57 @@ fn send(shared: &Shared, packet: &[u8]) {
 fn send_echo_state(shared: &Shared, engaged: bool) {
     send(shared, &packet::encode(ECHO_STATE, 0, &[engaged as u8]));
     shared.trace(format_args!("echo_state {}", engaged as u8));
+}
+
+/// starts a requested self-test and ends a running one on time (main thread)
+fn drive_self_test(shared: &Shared, now: Instant, mic_open: bool) {
+    if shared.self_test.lock().unwrap().idle() {
+        return;
+    }
+    // the gate the transmit path applies to this source
+    let (permitted, reset) = {
+        let runtime = &shared.runtime.lock().unwrap().0;
+        let (policy_permitted, _, reset) = runtime.capture_policy();
+        let permitted = if shared.real_mic {
+            runtime.microphone_permitted(now)
+        } else {
+            policy_permitted
+        };
+        (permitted, reset)
+    };
+    let status = self_test::Status {
+        busy: shared.ptt.load(Relaxed) || shared.open_mic.load(Relaxed),
+        permitted,
+        reset,
+        mic_open,
+        playback: shared.output.get().is_some(),
+    };
+    let result = shared.self_test.lock().unwrap().poll(now, status);
+    if let Some(result) = result {
+        send_self_test_result(shared, &result);
+    }
+}
+
+fn send_self_test_result(shared: &Shared, result: &SelfTestResult) {
+    send(shared, &packet::encode_self_test_result(result));
+    println!(
+        "self-test {}: {:?}, tone {}, mic peak {} dBFS, sent {} returned {} frames, first return {} ms",
+        result.test_id,
+        result.outcome,
+        result.tone,
+        result.mic_peak_dbfs,
+        result.frames_sent,
+        result.frames_returned,
+        result.first_return_ms
+    );
+    shared.trace(format_args!(
+        "self_test {} {} {} {} {}",
+        result.test_id,
+        result.outcome as u8,
+        result.tone,
+        result.frames_sent,
+        result.frames_returned
+    ));
 }
 
 enum Source {
@@ -785,6 +909,7 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
     let mut frame = 0;
     let mut gate = false;
     let mut generation = None;
+    let mut test_on_air = false;
     while let Some(Captured {
         mut pcm,
         generation: captured_generation,
@@ -835,7 +960,47 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
         }
         let (permitted, revision, reset) = runtime.capture_policy();
         tx.set_policy(permitted, revision, reset);
-        sent += send_packets(shared, runtime, network, tx.frame(&pcm), frame, ready_us);
+        // a self-test records through this same gate, then sends its recording in place of
+        // the input as one talkspurt of this transmitter; shared.ptt stays untouched. it sees
+        // the fence this frame passed, so a deny and allow between polls drops its recording.
+        // lock order: capture, runtime, then self_test as the leaf
+        let now = Instant::now();
+        let fence = Fence {
+            reset,
+            generation: captured_generation,
+        };
+        let test = shared
+            .self_test
+            .lock()
+            .unwrap()
+            .frame(&pcm, now, permitted, fence);
+        let testing = matches!(test, Frame::Send { .. });
+        let packets = match test {
+            Frame::Send { pcm, last } => {
+                if !test_on_air {
+                    tx.clear_preroll();
+                }
+                test_on_air = !last;
+                tx.set_ptt(!last);
+                tx.set_open_mic(false);
+                tx.frame(&pcm)
+            }
+            Frame::Live => {
+                // a test that ended early still closes its talkspurt first
+                let mut packets = if std::mem::take(&mut test_on_air) {
+                    tx.close()
+                } else {
+                    Vec::new()
+                };
+                packets.extend(tx.frame(&pcm));
+                packets
+            }
+        };
+        let voices = send_packets(shared, runtime, network, packets, frame, ready_us);
+        if testing {
+            shared.self_test.lock().unwrap().sent(voices, now);
+        }
+        sent += voices;
         frame += 1;
     }
     if matches!(source, Source::Gated(_)) {
@@ -983,6 +1148,10 @@ fn accept_media(
         }
     };
     let taken = outcome == MediaOutcome::Accepted;
+    // only a self-monitor POLICY lets the own stream back in
+    if taken && media.kind == Kind::Voice && runtime.local_player() == Some(media.stream.player) {
+        shared.self_test.lock().unwrap().returned(now);
+    }
     if media.kind == Kind::Voice {
         if taken {
             shared.trace(format_args!(
@@ -1133,6 +1302,14 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
                 continue;
             }
         }
+        // the generic parser does not know SELF_TEST; the main thread starts the run
+        if let Some(id) = packet::parse_self_test(&buf[..len]) {
+            let busy = shared.self_test.lock().unwrap().request(id);
+            if let Some(result) = busy {
+                send_self_test_result(shared, &result);
+            }
+            continue;
+        }
         let Some(incoming) = packet::parse(&buf[..len]) else {
             if stats.ignored == 0 {
                 eprintln!(
@@ -1278,6 +1455,8 @@ fn pull_playout(
     for (sample, gain) in pcm.iter_mut().zip(gains) {
         *sample *= gain;
     }
+    // the self-test tone sounds here, so the echo reference below includes it
+    shared.self_test.lock().unwrap().tone(&mut pcm);
     shared.echo.far_end(&pcm);
     let mut slot = 0;
     if let (Some((samples, _, popped)), Some(resampler)) = (output, resampler.as_mut()) {
@@ -1468,6 +1647,40 @@ mod tests {
         .unwrap();
         let (runtime, network) = &mut *shared.runtime.lock().unwrap();
         game_signal(shared, runtime, network, &bytes, now, None).unwrap();
+    }
+
+    #[test]
+    fn launch_takes_every_later_argument_as_the_game_command_line() {
+        let args = Args::try_parse_from([
+            "ptt-radio-companion",
+            "--port",
+            "1",
+            "--launch",
+            "/games/factorio",
+            "--mp-connect",
+            "host",
+            "--port",
+            "9",
+            "-v",
+            "--launch",
+        ])
+        .unwrap();
+        assert_eq!(args.port, 1);
+        assert_eq!(
+            args.launch,
+            [
+                "/games/factorio",
+                "--mp-connect",
+                "host",
+                "--port",
+                "9",
+                "-v",
+                "--launch"
+            ]
+        );
+        let plain = Args::try_parse_from(["ptt-radio-companion", "--game-port", "7"]).unwrap();
+        assert!(plain.launch.is_empty());
+        assert!(Args::try_parse_from(["ptt-radio-companion", "--launch"]).is_err());
     }
 
     #[test]
@@ -1762,6 +1975,7 @@ mod tests {
             output: OnceLock::new(),
             output_history: Mutex::new(OutputHistory::default()),
             output_reset: AtomicU64::new(0),
+            self_test: Mutex::default(),
         });
         let samples = Samples::default();
         shared.output.set((samples.clone(), OPUS_RATE)).unwrap();
