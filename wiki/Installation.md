@@ -1,0 +1,70 @@
+# Installation
+
+When you finish this page, the mod is installed in your game, the companion is unpacked on your computer, and the game starts with the flag the radio needs.
+
+Three things have to be in place:
+
+- the mod on the server **and** in every player's game: it is not a client-only mod, and Factorio will not let you join with a different mod set;
+- the companion on every player's computer, running on the same computer as the game;
+- the game started with `--enable-lua-udp <port>`, so the mod can talk to the companion.
+
+The mod needs Factorio 2.1. For the server side, see [Server Setup](Server-Setup).
+
+## 1. Install the mod
+
+**From the mod portal.** In the game, open *Mods*, search for *PTT Radio*, install it and restart the game. If the server already runs the mod, the game also offers to download it when you join.
+
+**From the zip.**
+
+1. Download `ptt-radio_<version>.zip` from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases).
+2. Put the zip, unchanged, into your Factorio `mods` folder:
+   - Windows: `%APPDATA%\Factorio\mods`
+   - macOS: `~/Library/Application Support/factorio/mods`
+   - Linux: `~/.factorio/mods`
+3. Start the game and check that *PTT Radio* is enabled under *Mods*.
+
+## 2. Download the companion
+
+1. Open the [Releases page](https://github.com/vshuraeff/ptt-radio/releases) and download the file for your system:
+
+   | System | File |
+   | --- | --- |
+   | Windows (64-bit) | `ptt-radio-companion-<version>-windows-x86_64.zip` |
+   | macOS (Apple silicon and Intel) | `ptt-radio-companion-<version>-macos-universal.zip` |
+   | Linux (x86_64, glibc 2.35 or newer: Ubuntu 22.04+, Debian 12+) | `ptt-radio-companion-<version>-linux-x86_64.tar.gz` |
+
+2. Optional: check the download against `SHA256SUMS` from the same release, for example `sha256sum --check --ignore-missing SHA256SUMS` on Linux or `shasum -a 256 <file>` on macOS.
+3. Unpack it into a folder you can write to, so the companion can update itself later. Inside is one program, `ptt-radio-companion` (`ptt-radio-companion.exe` on Windows), plus `LICENSE` and `README.md`.
+
+Use the companion from the same release as the mod. The first start, the push-to-talk key and the OS permission prompts are covered in [Companion](Companion).
+
+## 3. Add the launch flag
+
+The game must start with `--enable-lua-udp 34556`. `34556` is the port the companion expects by default (its `--game-port`). If you pick another port, start the companion with `--game-port <the same port>`.
+
+**Steam (Windows, macOS, Linux).**
+
+1. In the Steam library, right-click Factorio and choose *Properties*.
+2. On the *General* tab, type `--enable-lua-udp 34556` into *Launch Options*.
+3. Close the window and start the game as usual.
+
+**Standalone version (factorio.com).** Start the game binary with the flag, or add the flag to your shortcut:
+
+- Windows: `bin\x64\factorio.exe --enable-lua-udp 34556`, run from the Factorio folder. In a desktop shortcut, append the flag to *Target*.
+- Linux: `./bin/x64/factorio --enable-lua-udp 34556`, run from the Factorio folder.
+
+**macOS app (not Steam).** In Terminal:
+
+```sh
+open -a factorio --args --enable-lua-udp 34556
+```
+
+If Factorio is already running, quit it first: `open` passes the flag only to a new start.
+
+## 4. Check that it works
+
+1. Start the companion (see [Companion](Companion)).
+2. Join a multiplayer game.
+3. Within a few seconds the chat shows `Radio: companion connected.` and the companion window prints a `roster:` list with the players.
+
+If the message does not appear, see [Troubleshooting](Troubleshooting).
