@@ -53,6 +53,7 @@ The settings window picks your transmit channel and the channels you listen to, 
 
 ## Good to know
 
+- **The microphone follows the radio switch.** It opens only after the game permits transmission and closes when the radio is off, you are muted or refused, or the game stops responding for a minute. On macOS the microphone indicator then goes away; releasing PTT alone keeps the microphone ready for pre-roll and echo detection.
 - **Half-duplex is on by default.** While you hold the push-to-talk key, other voices go quiet, so your speakers do not feed back into your microphone. With headphones you can turn it off in the mod settings.
 - **Echo warning.** If the companion hears your speakers in your microphone, your line in the speaker list says "echo" and you get a button to turn off the open microphone. Headphones fix it.
 - **Channels are not private.** They separate listeners only among honest clients. The server and a modified client can hear every channel.
@@ -87,6 +88,8 @@ PTT Radio — рация с кнопкой «нажми и говори» для
 Если в чате написано «Рация: компаньон не найден», значит, компаньон не запущен или игра запущена без `--enable-lua-udp`; мод не может отличить одно от другого. Настройки рации открываются клавишами `ALT + SHIFT + V`. Компаньон из релиза сам обновляется до последней версии при каждом запуске (отключается флагом `--no-self-update`). В Linux клавиша PTT работает только в сеансе X11.
 
 Подробные инструкции на русском — в вики: [Установка](https://github.com/vshuraeff/ptt-radio/wiki/RU-Installation), [Решение проблем](https://github.com/vshuraeff/ptt-radio/wiki/RU-Troubleshooting).
+
+Микрофон открывается только после разрешения передачи от игры и закрывается при выключении рации, запрете передачи или после минуты без ответа от игры; тогда индикатор микрофона macOS исчезает. Отпускание PTT само по себе микрофон не закрывает: он остаётся готовым к передаче и обнаружению эха.
 
 ## For developers
 

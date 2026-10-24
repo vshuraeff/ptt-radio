@@ -7,6 +7,8 @@ Date: 2026-10-24
     - Every player who wants to talk or listen runs the ptt-radio companion and launches the game with
       --enable-lua-udp <port>. The mod is required on the server and on every client.
   Features:
+    - The companion releases the microphone while the radio is off, transmission is denied or the game
+      connection is lost, and reopens the current default input when transmission is permitted again.
     - Push-to-talk on F8 in the companion, and an open microphone toggled by a shortcut button or ALT + V.
     - Speaker HUD at the left edge of the screen: who is talking, in their player colour, with the
       transmit channel icon and three link quality bars.

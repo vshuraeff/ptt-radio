@@ -21,6 +21,8 @@ const HANDSHAKE_LIMIT: Duration = Duration::from_secs(10);
 const IMPROVE: Duration = Duration::from_millis(10);
 const SUSTAIN: Duration = Duration::from_secs(3);
 const REFRESH: Duration = Duration::from_millis(250);
+// the game replies to each five-second hello with a policy, even if unchanged
+const MIC_POLICY_LIFETIME: Duration = Duration::from_secs(60);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -34,6 +36,167 @@ pub struct RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_microphone_needs_a_current_permitted_policy_and_equal_refreshes_count() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(vec![], RuntimeConfig::default()).unwrap();
+        assert!(
+            runtime.capture_policy().0,
+            "legacy sources keep their default"
+        );
+        assert!(!runtime.microphone_permitted(now));
+        install_policy(&mut runtime, 7, &[], true, false, now);
+        assert!(runtime.microphone_permitted(now));
+        assert!(!runtime.microphone_permitted(now + MIC_POLICY_LIFETIME));
+        install_policy(
+            &mut runtime,
+            7,
+            &[],
+            true,
+            false,
+            now + Duration::from_secs(30),
+        );
+        assert!(runtime.microphone_permitted(now + Duration::from_secs(75)));
+        install_policy(
+            &mut runtime,
+            6,
+            &[],
+            true,
+            false,
+            now + Duration::from_secs(89),
+        );
+        install_policy(
+            &mut runtime,
+            7,
+            &[],
+            false,
+            false,
+            now + Duration::from_secs(89),
+        );
+        assert!(
+            !runtime.microphone_permitted(now + Duration::from_secs(90)),
+            "rollback and same-revision mutation do not refresh"
+        );
+        install_policy(
+            &mut runtime,
+            8,
+            &[],
+            false,
+            false,
+            now + Duration::from_secs(91),
+        );
+        assert!(!runtime.microphone_permitted(now + Duration::from_secs(91)));
+        install_policy(
+            &mut runtime,
+            9,
+            &[],
+            true,
+            false,
+            now + Duration::from_secs(92),
+        );
+        assert!(runtime.microphone_permitted(now + Duration::from_secs(92)));
+        runtime.policy = None;
+        assert!(!runtime.microphone_permitted(now + Duration::from_secs(92)));
+    }
+
+    #[test]
+    fn policy_close_flushes_wire_stops_under_the_retiring_permission() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(vec![], RuntimeConfig::default()).unwrap();
+        install_policy(&mut runtime, 7, &[], true, false, now);
+        runtime.transmit(&packet::encode(packet::START, 41, &[]), now);
+        while runtime.poll().is_some() {}
+        let denied = signaling::encode_policy(&signaling::Policy {
+            audience: Audience {
+                revision: 8,
+                send_to: vec![1, 2],
+                receive_from: vec![],
+            },
+            tx_permitted: false,
+            self_monitor: false,
+        })
+        .unwrap();
+        let mut closed = false;
+        runtime
+            .game_with_capture_close(&denied, now, |runtime, permitted| {
+                assert!(!permitted);
+                assert!(runtime.capture_policy().0);
+                assert_eq!(runtime.capture_policy().1, Some(7));
+                runtime.close_transmit();
+                let stops: Vec<_> = std::iter::from_fn(|| runtime.poll())
+                    .filter_map(|output| {
+                        if let Output::Game(bytes) = output
+                            && bytes[2] == wire::GAME_POLICY_STOP
+                        {
+                            let mut forwarded = bytes[..3].to_vec();
+                            forwarded.extend_from_slice(&1u16.to_be_bytes());
+                            forwarded.extend_from_slice(&bytes[3..]);
+                            wire::decode_policy_game(&forwarded).ok().map(|media| {
+                                (media.media.kind, media.revision, media.media.sequence)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    stops,
+                    [(Kind::PolicyStop, 7, 41), (Kind::PolicyStop, 7, 41)]
+                );
+                closed = true;
+            })
+            .unwrap();
+        assert!(closed);
+        assert!(!runtime.capture_policy().0);
+        runtime
+            .game_with_capture_close(&denied, now, |_, _| panic!("equal policy closes no talk"))
+            .unwrap();
+        install_policy(&mut runtime, 9, &[], true, false, now);
+        runtime
+            .game_with_capture_close(&denied, now, |_, _| {
+                panic!("rejected rollback closes no talk")
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_policy_does_not_consume_the_roster_epoch_reset() {
+        let now = Instant::now();
+        let mut runtime = Runtime::new(
+            vec!["127.0.0.1:41001".parse().unwrap()],
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        runtime.identify(1, now).unwrap();
+        install_policy(&mut runtime, 7, &[2], true, false, now);
+        let generation = runtime.generation;
+        runtime.roster(vec![1, 2], now).unwrap();
+        let valid = signaling::encode_policy(&signaling::Policy {
+            audience: Audience {
+                revision: 2,
+                send_to: vec![2],
+                receive_from: vec![2],
+            },
+            tx_permitted: true,
+            self_monitor: false,
+        })
+        .unwrap();
+        let mut malformed = valid.clone();
+        malformed[14] = 4;
+        assert!(signaling::decode_policy(&malformed).is_err());
+        runtime
+            .game_with_capture_close(&malformed, now, |_, _| {
+                panic!("malformed policy closes no talk")
+            })
+            .unwrap();
+        assert!(runtime.audience_reset);
+        assert_eq!(runtime.generation, generation);
+        runtime.game(&valid, now).unwrap();
+        assert_ne!(runtime.generation, generation);
+        assert_eq!(runtime.capture_policy().1, Some(2));
+        assert!(runtime.microphone_permitted(now));
+    }
 
     fn install_policy(
         runtime: &mut Runtime,
@@ -1005,6 +1168,9 @@ mod tests {
         lose_pongs: bool,
         cut_udp: bool,
         lose_return: bool,
+        cut_game: bool,
+        cut_direct: bool,
+        hub: Option<crate::transport::hub::Hub>,
     }
 
     impl Pair {
@@ -1034,6 +1200,21 @@ mod tests {
                 lose_pongs: false,
                 cut_udp: false,
                 lose_return: false,
+                cut_game: false,
+                cut_direct: false,
+                hub: None,
+            }
+        }
+
+        fn hub_frames(&mut self, frames: Vec<crate::transport::relay::Outgoing>) {
+            if self.cut_game {
+                return;
+            }
+            for frame in frames {
+                let (to, signal) = signaling::decode_game(&frame.frame, false).unwrap();
+                self.peers[to as usize - 1]
+                    .game(&signaling::encode_game(&signal, 0, true).unwrap(), self.now)
+                    .unwrap();
             }
         }
 
@@ -1051,8 +1232,19 @@ mod tests {
                 for (i, output) in events {
                     match output {
                         Output::Game(bytes) => {
+                            if self.cut_game {
+                                continue;
+                            }
                             if let Ok((to, signal)) = signaling::decode_game(&bytes, false) {
                                 if to == 0 {
+                                    let now_ms = self.peers[i].now_ms(self.now);
+                                    if let Some(hub) = &mut self.hub {
+                                        let inbound =
+                                            signaling::encode_game(&signal, i as u16 + 1, true)
+                                                .unwrap();
+                                        let frames = hub.on_game(now_ms, &inbound);
+                                        self.hub_frames(frames);
+                                    }
                                     continue;
                                 }
                                 let inbound =
@@ -1090,9 +1282,32 @@ mod tests {
                                 continue;
                             }
                             if tx.destination == self.peers[1 - i].sockets[0] {
+                                if self.cut_direct {
+                                    continue;
+                                }
                                 self.peers[1 - i]
                                     .udp(tx.source, tx.destination, &tx.contents, self.now)
                                     .unwrap();
+                            } else if let Some(hub) = &mut self.hub {
+                                let now_ms = self.peers[i].now_ms(self.now);
+                                let reply = hub.relay.handle(now_ms, tx.source, &tx.contents);
+                                let delivered = match reply {
+                                    Ok(crate::transport::relay::Reply::Send(to, bytes)) => {
+                                        Some((to, bytes))
+                                    }
+                                    Ok(crate::transport::relay::Reply::Forward(to)) => {
+                                        Some((to, tx.contents))
+                                    }
+                                    Err(_) => None,
+                                };
+                                if let Some((to, bytes)) = delivered {
+                                    let peer = self
+                                        .peers
+                                        .iter_mut()
+                                        .find(|p| p.sockets.contains(&to))
+                                        .unwrap();
+                                    peer.udp(tx.destination, to, &bytes, self.now).unwrap();
+                                }
                             }
                         }
                         Output::Media(media) | Output::UdpMedia(media) => {
@@ -1109,6 +1324,11 @@ mod tests {
         fn advance(&mut self, millis: u64) {
             for _ in 0..millis / 10 {
                 self.now += ms(10);
+                let now_ms = self.peers[0].now_ms(self.now);
+                if let Some(hub) = &mut self.hub {
+                    let frames = hub.tick(now_ms);
+                    self.hub_frames(frames);
+                }
                 for peer in &mut self.peers {
                     peer.tick(self.now, true).unwrap();
                 }
@@ -1121,6 +1341,91 @@ mod tests {
                 .choice
                 .active
                 .unwrap_or(Path::Game)
+        }
+    }
+
+    #[test]
+    fn direct_and_hub_voice_survive_a_join_freeze_across_the_old_grant_expiry() {
+        for through_hub in [false, true] {
+            let mut pair = Pair::new();
+            if through_hub {
+                let endpoint = "127.0.0.1:45000".parse().unwrap();
+                for runtime in &mut pair.peers {
+                    runtime.config.hub = Some(endpoint);
+                }
+                pair.cut_direct = true;
+                pair.hub = Some(crate::transport::hub::Hub::new(77, Limits::default()));
+            }
+            pair.advance(5000);
+            if through_hub {
+                let now_ms = pair.peers[0].now_ms(pair.now);
+                let first_expiry = pair
+                    .hub
+                    .as_ref()
+                    .unwrap()
+                    .relay
+                    .live(now_ms)
+                    .map(|g| g.expires_at_ms)
+                    .min()
+                    .unwrap();
+                // a healthy pair already received and bound the early renewal. the game
+                // freezes ten seconds before the original grant expires
+                pair.advance(first_expiry - now_ms - 10_000);
+                for (i, runtime) in pair.peers.iter().enumerate() {
+                    let bindings = &runtime.peers[&(2 - i as u16)].bindings;
+                    assert!(bindings.values().filter(|b| b.bound).count() >= 2);
+                    assert!(
+                        bindings
+                            .values()
+                            .any(|b| b.bound && b.grant.expires_at_ms > first_expiry + 60_000)
+                    );
+                    assert!(matches!(pair.active(i), Path::Hub { .. }));
+                }
+            } else {
+                assert_eq!(pair.active(0), Path::Direct);
+                assert_eq!(pair.active(1), Path::Direct);
+            }
+            for runtime in &mut pair.peers {
+                install_policy(runtime, 7, &[1, 2], true, false, pair.now);
+                runtime.transmit(&packet::encode(packet::START, 0, &[]), pair.now);
+            }
+            pair.cut_game = true;
+            pair.flush();
+            let freeze_start = pair.now;
+            for sequence in 1u16..=2250 {
+                pair.advance(20);
+                let before = pair.media.len();
+                for (i, runtime) in pair.peers.iter_mut().enumerate() {
+                    assert!(runtime.microphone_permitted(pair.now));
+                    runtime.transmit(
+                        &packet::encode(packet::VOICE, sequence, &[i as u8]),
+                        pair.now,
+                    );
+                }
+                pair.flush();
+                let voices: Vec<_> = pair.media[before..]
+                    .iter()
+                    .filter(|(_, m)| m.kind == Kind::Voice)
+                    .collect();
+                assert_eq!(
+                    voices.len(),
+                    2,
+                    "both directions, hub={through_hub}, sequence={sequence}"
+                );
+                for (listener, media) in voices {
+                    assert_eq!(media.sequence, sequence);
+                    assert_eq!(media.opus, [1 - *listener as u8]);
+                    assert_eq!(media.revision, Some(7));
+                }
+            }
+            assert_eq!(
+                pair.now.duration_since(freeze_start),
+                Duration::from_secs(45)
+            );
+            for runtime in &pair.peers {
+                assert!(runtime.microphone_permitted(pair.now));
+                assert!(!runtime.microphone_permitted(freeze_start + MIC_POLICY_LIFETIME));
+            }
         }
     }
 
@@ -2175,6 +2480,7 @@ pub struct Runtime {
     roster: Vec<u16>,
     audience: Option<Audience>,
     policy: Option<crate::policy::PolicyGate>,
+    policy_seen: Option<Instant>,
     capture_reset: u64,
     playout_reset: u64,
     audience_reset: bool,
@@ -2217,6 +2523,7 @@ impl Runtime {
             roster: Vec::new(),
             audience: None,
             policy: None,
+            policy_seen: None,
             capture_reset: 0,
             playout_reset: 0,
             audience_reset: false,
@@ -2430,6 +2737,29 @@ impl Runtime {
         )
     }
 
+    /// real devices require an explicit, recently refreshed transmit permission;
+    /// legacy synthetic sources retain `capture_policy`'s pre-policy behaviour
+    pub fn microphone_permitted(&self, now: Instant) -> bool {
+        self.policy_seen
+            .is_some_and(|seen| now.saturating_duration_since(seen) < MIC_POLICY_LIFETIME)
+            && self
+                .policy
+                .as_ref()
+                .and_then(|gate| gate.current())
+                .is_some_and(|policy| policy.tx_permitted)
+    }
+
+    /// ends the retiring talk while its policy and routes are still installed.
+    /// the socket owner must drain these outputs before revoking that policy
+    pub fn close_transmit(&mut self) {
+        if self.on_air {
+            self.send_media(Kind::Stop, &[]);
+            self.send_media(Kind::Stop, &[]);
+            self.on_air = false;
+            self.next_start = None;
+        }
+    }
+
     pub fn playout_reset(&self) -> u64 {
         self.playout_reset
     }
@@ -2507,7 +2837,20 @@ impl Runtime {
     }
 
     pub fn game(&mut self, bytes: &[u8], now: Instant) -> Result<bool> {
+        self.game_with_capture_close(bytes, now, |_, _| {})
+    }
+
+    /// the device owner can flush a retiring talk before an accepted policy
+    /// change takes effect. the callback receives the new transmit permission;
+    /// rejected and identical policies never close it
+    pub fn game_with_capture_close(
+        &mut self,
+        bytes: &[u8],
+        now: Instant,
+        mut close: impl FnMut(&mut Self, bool),
+    ) -> Result<bool> {
         if let Ok(policy) = signaling::decode_policy(bytes) {
+            let permitted = policy.tx_permitted;
             let reset = self.audience_reset
                 && self
                     .policy
@@ -2517,17 +2860,18 @@ impl Runtime {
                         policy.audience.revision < p.audience.revision
                             || (policy.audience.revision == p.audience.revision && policy != *p)
                     });
-            if reset {
-                self.reset_policy_epoch(now)?;
-            }
-            let gate = self
-                .policy
-                .get_or_insert_with(|| crate::policy::PolicyGate::new(self.player.unwrap_or(0)));
+            let mut gate = if reset {
+                crate::policy::PolicyGate::new(self.player.unwrap_or(0))
+            } else {
+                self.policy
+                    .clone()
+                    .unwrap_or_else(|| crate::policy::PolicyGate::new(self.player.unwrap_or(0)))
+            };
             let first = gate.current().is_none();
             let update = gate.install(policy);
             self.audience_reset = false;
             match update {
-                Ok(crate::policy::PolicyUpdate::Unchanged) => {}
+                Ok(crate::policy::PolicyUpdate::Unchanged) => self.policy_seen = Some(now),
                 Ok(crate::policy::PolicyUpdate::Installed {
                     purge_all,
                     removed_receivers,
@@ -2535,11 +2879,17 @@ impl Runtime {
                     self_monitor_changed,
                 }) => {
                     if first || reset || tx_changed || self_monitor_changed {
+                        close(self, permitted);
+                        if reset {
+                            self.reset_policy_epoch(now)?;
+                        }
                         self.out.retain(|pending| !pending.local_media);
                         self.capture_reset = self.capture_reset.wrapping_add(1);
                         self.on_air = false;
                         self.next_start = None;
                     }
+                    self.policy = Some(gate);
+                    self.policy_seen = Some(now);
                     self.purge(purge_all, removed_receivers);
                     self.trace(format!("policy {}", self.capture_policy().1.unwrap()));
                 }

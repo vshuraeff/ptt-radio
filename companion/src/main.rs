@@ -50,6 +50,7 @@ const ROSTER_WARN_AFTER: Duration = Duration::from_secs(3);
 const AUTO_PTT_GIVE_UP: Duration = Duration::from_secs(10);
 const DRAIN_MIN: Duration = Duration::from_millis(1500);
 const DRAIN_MAX: Duration = Duration::from_secs(5);
+const MIC_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(
@@ -154,6 +155,8 @@ struct Shared {
     // mute incoming voices while PTT is held (mod setting ptt-radio-half-duplex)
     half_duplex: AtomicBool,
     roster_seen: AtomicBool,
+    real_mic: bool,
+    mic_close: AtomicBool,
     mixer: Mutex<Mixer>,
     echo: EchoPath,
     // own VOICE frames by seq, to time their echo
@@ -303,6 +306,8 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         open_mic: AtomicBool::new(false),
         half_duplex: AtomicBool::new(true),
         roster_seen: AtomicBool::new(false),
+        real_mic: args.tone.is_none() && args.mic_wav.is_none() && args.speaker_wav.is_none(),
+        mic_close: AtomicBool::new(false),
         mixer: Mutex::new(Mixer::default()),
         echo: EchoPath::new(aec),
         sent: Mutex::new(HashMap::new()),
@@ -396,8 +401,8 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         None
     };
 
-    // cpal streams are not Send: they live here on the main thread until exit
-    let (source, _input) = match (args.tone, &virtual_device) {
+    // cpal streams are not send: the real input stays owned by this main thread
+    let (source, mut microphone) = match (args.tone, &virtual_device) {
         (Some(hz), _) => (
             Source::Tone {
                 hz,
@@ -408,9 +413,8 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         ),
         (None, Some((_, input, _))) => (Source::mic(input.clone(), OPUS_RATE), None),
         (None, None) => {
-            let samples = Samples::default();
-            let (stream, rate) = audio::open_input(samples.clone())?;
-            (Source::mic(samples, rate), Some(stream))
+            let microphone = Microphone::default();
+            (Source::Gated(microphone.capture.clone()), Some(microphone))
         }
     };
     let (output, _output_stream) = match &virtual_device {
@@ -491,6 +495,9 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         if exit_at.is_some_and(|at| now >= at) {
             break;
         }
+        if let Some(microphone) = &mut microphone {
+            microphone.update(&shared, now, audio::open_input);
+        }
         // heartbeat for the whole lifetime: the mod marks the companion offline after 15 s without HELLO
         if now >= next_hello {
             send(&shared, &hello);
@@ -539,6 +546,9 @@ fn run(args: Args) -> Result<ExitCode, Box<dyn Error>> {
         }
     }
 
+    if let Some(microphone) = &mut microphone {
+        microphone.close(&shared, "shutdown");
+    }
     shared.done.store(true, Relaxed);
     let frames_sent = tx_thread.join().expect("transmit thread");
     let rx = rx_thread.join().expect("receive thread");
@@ -583,29 +593,136 @@ fn send_echo_state(shared: &Shared, engaged: bool) {
 }
 
 enum Source {
-    Tone {
-        hz: f32,
-        phase: f32,
-        next: Instant,
-    },
-    Mic {
-        samples: Samples,
-        resampler: Resampler,
-        pending: Vec<f32>,
-    },
+    Tone { hz: f32, phase: f32, next: Instant },
+    Mic(Capture),
+    Gated(Arc<Mutex<MicCapture>>),
 }
 
-impl Source {
-    fn mic(samples: Samples, rate: u32) -> Self {
-        Source::Mic {
+struct Capture {
+    samples: Samples,
+    resampler: Resampler,
+    pending: Vec<f32>,
+}
+
+impl Capture {
+    fn new(samples: Samples, rate: u32) -> Self {
+        Self {
             samples,
             resampler: Resampler::new(rate, OPUS_RATE),
             pending: Vec::new(),
         }
     }
 
+    fn try_frame(&mut self, n: usize) -> Option<Vec<f32>> {
+        if self.pending.len() < n {
+            let captured: Vec<f32> = self.samples.lock().unwrap().drain(..).collect();
+            self.resampler.process(&captured, &mut self.pending);
+        }
+        (self.pending.len() >= n).then(|| self.pending.drain(..n).collect())
+    }
+}
+
+#[derive(Default)]
+struct MicCapture {
+    input: Option<Capture>,
+    generation: u64,
+}
+
+impl MicCapture {
+    fn accepts(&self, generation: Option<u64>) -> bool {
+        self.input.is_some() && generation == Some(self.generation)
+    }
+}
+
+// generic over the owned device handle so tests can observe its drop without a real microphone
+struct Microphone<S = cpal::Stream> {
+    stream: Option<S>,
+    capture: Arc<Mutex<MicCapture>>,
+    retry_at: Option<Instant>,
+}
+
+impl<S> Default for Microphone<S> {
+    fn default() -> Self {
+        Self {
+            stream: None,
+            capture: Arc::default(),
+            retry_at: None,
+        }
+    }
+}
+
+impl<S> Microphone<S> {
+    fn update(
+        &mut self,
+        shared: &Shared,
+        now: Instant,
+        open: impl FnOnce(Samples) -> Result<(S, u32), Box<dyn Error>>,
+    ) {
+        if shared.mic_close.swap(false, Relaxed) {
+            self.close(shared, "transmit policy changed");
+        }
+        if !shared.runtime.lock().unwrap().0.microphone_permitted(now) {
+            self.retry_at = None;
+            self.close(shared, "radio off, transmit not permitted or policy lost");
+            return;
+        }
+        if self.stream.is_some() || self.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        let samples = Samples::default();
+        match open(samples.clone()) {
+            Ok((stream, rate)) => {
+                let mut capture = self.capture.lock().unwrap();
+                // permission may have changed while the device was opening
+                let runtime = shared.runtime.lock().unwrap();
+                if !runtime.0.microphone_permitted(Instant::now()) || shared.mic_close.load(Relaxed)
+                {
+                    return;
+                }
+                shared.echo.reset();
+                capture.generation = capture.generation.wrapping_add(1);
+                capture.input = Some(Capture::new(samples, rate));
+                self.stream = Some(stream);
+                self.retry_at = None;
+                println!("mic opened");
+            }
+            Err(err) => {
+                eprintln!("mic open failed: {err}; retrying in 1 s");
+                self.retry_at = Some(now + MIC_RETRY);
+            }
+        }
+    }
+
+    fn close(&mut self, shared: &Shared, reason: &str) {
+        if self.stream.is_none() {
+            return;
+        }
+        // the same fence spans the transmit worker's final generation check and send
+        let mut capture = self.capture.lock().unwrap();
+        let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+        runtime.close_transmit();
+        drain_runtime(shared, runtime, network, None);
+        capture.input = None;
+        capture.generation = capture.generation.wrapping_add(1);
+        drop(self.stream.take());
+        shared.echo.reset();
+        send_echo_state(shared, false);
+        println!("mic closed ({reason})");
+    }
+}
+
+struct Captured {
+    pcm: Vec<f32>,
+    generation: Option<u64>,
+}
+
+impl Source {
+    fn mic(samples: Samples, rate: u32) -> Self {
+        Source::Mic(Capture::new(samples, rate))
+    }
+
     /// blocks until the next frame of `n` samples at 48 kHz is ready; None once shutdown starts
-    fn next_frame(&mut self, n: usize, done: &AtomicBool) -> Option<Vec<f32>> {
+    fn next_frame(&mut self, n: usize, done: &AtomicBool) -> Option<Captured> {
         match self {
             Source::Tone { hz, phase, next } => {
                 *next += Duration::from_secs_f64(n as f64 / OPUS_RATE as f64);
@@ -618,25 +735,43 @@ impl Source {
                         s
                     })
                     .collect();
-                (!done.load(Relaxed)).then_some(frame)
+                (!done.load(Relaxed)).then_some(Captured {
+                    pcm: frame,
+                    generation: None,
+                })
             }
-            Source::Mic {
-                samples,
-                resampler,
-                pending,
-            } => loop {
-                if pending.len() >= n {
-                    return Some(pending.drain(..n).collect());
-                }
+            Source::Mic(input) => loop {
                 if done.load(Relaxed) {
                     return None;
                 }
-                let captured: Vec<f32> = samples.lock().unwrap().drain(..).collect();
-                resampler.process(&captured, pending);
-                if pending.len() < n {
-                    // the poll period adds up to its own length to every frame
-                    thread::sleep(Duration::from_millis(1));
+                if let Some(pcm) = input.try_frame(n) {
+                    return Some(Captured {
+                        pcm,
+                        generation: None,
+                    });
                 }
+                thread::sleep(Duration::from_millis(1));
+            },
+            Source::Gated(capture) => loop {
+                if done.load(Relaxed) {
+                    return None;
+                }
+                let delay = {
+                    let mut capture = capture.lock().unwrap();
+                    let generation = capture.generation;
+                    if let Some(input) = &mut capture.input {
+                        if let Some(pcm) = input.try_frame(n) {
+                            return Some(Captured {
+                                pcm,
+                                generation: Some(generation),
+                            });
+                        }
+                        Duration::from_millis(1)
+                    } else {
+                        Duration::from_millis(10)
+                    }
+                };
+                thread::sleep(delay);
             },
         }
     }
@@ -649,7 +784,27 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
     // captured frames so far: frame n holds samples [n * size, (n + 1) * size) of the capture
     let mut frame = 0;
     let mut gate = false;
-    while let Some(mut pcm) = source.next_frame(tx.frame_samples(), &shared.done) {
+    let mut generation = None;
+    while let Some(Captured {
+        mut pcm,
+        generation: captured_generation,
+    }) = source.next_frame(tx.frame_samples(), &shared.done)
+    {
+        let capture = match &source {
+            Source::Gated(capture) => Some(capture.lock().unwrap()),
+            _ => None,
+        };
+        if let Some(capture) = &capture {
+            if !capture.accepts(captured_generation) {
+                continue;
+            }
+            if generation != captured_generation {
+                tx.set_policy(false, None, 0);
+                generation = captured_generation;
+                frame = 0;
+                gate = false;
+            }
+        }
         let ready_us = unix_us();
         shared.echo.near_end(&mut pcm);
         let state = shared.echo.gate_state();
@@ -673,10 +828,19 @@ fn transmit(shared: &Shared, mut source: Source, codec: Codec) -> u64 {
         tx.set_ptt(shared.ptt.load(Relaxed));
         tx.set_open_mic(shared.open_mic.load(Relaxed));
         let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+        if capture.is_some()
+            && (!runtime.microphone_permitted(Instant::now()) || shared.mic_close.load(Relaxed))
+        {
+            continue;
+        }
         let (permitted, revision, reset) = runtime.capture_policy();
         tx.set_policy(permitted, revision, reset);
         sent += send_packets(shared, runtime, network, tx.frame(&pcm), frame, ready_us);
         frame += 1;
+    }
+    if matches!(source, Source::Gated(_)) {
+        // the main thread closed and flushed the talk before dropping the device
+        return sent;
     }
     let (runtime, network) = &mut *shared.runtime.lock().unwrap();
     sent + send_packets(shared, runtime, network, tx.close(), frame, unix_us())
@@ -863,6 +1027,25 @@ fn accept_media(
     }
 }
 
+fn game_signal(
+    shared: &Shared,
+    runtime: &mut Runtime,
+    network: &mut Network,
+    bytes: &[u8],
+    now: Instant,
+    mut stats: Option<&mut RxStats>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    runtime.game_with_capture_close(bytes, now, |runtime, permitted| {
+        if shared.real_mic {
+            if !permitted {
+                shared.mic_close.store(true, Relaxed);
+            }
+            runtime.close_transmit();
+            drain_runtime(shared, runtime, network, stats.as_deref_mut());
+        }
+    })
+}
+
 fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
     let mut stats = RxStats::default();
     let mut hud = Reporter::default();
@@ -937,13 +1120,14 @@ fn receive(shared: &Shared, mut resolver: Option<Resolver>) -> RxStats {
         let now = Instant::now();
         {
             let (runtime, network) = &mut *shared.runtime.lock().unwrap();
-            let consumed = match runtime.game(&buf[..len], now) {
-                Ok(consumed) => consumed,
-                Err(err) => {
-                    eprintln!("game signaling: {err}");
-                    true
-                }
-            };
+            let consumed =
+                match game_signal(shared, runtime, network, &buf[..len], now, Some(&mut stats)) {
+                    Ok(consumed) => consumed,
+                    Err(err) => {
+                        eprintln!("game signaling: {err}");
+                        true
+                    }
+                };
             drain_runtime(shared, runtime, network, Some(&mut stats));
             if consumed {
                 continue;
@@ -1270,6 +1454,257 @@ fn summary(frames_sent: u64, rx: &RxStats, mix: &mix::MixStats, recorded: u64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mic_policy(shared: &Shared, revision: u64, permitted: bool, now: Instant) {
+        let bytes = signaling::encode_policy(&signaling::Policy {
+            audience: Audience {
+                revision,
+                send_to: vec![],
+                receive_from: vec![],
+            },
+            tx_permitted: permitted,
+            self_monitor: false,
+        })
+        .unwrap();
+        let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+        game_signal(shared, runtime, network, &bytes, now, None).unwrap();
+    }
+
+    #[test]
+    fn microphone_starts_closed_retries_nonfatally_and_reopens_with_fresh_capture() {
+        let (shared, _) = shared();
+        let mut mic = Microphone::<()>::default();
+        let now = Instant::now();
+        mic.update(&shared, now, |_| panic!("no policy must not open input"));
+        mic_policy(&shared, 1, false, now);
+        mic.update(&shared, now, |_| panic!("denial must not open input"));
+        mic_policy(&shared, 2, true, now);
+        mic.update(&shared, now, |_| Err("no input available".into()));
+        assert!(mic.stream.is_none());
+        mic.update(&shared, now + MIC_RETRY / 2, |_| {
+            panic!("retry must back off")
+        });
+        mic.update(&shared, now + MIC_RETRY, |samples| {
+            samples.lock().unwrap().extend([0.5; 2000]);
+            Ok(((), 44_100))
+        });
+        assert!(mic.stream.is_some());
+        let mut source = Source::Gated(mic.capture.clone());
+        let stale = source.next_frame(960, &shared.done).unwrap();
+        assert!(mic.capture.lock().unwrap().accepts(stale.generation));
+        assert!(
+            !mic.capture
+                .lock()
+                .unwrap()
+                .input
+                .as_ref()
+                .unwrap()
+                .pending
+                .is_empty()
+        );
+        mic_policy(&shared, 3, false, now + MIC_RETRY);
+        mic.update(&shared, now + MIC_RETRY, |_| panic!("denial must close"));
+        assert!(mic.capture.lock().unwrap().input.is_none());
+        assert!(!mic.capture.lock().unwrap().accepts(stale.generation));
+        mic_policy(&shared, 4, true, now + MIC_RETRY);
+        mic.update(&shared, now + MIC_RETRY, |samples| {
+            samples.lock().unwrap().extend([-0.25; 960]);
+            Ok(((), OPUS_RATE))
+        });
+        let capture = mic.capture.lock().unwrap();
+        assert!(
+            !capture.accepts(stale.generation),
+            "already-read old frames are fenced out"
+        );
+        drop(capture);
+        let fresh = source.next_frame(960, &shared.done).unwrap();
+        assert_ne!(stale.generation, fresh.generation);
+        assert!(
+            fresh.pcm.iter().all(|sample| *sample <= 0.0),
+            "no old input or resampler carry survives"
+        );
+        let mut tx = Transmitter::new(Codec::default()).unwrap();
+        tx.frame(&stale.pcm);
+        tx.set_policy(false, None, 0);
+        tx.set_policy(true, Some(4), 4);
+        tx.set_ptt(true);
+        let packets = tx.frame(&fresh.pcm);
+        assert_eq!(
+            packets.iter().map(|p| p[2]).collect::<Vec<_>>(),
+            [START, VOICE]
+        );
+    }
+
+    struct StopBeforeDrop {
+        game: UdpSocket,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for StopBeforeDrop {
+        fn drop(&mut self) {
+            let mut buf = [0; 4096];
+            let mut stops = Vec::new();
+            while let Ok(len) = self.game.recv(&mut buf) {
+                if len >= 3 && buf[2] == ptt_radio_companion::transport::wire::GAME_POLICY_STOP {
+                    let mut forwarded = buf[..3].to_vec();
+                    forwarded.extend_from_slice(&1u16.to_be_bytes());
+                    forwarded.extend_from_slice(&buf[3..len]);
+                    let media =
+                        ptt_radio_companion::transport::wire::decode_policy_game(&forwarded)
+                            .unwrap();
+                    stops.push((media.revision, media.media.sequence));
+                }
+            }
+            assert_eq!(
+                stops,
+                [(1, 17), (1, 17)],
+                "wire stops must arrive before stream drop"
+            );
+            self.dropped.store(true, Relaxed);
+        }
+    }
+
+    #[test]
+    fn denial_and_watchdog_send_stop_before_dropping_the_stream() {
+        for watchdog in [false, true] {
+            let (mut shared, _) = shared();
+            let game = UdpSocket::bind("127.0.0.1:0").unwrap();
+            game.set_nonblocking(true).unwrap();
+            let owned = Arc::get_mut(&mut shared).unwrap();
+            owned.game = game.local_addr().unwrap();
+            owned.real_mic = true;
+            let now = Instant::now();
+            mic_policy(&shared, 1, true, now);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut mic = Microphone::default();
+            mic.update(&shared, now, |_| {
+                Ok((
+                    StopBeforeDrop {
+                        game,
+                        dropped: dropped.clone(),
+                    },
+                    OPUS_RATE,
+                ))
+            });
+            {
+                let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+                runtime.transmit(&packet::encode(START, 17, &[]), now);
+                drain_runtime(&shared, runtime, network, None);
+            }
+            if watchdog {
+                let generation = mic.capture.lock().unwrap().generation;
+                mic.update(&shared, now + Duration::from_secs(45), |_| {
+                    panic!("the open input survives a join freeze")
+                });
+                assert!(mic.stream.is_some());
+                assert_eq!(mic.capture.lock().unwrap().generation, generation);
+                assert!(!dropped.load(Relaxed));
+                mic.update(&shared, now + Duration::from_secs(60), |_| {
+                    panic!("expired policy must close")
+                });
+            } else {
+                mic_policy(&shared, 2, false, now);
+                assert!(!shared.runtime.lock().unwrap().0.capture_policy().0);
+                mic.update(&shared, now, |_| panic!("denied policy must close"));
+            }
+            assert!(dropped.load(Relaxed));
+            assert!(mic.capture.lock().unwrap().input.is_none());
+        }
+    }
+
+    #[test]
+    fn a_brief_deny_then_allow_still_releases_the_device() {
+        let (mut shared, _) = shared();
+        Arc::get_mut(&mut shared).unwrap().real_mic = true;
+        let mut mic = Microphone::<()>::default();
+        let now = Instant::now();
+        mic_policy(&shared, 1, true, now);
+        mic.update(&shared, now, |_| Ok(((), OPUS_RATE)));
+        let generation = mic.capture.lock().unwrap().generation;
+        mic_policy(&shared, 2, false, now);
+        mic_policy(&shared, 3, true, now);
+        mic.update(&shared, now, |_| Ok(((), OPUS_RATE)));
+        assert!(mic.capture.lock().unwrap().generation >= generation + 2);
+    }
+
+    #[test]
+    fn permitted_monitor_and_epoch_changes_keep_the_device_and_capture_timeline() {
+        struct Observed(Arc<AtomicBool>);
+        impl Drop for Observed {
+            fn drop(&mut self) {
+                self.0.store(true, Relaxed);
+            }
+        }
+        let (mut shared, _) = shared();
+        Arc::get_mut(&mut shared).unwrap().real_mic = true;
+        let now = Instant::now();
+        mic_policy(&shared, 7, true, now);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut mic = Microphone::default();
+        mic.update(&shared, now, |_| Ok((Observed(dropped.clone()), OPUS_RATE)));
+        let generation = mic.capture.lock().unwrap().generation;
+        let monitor = signaling::encode_policy(&signaling::Policy {
+            audience: Audience {
+                revision: 8,
+                send_to: vec![],
+                receive_from: vec![],
+            },
+            tx_permitted: true,
+            self_monitor: true,
+        })
+        .unwrap();
+        {
+            let (runtime, network) = &mut *shared.runtime.lock().unwrap();
+            game_signal(&shared, runtime, network, &monitor, now, None).unwrap();
+        }
+        mic.update(&shared, now, |_| {
+            panic!("monitor-only change must keep the device")
+        });
+        assert_eq!(mic.capture.lock().unwrap().generation, generation);
+        assert!(!dropped.load(Relaxed));
+        shared
+            .runtime
+            .lock()
+            .unwrap()
+            .0
+            .roster(vec![1], now)
+            .unwrap();
+        mic_policy(&shared, 1, true, now);
+        mic.update(&shared, now, |_| {
+            panic!("permitted epoch reset must keep the device")
+        });
+        assert_eq!(mic.capture.lock().unwrap().generation, generation);
+        assert!(!dropped.load(Relaxed));
+        mic.close(&shared, "shutdown");
+        assert!(dropped.load(Relaxed));
+    }
+
+    #[test]
+    fn closed_or_empty_real_capture_does_not_block_transmit_shutdown() {
+        for open in [false, true] {
+            let (shared, _) = shared();
+            let capture = Arc::new(Mutex::new(MicCapture {
+                input: open.then(|| Capture::new(Samples::default(), OPUS_RATE)),
+                generation: 1,
+            }));
+            let (ready, started) = std::sync::mpsc::channel();
+            let (finished, result) = std::sync::mpsc::channel();
+            let worker = {
+                let shared = shared.clone();
+                thread::spawn(move || {
+                    ready.send(()).unwrap();
+                    finished
+                        .send(transmit(&shared, Source::Gated(capture), Codec::default()))
+                        .unwrap();
+                })
+            };
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            shared.done.store(true, Relaxed);
+            assert_eq!(result.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+            worker.join().unwrap();
+        }
+    }
     use ptt_radio_companion::transport::signaling::{self, Audience};
 
     fn shared() -> (Arc<Shared>, Samples) {
@@ -1305,6 +1740,8 @@ mod tests {
             open_mic: AtomicBool::new(false),
             half_duplex: AtomicBool::new(false),
             roster_seen: AtomicBool::new(false),
+            real_mic: false,
+            mic_close: AtomicBool::new(false),
             mixer: Mutex::new(Mixer::default()),
             echo: EchoPath::new(false),
             sent: Mutex::new(HashMap::new()),

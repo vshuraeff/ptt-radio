@@ -51,6 +51,17 @@ fn processor() -> AudioProcessing {
 }
 
 impl Canceller {
+    fn new() -> Self {
+        Self {
+            processor: processor(),
+            render: VecDeque::with_capacity(MAX_PENDING_RENDER),
+            detector: Detector::default(),
+            wet_mix: 0.0,
+            capture_sample: 0,
+            transition_sample: 0,
+        }
+    }
+
     fn render(&mut self, block: &[f32; BLOCK]) {
         let mut output = [0.0; BLOCK];
         self.processor
@@ -72,16 +83,14 @@ impl Default for EchoPath {
 impl EchoPath {
     pub fn new(enabled: bool) -> Self {
         Self {
-            canceller: enabled.then(|| {
-                Mutex::new(Canceller {
-                    processor: processor(),
-                    render: VecDeque::with_capacity(MAX_PENDING_RENDER),
-                    detector: Detector::default(),
-                    wet_mix: 0.0,
-                    capture_sample: 0,
-                    transition_sample: 0,
-                })
-            }),
+            canceller: enabled.then(|| Mutex::new(Canceller::new())),
+        }
+    }
+
+    /// a newly opened capture device starts a new render/capture timeline
+    pub fn reset(&self) {
+        if let Some(canceller) = &self.canceller {
+            *canceller.lock().unwrap() = Canceller::new();
         }
     }
 
@@ -150,6 +159,34 @@ impl EchoPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopening_capture_resets_the_canceller_detector_and_timeline() {
+        let echo = EchoPath::new(true);
+        echo.far_end(&[0.2; BLOCK]);
+        echo.near_end(&mut [0.1; BLOCK]);
+        echo.far_end(&[0.3; BLOCK]);
+        {
+            let mut state = echo.canceller.as_ref().unwrap().lock().unwrap();
+            assert_eq!(state.capture_sample, BLOCK as u64);
+            assert!(!state.render.is_empty());
+            state.wet_mix = 1.0;
+            state.transition_sample = 42;
+            state.detector.engaged = true;
+        }
+        echo.reset();
+        let state = echo.canceller.as_ref().unwrap().lock().unwrap();
+        assert_eq!(state.capture_sample, 0);
+        assert_eq!(state.transition_sample, 0);
+        assert_eq!(state.wet_mix, 0.0);
+        assert!(state.render.is_empty());
+        assert!(!state.detector.engaged);
+        drop(state);
+        assert_eq!(echo.gate_state().score, 0.0);
+        let disabled = EchoPath::new(false);
+        disabled.reset();
+        assert!(disabled.canceller.is_none());
+    }
 
     #[test]
     fn wet_impulse_delay_is_pinned_at_three_phases() {

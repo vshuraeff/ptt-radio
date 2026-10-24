@@ -68,13 +68,15 @@ A companion you built yourself with `cargo build` never updates itself; it print
 
 ## Devices
 
-The companion has no device option: it opens the system's **default** microphone and the **default** output device when it starts.
+The companion has no device option. It opens the system's **default** output device at startup. The microphone stays closed until the game permits transmission, and closes when the radio is off, you are muted or refused, or no permission update arrives from the game for one minute. On macOS, the microphone indicator goes away when the radio is off. Releasing PTT alone leaves the input open for pre-roll and echo detection.
+
+A join, autosave or multiplayer catch-up keeps the microphone open unless the pause lasts a minute; voice over established direct and hub routes can continue while the game is frozen. After leaving the game, the microphone indicator can remain for up to a minute. Input reopens when the game next confirms permission to transmit. If opening fails, the companion reports `mic open failed` and retries once a second while transmission is permitted.
 
 - Windows: *Settings → System → Sound*, choose the input and the output.
 - macOS: *System Settings → Sound*, the *Output* and *Input* tabs.
 - Linux: your desktop's sound settings, or `pavucontrol` / `wpctl` under PipeWire.
 
-After changing a default device, restart the companion.
+After changing the default input, switch the radio off and on: each reopen selects the current default microphone. Restart the companion to change its output device.
 
 Headphones are best. With speakers your microphone picks up the other players, and the companion has to cancel that echo (see [Echo](#echo-and-half-duplex)).
 
@@ -106,6 +108,7 @@ There are two ways to transmit.
 | `half-duplex on` / `half-duplex off` | The *Mute the radio while I talk* setting reached the companion. |
 | `ptt pressed` / `ptt released` | The push-to-talk key went down or up. |
 | `sent START` / `sent STOP` | A transmission began or ended. |
+| `mic opened` / `mic closed (...)` | The real input device opened or was released. |
 | `stats: sent N frames \| received [...] \| ...` | Printed when the companion exits: what it sent and received. |
 
 ## Your system
@@ -119,7 +122,7 @@ There are two ways to transmit.
 ### macOS
 
 - **Gatekeeper.** If the release build is not signed, macOS refuses to open it the first time. Open *System Settings → Privacy & Security* and click *Open Anyway* next to the message about `ptt-radio-companion`, then start it again. Alternatively, remove the download mark in Terminal: `xattr -d com.apple.quarantine ptt-radio-companion`.
-- **Microphone.** On the first start macOS asks for microphone access. When you start the companion from Terminal, the request is made for your terminal app. If you refused, allow it under *System Settings → Privacy & Security → Microphone* and restart the companion.
+- **Microphone.** When the radio first permits transmission, macOS asks for microphone access. When you start the companion from Terminal, the request is made for your terminal app. If you refused, allow it under *System Settings → Privacy & Security → Microphone*. The companion retries while transmission is permitted; restart it if access is still refused after changing the permission.
 - **The key.** The companion registers `F8` as an ordinary global shortcut and does not ask for Accessibility or Input Monitoring. On many Mac keyboards `F8` is a media key; press `fn + F8`, or turn on *Use F1, F2, etc. keys as standard function keys* in the keyboard settings.
 
 ### Linux
