@@ -5,7 +5,9 @@ name: ci
 on:
   push:
     branches: [master]
+    paths-ignore: ['wiki/**', 'docs/**', '**.md']
   pull_request:
+    paths-ignore: ['wiki/**', 'docs/**', '**.md']
 
 permissions: {}
 
@@ -32,6 +34,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - name: install rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: companion -> target
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --release -- -D warnings
       - name: hub build without the audio feature
@@ -58,6 +65,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       - name: install rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: companion -> target
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - run: cargo test --locked --lib --bins
       - name: integration suites
         if: runner.os == 'Linux'
@@ -65,9 +77,137 @@ jobs:
           for t in bridge_repr connectivity crypto_sessions game_probe multiparty_lab netlab policy_contract policy_playout receive_order relay_hub transport_contract; do
             cargo test --locked --test "$t" -- --test-threads 1
           done
-      - name: release lib tests
-        if: runner.os == 'Linux'
-        run: cargo test --locked --release --lib
+
+  test-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: companion
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install system packages
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: install rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: companion -> target
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      - run: cargo test --locked --release --lib
+
+  # the same container, toolchain, environment and shared cache as the release's linux job
+  release-build-linux:
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    permissions:
+      contents: read
+    steps:
+      - name: install system packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential cmake pkg-config libasound2-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: companion -> target
+          cache-bin: false
+          shared-key: companion-linux
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      - name: build
+        working-directory: companion
+        env:
+          PTT_RADIO_RELEASE_BUILD: '1'
+        run: cargo build --locked --release --bin ptt-radio-companion
+      - name: glibc reach
+        run: |
+          max=$(objdump -T companion/target/release/ptt-radio-companion | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -n 1)
+          echo "highest glibc symbol version: $max"
+          if [ "$(printf '%s\n' "$max" 2.35 | sort -V | tail -n 1)" != 2.35 ]; then
+            echo "::error::the linux companion needs glibc $max, above 2.35"
+            exit 1
+          fi
+
+  release-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            targets: x86_64-pc-windows-msvc
+            arguments: --target x86_64-pc-windows-msvc
+          - os: macos-latest
+            platform: macos
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+            arguments: --target aarch64-apple-darwin --target x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: keep lf line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install rust
+        env:
+          TARGETS: ${{ matrix.targets }}
+        run: rustup toolchain install stable --profile minimal --target "$TARGETS" && rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: companion -> target
+          cache-bin: false
+          shared-key: companion-${{ matrix.platform }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      - name: build
+        working-directory: companion
+        env:
+          PTT_RADIO_RELEASE_BUILD: '1'
+        run: cargo build --locked --release ${{ matrix.arguments }} --bin ptt-radio-companion
+
+  hub-cache:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: x86_64
+          - platform: linux/arm64
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: warm static hub cache
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/hub.Dockerfile
+          target: binary
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=hub-${{ matrix.arch }}
+          cache-to: type=gha,scope=hub-${{ matrix.arch }},mode=max
 
   lua:
     runs-on: ubuntu-latest

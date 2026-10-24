@@ -49,7 +49,7 @@ The same run also pushes the hub image `ghcr.io/vshuraeff/ptt-radio-hub` with th
    git push origin v0.4.1
    ```
 
-6. Watch the `release` run in the Actions tab. When it finishes, the release is public with every asset. The first step runs `tools/check-version.sh v0.4.1`, so a tag that does not match both files stops the run before anything is built.
+6. Watch the `release` run in the Actions tab. Compilation runs in parallel with `tools/check-version.sh v0.4.1`; the final publication waits for that check and every asset. A mismatched tag cannot publish a release. The hub workflow also checks the version before building or pushing its image.
 
 To retry a run that failed before publishing, fix the cause, delete the tag locally and on GitHub (`git push origin :refs/tags/v0.4.1`), and tag again. Once a release is published, companions may already have updated to it, so fix forward with a new version instead (see Self-update).
 
@@ -121,4 +121,10 @@ The wiki is kept in `wiki/` and mirrored by `.github/workflows/wiki.yml` into th
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push to `master` and every pull request: `cargo fmt --check`, clippy with `-D warnings`, the library and integration tests, a build of the hub without the `audio` feature, the Lua syntax check and test suites, and `tools/check-version.sh`. The library tests also run on macOS and Windows. The real-time audio suites (`scenarios`, `aec_gate` and the ignored `policy_playout` tests) need a quiet dedicated machine and run only in `tools/gate.sh`.
+`.github/workflows/ci.yml` runs on pushes to `master` and pull requests, except changes limited to `wiki/`, `docs/` or Markdown. It runs `cargo fmt --check`, clippy with `-D warnings`, library and integration tests, a hub build without the `audio` feature, Lua checks and `tools/check-version.sh`. Library tests also run on macOS and Windows; Linux release-profile library tests have their own parallel job.
+
+CI also mirrors the release companion builds: the Ubuntu 22.04 container and glibc check, Windows MSVC, and both macOS targets in one Cargo invocation. It neither packages nor signs these builds. Matching CI/release jobs share Cargo dependency caches; only master pushes save them, while PRs and tags restore them. Registry and compiled dependency reuse avoids recompiling unchanged dependencies; the workspace crate still rebuilds, including when its release version changes. Signing material and temporary keychains stay outside the caches and reach only signing steps.
+
+Master CI warms separate BuildKit caches for both hub architectures. Hub archive builds update those caches, and the image imports both. The Docker dependency layer depends on manifests and the lockfile, so a source-only change rebuilds the hub crate while retaining its dependencies.
+
+The real-time audio suites (`scenarios`, `aec_gate` and the ignored `policy_playout` tests) need a quiet dedicated machine and run only in `tools/gate.sh`.

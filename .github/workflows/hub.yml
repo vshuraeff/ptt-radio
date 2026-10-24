@@ -4,6 +4,7 @@ on:
   workflow_call:
     inputs:
       version:
+        description: Release version or v-prefixed release tag
         required: true
         type: string
   workflow_dispatch:
@@ -20,6 +21,8 @@ permissions:
 jobs:
   binaries:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     strategy:
       matrix:
         include:
@@ -30,9 +33,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check version
+        id: version
         env:
           VERSION: ${{ inputs.version }}
-        run: tools/check-version.sh "v$VERSION"
+        run: |
+          VERSION=${VERSION#v}
+          tools/check-version.sh "v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build static hub
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -42,9 +50,10 @@ jobs:
           target: binary
           platforms: ${{ matrix.platform }}
           outputs: type=local,dest=dist
+          cache-from: type=gha,scope=hub-${{ matrix.arch }}
+          cache-to: type=gha,scope=hub-${{ matrix.arch }},mode=max
       - name: Package hub
         env:
-          VERSION: ${{ inputs.version }}
           ARCH: ${{ matrix.arch }}
         run: |
           cp LICENSE dist/LICENSE
@@ -52,12 +61,14 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: hub-linux-${{ matrix.arch }}
-          path: ptt-radio-hub-${{ inputs.version }}-linux-${{ matrix.arch }}.tar.gz
+          path: ptt-radio-hub-${{ env.VERSION }}-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   image:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: binaries
+    env:
+      VERSION: ${{ needs.binaries.outputs.version }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -75,19 +86,22 @@ jobs:
         with:
           images: ghcr.io/vshuraeff/ptt-radio-hub
           tags: |
-            type=semver,pattern={{version}},value=${{ inputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=semver,pattern={{version}},value=${{ env.VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }}
             type=raw,value=latest
           labels: |
             org.opencontainers.image.source=https://github.com/vshuraeff/ptt-radio
             org.opencontainers.image.licenses=GPL-3.0-only
-            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.version=${{ env.VERSION }}
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: docker/hub.Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: VERSION=${{ inputs.version }}
+          cache-from: |
+            type=gha,scope=hub-x86_64
+            type=gha,scope=hub-aarch64
+          build-args: VERSION=${{ env.VERSION }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}

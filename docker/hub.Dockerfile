@@ -2,9 +2,13 @@ FROM --platform=$BUILDPLATFORM rust:1.99.1-slim-trixie@sha256:1a939748a7cbab172d
 ARG TARGETARCH
 WORKDIR /src
 COPY companion/Cargo.toml companion/Cargo.lock ./
-COPY companion/src/ ./src/
 COPY companion/experiments/dtln-runtime/Cargo.toml ./experiments/dtln-runtime/Cargo.toml
-COPY companion/experiments/dtln-runtime/src/ ./experiments/dtln-runtime/src/
+# stub every cargo target so source edits retain the compiled dependency layer
+RUN mkdir -p src/bin experiments/dtln-runtime/src \
+ && touch src/lib.rs experiments/dtln-runtime/src/lib.rs \
+ && printf 'fn main() {}\n' > src/main.rs \
+ && cp src/main.rs src/bin/relay.rs \
+ && cp src/main.rs src/bin/ptt-radio-hub.rs
 # the hub has no native c dependencies; rust's bundled musl and lld cross-link it
 RUN case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-musl ;; \
@@ -12,6 +16,17 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
  && rustup target add "$target" \
+ && RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
+    cargo build --locked --release --no-default-features --bin ptt-radio-hub --target "$target"
+
+COPY companion/src/ ./src/
+COPY companion/experiments/dtln-runtime/src/ ./experiments/dtln-runtime/src/
+RUN find src experiments/dtln-runtime/src -type f -name '*.rs' -exec touch {} + \
+ && case "$TARGETARCH" in \
+      amd64) target=x86_64-unknown-linux-musl ;; \
+      arm64) target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
  && RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static" \
     cargo build --locked --release --no-default-features --bin ptt-radio-hub --target "$target" \
  && mkdir /out \
