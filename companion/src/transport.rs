@@ -1,6 +1,7 @@
 //! shared p2p media, transport and signaling contracts consumed by runtime.rs.
 
 pub mod hub;
+#[cfg(feature = "audio")]
 pub mod lab;
 pub mod relay;
 pub mod signaling;

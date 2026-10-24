@@ -1,0 +1,31 @@
+# run from this directory with docker compose -f compose.example.yaml up -d --build
+# keep the repository layout: factorio is built from ../stand/server and uses ../stand/mod-list.json
+# the hub uses the published image; stand/compose.hub.yaml is the local hub source-build option
+# the server creates ./data/saves/probe.zip on first start; replace it to use an existing map
+# allow inbound udp 34197 (factorio) and 34560 (voice hub) in the host firewall
+# lua udp 34556 and the hub receive port 34557 stay on shared loopback; do not publish them
+services:
+  factorio:
+    platform: linux/amd64
+    build: ../stand/server
+    ports:
+      - "34197:34197/udp"
+      - "34560:34560/udp"
+    environment:
+      LUA_UDP_PORT: "34556"
+    volumes:
+      - ./data:/data
+      - ../mod/ptt-radio:/data/mods/ptt-radio:ro
+      - ../stand/mod-list.json:/config/mod-list.json:ro
+    restart: unless-stopped
+
+  hub:
+    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.0
+    network_mode: "service:factorio"
+    depends_on:
+      - factorio
+    command: ["--public", "0.0.0.0:34560", "--game", "127.0.0.1:34556", "--receive", "127.0.0.1:34557"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
