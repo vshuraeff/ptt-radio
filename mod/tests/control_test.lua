@@ -62,6 +62,7 @@ local function setup()
   end
   game.connected_players = { players[3], players[1], players[2] }
   package.loaded.hud = nil
+  package.loaded.channels = nil
   dofile(control_path)
   script.init()
 end
@@ -360,6 +361,7 @@ emit(1, packet(1))
 expect_audience(1, "2,3", "0,2,3")
 handlers.on_player_joined_game({ player_index = 2 })
 assert(storage.v2 and storage.echo_sources and storage.talks and #storage.audience_revision == 8)
+assert(storage.radio and storage.radio_policy.deny)
 
 -- speaker hud: a viewer's stack as row senders in screen order, «ещё N» as +N
 local function hud_root(index) return players[index].gui.screen.ptt_radio_hud end
@@ -508,5 +510,15 @@ assert(players[1].gui.left.ptt_radio_echo_panel and hud_root(1) == nil)
 game.tick = 31
 nth[15]({ tick = 31 })
 assert(storage.speakers[1] == nil and hud_root(2) == nil)
+
+-- a 0.3.0 save has no radio tables; existing radio state survives a second configure
+setup()
+storage = { speakers = {}, companions = {}, v2 = {}, open_mic = {}, echo_sources = {}, talks = {}, audience_revision = string.rep("\0", 8) }
+script.configure({})
+assert(storage.radio and storage.radio_policy.muted and storage.radio_policy.publishers)
+storage.radio[1] = { tx = "item/iron-plate", rx = {}, presets = {} }
+storage.radio_policy.muted[2] = true
+script.configure({})
+assert(storage.radio[1].tx == "item/iron-plate" and storage.radio_policy.muted[2])
 
 print("control.lua: routing, audience, identity, plaque, hud, bounds and 0.2.0/0.3.0 migration passed")
