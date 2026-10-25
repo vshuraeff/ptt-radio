@@ -8,6 +8,8 @@ on:
     paths-ignore: ['wiki/**', 'docs/**', '**.md']
   pull_request:
     paths-ignore: ['wiki/**', 'docs/**', '**.md']
+  # path filters skip the first push of a new repository, so ci can be started by hand
+  workflow_dispatch:
 
 permissions: {}
 
