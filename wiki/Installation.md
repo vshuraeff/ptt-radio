@@ -51,7 +51,11 @@ Invoke-WebRequest -UseBasicParsing https://github.com/vshuraeff/ptt-radio/releas
 & .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.0
 ```
 
-`--mods-dir` / `-ModsDir` records the absolute mod directory in `install.json`; the installer never edits that directory or `mod-list.json`. Omit it to use `<user-data>/mods`. Use the companion from the same release as the mod. Linux archives currently support x86_64 with glibc 2.35 or newer; macOS supports Apple silicon and Intel. Other platforms receive an unsupported-platform error.
+`--mods-dir` / `-ModsDir` records the absolute mod directory in `install.json`; the installer never edits that directory or `mod-list.json`. Omit it to use `<user-data>/mods`. The installed companion removes its own folder after the mod is gone only when the recorded directory is `<user-data>/mods` itself; naming that folder, or a link to it, with `--mods-dir` still counts. With any other folder it never removes itself and stays until you delete it. The other conditions are in [Removal with the mod](Companion#removal-with-the-mod).
+
+`--version` / `-Version` only chooses the release the installer puts in place. Companion builds from the Releases page check GitHub's latest release at every start. When that release is stable and strictly newer than the running companion, the companion downloads and verifies it, replaces its own executable (never the mod) and restarts with the same arguments, so it no longer matches a pinned mod. A failed check keeps the current version. To stay on the pinned version, start the companion with `--no-self-update` or set `PTT_RADIO_NO_SELF_UPDATE=1` (any value other than empty or `0`). The Steam launch option the installer prints has no opt-out; put the flag before `--launch`, because everything after `--launch` goes to the game: `"<user-data>/ptt-radio-companion/ptt-radio-companion" --no-self-update --launch %command%`.
+
+Linux archives currently support x86_64 with glibc 2.35 or newer; macOS supports Apple silicon and Intel. On other platforms the installer stops with an error saying no companion release archive is published for them.
 
 ### Manual download
 
@@ -66,7 +70,7 @@ Invoke-WebRequest -UseBasicParsing https://github.com/vshuraeff/ptt-radio/releas
 2. Optional: check the download against `SHA256SUMS` from the same release, for example `sha256sum --check --ignore-missing SHA256SUMS` on Linux or `shasum -a 256 <file>` on macOS.
 3. Unpack it into a folder you can write to, so the companion can update itself later. Inside is one program, `ptt-radio-companion` (`ptt-radio-companion.exe` on Windows), plus `LICENSE` and `README.md`.
 
-Use the companion from the same release as the mod. The first start, the push-to-talk key and the OS permission prompts are covered in [Companion](Companion).
+Use the companion from the same release as the mod. Nothing enforces this: the *Companion* section of the *Radio settings* window only labels the companion as older, newer or matching. A companion without radio-channel support cannot send or receive voice at all; the window then shows the red note "Update the companion to use radio channels. This companion cannot send or receive voice." The first start, the push-to-talk key and the OS permission prompts are covered in [Companion](Companion).
 
 ## 3. Add the launch flag
 
@@ -75,7 +79,7 @@ The game must start with `--enable-lua-udp 34556`. `34556` is the port the compa
 **Steam (Windows, macOS, Linux).**
 
 1. In the Steam library, right-click Factorio and choose *Properties*.
-2. On the *General* tab, paste the Steam launch option printed by the installer into *Launch Options*. It looks like `"<user-data>/ptt-radio-companion/ptt-radio-companion" --launch %command%` (`.exe` on Windows). This starts the companion with the game and adds the Lua UDP flag. For a manually started companion, use `--enable-lua-udp 34556` instead.
+2. On the *General* tab, paste the line the installer printed after `Steam launch options:` into *Launch Options*. It looks like `"<user-data>/ptt-radio-companion/ptt-radio-companion" --launch %command%` (`.exe` on Windows). This starts the companion with the game and adds the Lua UDP flag. If you start the companion yourself, put only `--enable-lua-udp 34556` in *Launch Options* instead.
 3. Close the window and start the game as usual.
 
 **Standalone version (factorio.com).** Start the game binary with the flag, or add the flag to your shortcut:
@@ -93,7 +97,7 @@ If Factorio is already running, quit it first: `open` passes the flag only to a 
 
 ## 4. Check that it works
 
-1. Run the installer's start command, or start Factorio through the printed Steam option (see [Companion](Companion)).
+1. Run the installer's start command, or start Factorio through the printed Steam option you set in step 3 (see [Companion](Companion)).
 2. Join a multiplayer game.
 3. Within a few seconds the chat shows `Radio: companion connected.` and the companion window prints a `roster:` list with the players.
 
