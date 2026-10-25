@@ -1064,7 +1064,10 @@ mod tests {
         send(&wrapped);
         assert_eq!(recv(&b), forwarded(&wrapped));
         send(&media(Kind::Stop, 0, 65535, 2, &[]));
-        quiet(&b);
+        // an ignored packet sends nothing, so wait for a forwarded one queued after it
+        let probe = packet::encode(VOICE, 13, &[5]);
+        send(&probe);
+        assert_eq!(recv(&b), forwarded(&probe));
         let report = relay.stop();
         assert_eq!(report.ignored, 11);
     }
