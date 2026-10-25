@@ -1,6 +1,6 @@
 # ptt-radio architecture
 
-This is a map of the ptt-radio tree at version 0.4.0 (`mod/ptt-radio/info.json`, `companion/Cargo.toml`): the components, how voice and control data move between them, where trust ends, and how the code is built, released and tested. Wire formats, protocol contracts and measurements live in [DESIGN.md](DESIGN.md); this file links to its sections instead of repeating them. Paths are relative to this directory.
+This is a map of the ptt-radio tree at version 0.4.1 (`mod/ptt-radio/info.json`, `companion/Cargo.toml`): the components, how voice and control data move between them, where trust ends, and how the code is built, released and tested. Wire formats, protocol contracts and measurements live in [DESIGN.md](DESIGN.md); this file links to its sections instead of repeating them. Paths are relative to this directory.
 
 ## Components
 

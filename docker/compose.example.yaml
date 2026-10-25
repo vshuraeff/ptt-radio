@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
 
   hub:
-    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.0
+    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.1
     network_mode: "service:factorio"
     depends_on:
       - factorio

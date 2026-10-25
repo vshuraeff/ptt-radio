@@ -43,12 +43,12 @@ irm https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 
 
 ```sh
 curl -fsSLo install.sh https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh
-sh install.sh --factorio-dir "/path/to/Factorio data" --mods-dir "/path/to/custom mods" --version v0.4.0
+sh install.sh --factorio-dir "/path/to/Factorio data" --mods-dir "/path/to/custom mods" --version v0.4.1
 ```
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 -OutFile install.ps1
-& .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.0
+& .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.1
 ```
 
 `--mods-dir` / `-ModsDir` записывает в `install.json` абсолютный путь к папке модов; саму эту папку и `mod-list.json` установщик не трогает. Без этого параметра используется `<папка данных Factorio>/mods`. Установленный компаньон удаляет свою папку, когда мод пропадает, только если записана именно `<папка данных Factorio>/mods`; если передать в `--mods-dir` эту же папку или ссылку на неё, удаление тоже работает. С любой другой папкой компаньон себя не удаляет и остаётся, пока вы не удалите его сами. Остальные условия — в разделе [Удаление вместе с модом](RU-Companion#удаление-вместе-с-модом).

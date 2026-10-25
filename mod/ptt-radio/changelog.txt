@@ -1,4 +1,10 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.4.1
+Date: 2026-10-25
+  Info:
+    - Every GitHub release file and the hub container image now carry a signed build provenance
+      attestation; check a download with: gh attestation verify <file> -R vshuraeff/ptt-radio
+---------------------------------------------------------------------------------------------------
 Version: 0.4.0
 Date: 2026-10-24
   Major Features:

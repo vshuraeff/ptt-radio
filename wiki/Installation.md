@@ -43,12 +43,12 @@ For custom directories or a pinned release, download the installer first and pas
 
 ```sh
 curl -fsSLo install.sh https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.sh
-sh install.sh --factorio-dir "/path/to/Factorio data" --mods-dir "/path/to/custom mods" --version v0.4.0
+sh install.sh --factorio-dir "/path/to/Factorio data" --mods-dir "/path/to/custom mods" --version v0.4.1
 ```
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing https://github.com/vshuraeff/ptt-radio/releases/latest/download/install.ps1 -OutFile install.ps1
-& .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.0
+& .\install.ps1 -FactorioDir 'D:\Games\Factorio data' -ModsDir 'D:\Games\custom mods' -Version v0.4.1
 ```
 
 `--mods-dir` / `-ModsDir` records the absolute mod directory in `install.json`; the installer never edits that directory or `mod-list.json`. Omit it to use `<user-data>/mods`. The installed companion removes its own folder after the mod is gone only when the recorded directory is `<user-data>/mods` itself; naming that folder, or a link to it, with `--mods-dir` still counts. With any other folder it never removes itself and stays until you delete it. The other conditions are in [Removal with the mod](Companion#removal-with-the-mod).

@@ -32,7 +32,7 @@
 
 ## Запуск в Docker
 
-Образ — `ghcr.io/vshuraeff/ptt-radio-hub` для `linux/amd64` и `linux/arm64`, теги: версия (`0.4.0`), минорная ветка (`0.4`) и `latest`. Аргументы после имени образа передаются прямо хабу.
+Образ — `ghcr.io/vshuraeff/ptt-radio-hub` для `linux/amd64` и `linux/arm64`, теги: версия (`0.4.1`), минорная ветка (`0.4`) и `latest`. Аргументы после имени образа передаются прямо хабу.
 
 **Сервер работает прямо на хосте.** Используйте сеть хоста, тогда `127.0.0.1` внутри контейнера — это loopback хоста:
 
@@ -41,7 +41,7 @@
 
    ```sh
    docker run -d --name ptt-radio-hub --network host --restart unless-stopped \
-     ghcr.io/vshuraeff/ptt-radio-hub:0.4.0 \
+     ghcr.io/vshuraeff/ptt-radio-hub:0.4.1 \
      --public 0.0.0.0:34560 --game 127.0.0.1:34556 --receive 127.0.0.1:34557
    ```
 
@@ -57,7 +57,7 @@ services:
       - "34197:34197/udp"
       - "34560:34560/udp"   # публичный порт хаба
   hub:
-    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.0
+    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.1
     network_mode: "service:factorio"
     depends_on:
       - factorio
@@ -78,7 +78,7 @@ services:
 
    ```sh
    sha256sum --check --ignore-missing SHA256SUMS
-   tar -xzf ptt-radio-hub-0.4.0-linux-x86_64.tar.gz
+   tar -xzf ptt-radio-hub-0.4.1-linux-x86_64.tar.gz
    sudo install -m 755 ptt-radio-hub /usr/local/bin/ptt-radio-hub
    ```
 

@@ -1,6 +1,6 @@
 [package]
 name = "ptt-radio-companion"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Desktop companion for the ptt-radio Factorio mod: push-to-talk capture, Opus, playback"
 publish = false

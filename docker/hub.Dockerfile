@@ -36,7 +36,7 @@ FROM scratch AS binary
 COPY --from=build /out/ptt-radio-hub /ptt-radio-hub
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99 AS runtime
-ARG VERSION=0.4.0
+ARG VERSION=0.4.1
 LABEL org.opencontainers.image.source="https://github.com/vshuraeff/ptt-radio" \
       org.opencontainers.image.licenses="GPL-3.0-only" \
       org.opencontainers.image.version="$VERSION"

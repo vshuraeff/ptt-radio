@@ -14,6 +14,13 @@ A release is one tag, `v<version>`. Pushing it runs `.github/workflows/release.y
 | `install.sh`, `install.ps1` | companion installers, also available through `releases/latest/download/` |
 | `SHA256SUMS` | the SHA-256 of every asset above |
 
+Every asset in the table, `SHA256SUMS` included, gets a signed SLSA build provenance attestation from the publication job, and the hub image gets one for its digest, pushed to ghcr.io beside it. Anyone can check that a file or image was built by a GitHub Actions workflow of this repository (`-R` checks the repository, not which of its workflows signed):
+
+```sh
+gh attestation verify ptt-radio-companion-<ver>-linux-x86_64.tar.gz -R vshuraeff/ptt-radio
+gh attestation verify oci://ghcr.io/vshuraeff/ptt-radio-hub:<ver> -R vshuraeff/ptt-radio
+```
+
 The Linux companion is built inside an Ubuntu 22.04 container, so it needs glibc 2.35 or newer and runs on Ubuntu 22.04, Debian 12 and later; the run fails if the binary would need a newer glibc. That container is a deliberate exception to keeping every image at its latest version, made to hold the glibc 2.35 floor that this check enforces.
 
 The README inside each companion archive is written by `tools/archive-readme.sh`, which turns its repository-relative links into links to the tagged files on GitHub, since the archive holds only the binary, `LICENSE` and `README.md`.

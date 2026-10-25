@@ -32,7 +32,7 @@ The hub plays no audio and needs no sound card. To the mod it presents itself as
 
 ## Run it with Docker
 
-The image is `ghcr.io/vshuraeff/ptt-radio-hub` for `linux/amd64` and `linux/arm64`, tagged with the version (`0.4.0`), the minor line (`0.4`) and `latest`. Arguments after the image name go straight to the hub.
+The image is `ghcr.io/vshuraeff/ptt-radio-hub` for `linux/amd64` and `linux/arm64`, tagged with the version (`0.4.1`), the minor line (`0.4`) and `latest`. Arguments after the image name go straight to the hub.
 
 **The server runs directly on the host.** Use the host network, so `127.0.0.1` inside the container is the host's loopback:
 
@@ -41,7 +41,7 @@ The image is `ghcr.io/vshuraeff/ptt-radio-hub` for `linux/amd64` and `linux/arm6
 
    ```sh
    docker run -d --name ptt-radio-hub --network host --restart unless-stopped \
-     ghcr.io/vshuraeff/ptt-radio-hub:0.4.0 \
+     ghcr.io/vshuraeff/ptt-radio-hub:0.4.1 \
      --public 0.0.0.0:34560 --game 127.0.0.1:34556 --receive 127.0.0.1:34557
    ```
 
@@ -57,7 +57,7 @@ services:
       - "34197:34197/udp"
       - "34560:34560/udp"   # the hub's public port
   hub:
-    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.0
+    image: ghcr.io/vshuraeff/ptt-radio-hub:0.4.1
     network_mode: "service:factorio"
     depends_on:
       - factorio
@@ -78,7 +78,7 @@ The image has no shell, so `docker exec ... sh` does not work; read the hub with
 
    ```sh
    sha256sum --check --ignore-missing SHA256SUMS
-   tar -xzf ptt-radio-hub-0.4.0-linux-x86_64.tar.gz
+   tar -xzf ptt-radio-hub-0.4.1-linux-x86_64.tar.gz
    sudo install -m 755 ptt-radio-hub /usr/local/bin/ptt-radio-hub
    ```
 
