@@ -39,8 +39,10 @@ jobs:
           fi
 
       - name: Mirror wiki/ and push on a diff
+        # --checksum: checkout and clone land in the same second, so the size+mtime quick check
+        # skips an edit that keeps the file size (0.4.0 -> 0.4.1)
         run: |
-          rsync -a --delete --exclude .git wiki/ "$RUNNER_TEMP/wiki/"
+          rsync -a --checksum --delete --exclude .git wiki/ "$RUNNER_TEMP/wiki/"
           cd "$RUNNER_TEMP/wiki"
           git add -A
           if git diff --cached --quiet; then
