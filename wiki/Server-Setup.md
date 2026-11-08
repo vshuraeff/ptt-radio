@@ -10,7 +10,7 @@ When you finish this page, your dedicated or rented server runs the mod, you kno
 
 ## Install the mod on a headless server
 
-1. Download `ptt-radio_<version>.zip` from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases).
+1. Download `ptt-radio_<version>.zip` from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases) or from the [mod's portal page](https://mods.factorio.com/mod/ptt-radio) (the portal asks you to sign in to your factorio.com account first).
 2. Copy the zip, unchanged, into the server's `mods` folder.
 3. Enable it: add this entry to the `mods` list in `mods/mod-list.json`.
 
@@ -18,7 +18,7 @@ When you finish this page, your dedicated or rented server runs the mod, you kno
    { "name": "ptt-radio", "enabled": true }
    ```
 
-4. Restart the server. Players who join with the mod missing are offered a download if the mod is on the mod portal; otherwise they install it as in [Installation](Installation).
+4. Restart the server. Players who join with the mod missing are offered a download from the mod portal. A player whose game cannot download from the portal installs the zip as in [Installation](Installation).
 
 With the hub, the start command looks like this (keep your own save and settings arguments):
 

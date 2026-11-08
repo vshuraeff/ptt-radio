@@ -12,9 +12,9 @@ The mod needs Factorio 2.1. For the server side, see [Server Setup](Server-Setup
 
 ## 1. Install the mod
 
-**From the mod portal.** In the game, open *Mods*, search for *PTT Radio*, install it and restart the game. If the server already runs the mod, the game also offers to download it when you join.
+**From the mod portal.** The mod is published at [mods.factorio.com/mod/ptt-radio](https://mods.factorio.com/mod/ptt-radio). In the game, open *Mods*, search for *PTT Radio*, install it and restart the game. If the server already runs the mod, the game also offers to download it when you join. New versions install from the same *Mods* window.
 
-**From the zip.**
+**From the zip.** The same zip is attached to every GitHub release. Use it when the game cannot download mods from the portal.
 
 1. Download `ptt-radio_<version>.zip` from the [Releases page](https://github.com/vshuraeff/ptt-radio/releases).
 2. Put the zip, unchanged, into your Factorio `mods` folder:
